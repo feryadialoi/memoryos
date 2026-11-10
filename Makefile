@@ -62,8 +62,10 @@ local-import: local-db
 local-start: local-db
 	$(BIN) restart
 
+# Postgres refuses to start without a locale ("postmaster became multithreaded during startup"), which a
+# shell started by launchd or cron may not have.
 local-db:
-	$(PG)/pg_ctl -D $(PGDATA) status >/dev/null || $(PG)/pg_ctl -D $(PGDATA) -o "-p $(PORT)" -l $(DIR)/postgres.log start
+	$(PG)/pg_ctl -D $(PGDATA) status >/dev/null || LC_ALL=C $(PG)/pg_ctl -D $(PGDATA) -o "-p $(PORT)" -l $(DIR)/postgres.log start
 
 local-upgrade: install local-db
 	$(BIN) migrate
