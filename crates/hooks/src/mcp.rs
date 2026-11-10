@@ -3,13 +3,19 @@
 //! one. The admin key is never used here.
 
 use std::io::{BufRead, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use url::Url;
 
 use crate::config::{self, process_env};
+use crate::settings;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the check for a running local server waits on a loopback port.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Longer than any tool call should take, so a hung server cannot stall the agent forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const INTERNAL_ERROR: i64 = -32603;
@@ -35,7 +41,9 @@ enum Takes {
 
 pub fn run() -> Result<(), String> {
     let key = config::agent_key(&process_env)?;
-    let endpoint = format!("{}/mcp", config::base_url(&process_env)?);
+    let base = config::base_url(&process_env)?;
+    start_local_server(&base);
+    let endpoint = format!("{base}/mcp");
     // A bad value must not take the tools away: the model then has to name scopes itself.
     let defaults: Vec<String> = match config::hook_scopes(&process_env) {
         Ok(scopes) => scopes.iter().map(ToString::to_string).collect(),
@@ -73,6 +81,58 @@ pub fn run() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// After a reboot nothing runs the server of a local install, so the proxy the agent starts does.
+/// Only when `server.env` exists and the server URL is on this machine with nothing listening.
+/// `memoryos start` runs in the background, so calls fail until the server is ready instead of the
+/// agent waiting on a model download.
+fn start_local_server(base: &str) {
+    if !settings::path().is_some_and(|path| path.is_file()) || !needs_start(base) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = Command::new(exe);
+    command
+        .arg("start")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    match command.spawn() {
+        // Reaped on its own thread, so it leaves no zombie while the proxy runs.
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+        }
+        Err(error) => eprintln!("memoryos mcp: cannot start the local server: {error}"),
+    }
+}
+
+/// A loopback URL whose port takes no connection.
+fn needs_start(base: &str) -> bool {
+    let Ok(url) = Url::parse(base) else {
+        return false;
+    };
+    let loopback = match url.host() {
+        Some(url::Host::Domain(name)) => name == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let Ok(addresses) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    loopback
+        && !addresses
+            .into_iter()
+            .any(|address| TcpStream::connect_timeout(&address, PROBE_TIMEOUT).is_ok())
 }
 
 /// What to write back for one line, if anything.
@@ -277,6 +337,21 @@ mod tests {
     use super::*;
 
     const AT: &str = "http://h/mcp";
+
+    #[test]
+    fn only_a_loopback_url_with_nothing_listening_needs_a_start() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let busy = listener.local_addr().expect("address").port();
+        let free = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            probe.local_addr().expect("address").port()
+        };
+        assert!(!needs_start(&format!("http://127.0.0.1:{busy}")));
+        assert!(needs_start(&format!("http://127.0.0.1:{free}")));
+        assert!(needs_start(&format!("http://localhost:{free}")));
+        assert!(!needs_start("https://memory.example.com"));
+        assert!(!needs_start("not a url"));
+    }
 
     fn parsed(reply: Option<String>) -> Value {
         serde_json::from_str(&reply.expect("a reply")).expect("JSON")

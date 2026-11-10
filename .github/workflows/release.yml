@@ -1,0 +1,96 @@
+name: Release
+
+# Every merge to main is a release: the next patch version after the newest v* tag, or the crate's
+# version when there is none. The release creates the tag; nobody tags by hand. install.sh and
+# `memoryos update` download its archives.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One release at a time, in merge order, so two merges never take the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: next
+        run: |
+          last=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)
+          if [ -z "$last" ]; then
+            version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+            tag="v$version"
+          else
+            IFS=. read -r major minor patch <<< "${last#v}"
+            tag="v$major.$minor.$((patch + 1))"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag"
+
+  build:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            asset: memoryos-macos-aarch64
+          # ONNX Runtime needs glibc 2.38 or newer, so the binary needs a Linux at least as new.
+          - runner: ubuntu-24.04
+            asset: memoryos-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            asset: memoryos-linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-11-06
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: MEMORYOS_VERSION="${TAG#v}" cargo build --release --locked -p memoryos-server
+      - name: Smoke test
+        run: ./target/release/memoryos --version
+      - name: Package
+        run: |
+          tar -czf "${{ matrix.asset }}.tar.gz" -C target/release memoryos
+          shasum -a 256 "${{ matrix.asset }}.tar.gz" > "${{ matrix.asset }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.tar.gz*
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: >-
+          gh release create "$TAG" dist/*
+          --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --generate-notes

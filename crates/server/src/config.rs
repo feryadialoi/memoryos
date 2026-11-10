@@ -9,7 +9,7 @@ use memoryos_ingest::SingleValued;
 use memoryos_retrieve::DEFAULT_RERANK_TOP;
 use memoryos_store::Backend;
 
-use crate::settings::Lookup;
+use memoryos_hooks::settings::Lookup;
 
 #[derive(Clone)]
 pub struct Config {

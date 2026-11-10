@@ -1,7 +1,7 @@
-//! `memoryos restart`: stops the `memoryos serve` listening on `MEMORYOS_BIND`, starts a new one in
-//! the background with its output appended to `~/.local/share/memoryos/server.log`, and waits for
-//! `/readyz`. For a local install; a port held by anything other than `memoryos serve`, such as
-//! Docker, is refused instead of stopped.
+//! `memoryos start`, `stop` and `restart` for the server of a local install: the `memoryos serve`
+//! listening on `MEMORYOS_BIND`, run in the background with its output appended to
+//! `~/.local/share/memoryos/server.log`. A port held by anything other than `memoryos serve`, such
+//! as Docker, is refused instead of stopped.
 
 use std::fs::{self, File};
 use std::net::SocketAddr;
@@ -9,30 +9,66 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use memoryos_hooks::settings::Lookup;
+
 use crate::config::DEFAULT_BIND;
-use crate::settings::Lookup;
 
 /// Above the server's 25 second drain, so a stop is never cut short.
 const STOP_TIMEOUT: Duration = Duration::from_secs(35);
-/// Room for the first start, which downloads the embedding model.
-const READY_TIMEOUT: Duration = Duration::from_secs(300);
+/// The first start downloads the 481 MB embedding model, seen as slow as 150 KB/s.
+const READY_TIMEOUT: Duration = Duration::from_secs(90 * 60);
+const REPORT_EVERY: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_millis(250);
 
-pub fn run() -> Result<(), String> {
-    let lookup = Lookup::load()?;
-    let bind = lookup
+/// Starts the server, stopping the one already running first.
+pub fn restart() -> Result<(), String> {
+    let (bind, address) = bind()?;
+    stop_port(address.port())?;
+    start_and_wait(&bind, address)
+}
+
+/// Starts the server unless one already answers, so many callers at once start it once.
+pub fn start() -> Result<(), String> {
+    let (bind, address) = bind()?;
+    if is_ready(&ready_url(address)) {
+        println!("memoryos is already running on http://{bind}");
+        return Ok(());
+    }
+    if !listeners(address.port())?.is_empty() {
+        println!("memoryos is starting on http://{bind}");
+        return Ok(());
+    }
+    start_and_wait(&bind, address)
+}
+
+pub fn stop() -> Result<(), String> {
+    let (bind, address) = bind()?;
+    if stop_port(address.port())? {
+        println!("memoryos stopped on http://{bind}");
+    } else {
+        println!("memoryos is not running on http://{bind}");
+    }
+    Ok(())
+}
+
+fn bind() -> Result<(String, SocketAddr), String> {
+    let bind = Lookup::load()?
         .get("MEMORYOS_BIND")
         .unwrap_or_else(|| DEFAULT_BIND.to_owned());
-    let address: SocketAddr = bind
+    let address = bind
         .trim()
         .parse()
         .map_err(|_| format!("MEMORYOS_BIND {bind:?} is not an address like 127.0.0.1:8080"))?;
-    stop(address.port())?;
+    Ok((bind, address))
+}
+
+fn start_and_wait(bind: &str, address: SocketAddr) -> Result<(), String> {
     let log = log_path()?;
-    let mut child = start(&log)?;
+    let mut child = spawn(&log)?;
     let url = ready_url(address);
     eprintln!("waiting for {url}");
     let started = Instant::now();
+    let mut reported = started;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(
@@ -46,28 +82,37 @@ pub fn run() -> Result<(), String> {
         }
         if started.elapsed() > READY_TIMEOUT {
             return Err(format!(
-                "the server is not ready after {} s, see {}",
-                READY_TIMEOUT.as_secs(),
+                "the server is not ready after {} minutes, see {}",
+                READY_TIMEOUT.as_secs() / 60,
                 log.display()
             ));
+        }
+        if reported.elapsed() >= REPORT_EVERY {
+            reported = Instant::now();
+            eprintln!(
+                "  still waiting, {}s. The first start downloads a 481 MB model.",
+                started.elapsed().as_secs()
+            );
         }
         std::thread::sleep(POLL);
     }
 }
 
 /// Stops every `memoryos serve` listening on `port`, and refuses when something else holds it.
-fn stop(port: u16) -> Result<(), String> {
-    for pid in listeners(port)? {
-        let command = command_of(&pid)?;
+/// Says whether there was one.
+fn stop_port(port: u16) -> Result<bool, String> {
+    let pids = listeners(port)?;
+    for pid in &pids {
+        let command = command_of(pid)?;
         if !is_memoryos_serve(&command) {
             return Err(format!(
                 "port {port} is held by `{command}`, not a local memoryos server; stop it first"
             ));
         }
         eprintln!("stopping the server (pid {pid})");
-        signal(&pid, "-TERM")?;
+        signal(pid, "-TERM")?;
         let started = Instant::now();
-        while signal(&pid, "-0").is_ok() {
+        while signal(pid, "-0").is_ok() {
             if started.elapsed() > STOP_TIMEOUT {
                 return Err(format!(
                     "the server (pid {pid}) did not stop within {} s",
@@ -77,7 +122,7 @@ fn stop(port: u16) -> Result<(), String> {
             std::thread::sleep(POLL);
         }
     }
-    Ok(())
+    Ok(!pids.is_empty())
 }
 
 fn listeners(port: u16) -> Result<Vec<String>, String> {
@@ -131,7 +176,7 @@ fn log_path() -> Result<PathBuf, String> {
 }
 
 /// In its own process group, so it outlives this command and the terminal it ran in.
-fn start(log: &PathBuf) -> Result<std::process::Child, String> {
+fn spawn(log: &PathBuf) -> Result<std::process::Child, String> {
     let open = || {
         File::options()
             .create(true)

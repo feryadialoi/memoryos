@@ -16,6 +16,7 @@ use serde_json::json;
 use crate::config::{self, process_env, Env};
 use crate::credentials::{self, Credentials};
 use crate::install::{self, Agent};
+use crate::settings;
 use crate::SetupArgs;
 
 const COMPOSE_FILE: &str = include_str!("../../../deploy/docker-compose.yml");
@@ -418,21 +419,7 @@ impl Stack for Docker {
     }
 
     fn key_works(&self, url: &str, key: &str) -> Result<bool, String> {
-        let runtime = runtime()?;
-        let http = http_client()?;
-        // Inside the runtime: a request with a timeout needs its timer as soon as it is sent.
-        let response = runtime.block_on(async {
-            http.post(format!("{url}/mcp"))
-                .bearer_auth(key)
-                .header("content-type", "application/json")
-                .body(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string())
-                .send()
-                .await
-        });
-        match response {
-            Ok(response) => Ok(response.status().as_u16() != 401),
-            Err(error) => Err(format!("cannot check a stored key at {url}: {error}")),
-        }
+        key_accepted(url, key)
     }
 
     fn destroy(&self, settings: &Settings) -> Result<(), String> {
@@ -467,6 +454,52 @@ impl Stack for Docker {
     }
 }
 
+/// Whether the server at `url` takes `key`.
+fn key_accepted(url: &str, key: &str) -> Result<bool, String> {
+    let runtime = runtime()?;
+    let http = http_client()?;
+    // Inside the runtime: a request with a timeout needs its timer as soon as it is sent.
+    let response = runtime.block_on(async {
+        http.post(format!("{url}/mcp"))
+            .bearer_auth(key)
+            .header("content-type", "application/json")
+            .body(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string())
+            .send()
+            .await
+    });
+    match response {
+        Ok(response) => Ok(response.status().as_u16() != 401),
+        Err(error) => Err(format!("cannot check a stored key at {url}: {error}")),
+    }
+}
+
+/// Where `setup` creates and checks the two keys.
+trait KeyMaker {
+    fn url(&self) -> String;
+    /// Returns the token. It is printed by no one.
+    fn create_key(&self, spec: &KeySpec) -> Result<String, String>;
+    fn key_works(&self, key: &str) -> Result<bool, String>;
+}
+
+struct DockerKeys<'a> {
+    stack: &'a dyn Stack,
+    settings: &'a Settings,
+}
+
+impl KeyMaker for DockerKeys<'_> {
+    fn url(&self) -> String {
+        self.settings.url()
+    }
+
+    fn create_key(&self, spec: &KeySpec) -> Result<String, String> {
+        self.stack.create_key(self.settings, spec)
+    }
+
+    fn key_works(&self, key: &str) -> Result<bool, String> {
+        self.stack.key_works(&self.settings.url(), key)
+    }
+}
+
 fn runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -481,6 +514,170 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("cannot start the HTTP client: {e}"))
 }
 
+// ---- Local: SQLite and `memoryos serve` on this machine -----------------------------------------
+
+/// Settings `setup --local` writes to `server.env` when the file has none of its own, so a second
+/// run keeps what the user changed, such as the reranking model or a Postgres `DATABASE_URL`.
+const LOCAL_BIND: &str = "127.0.0.1:8080";
+/// As accurate as the larger default on the bench, and about three times faster.
+const LOCAL_RERANK_MODEL: &str = "bge-reranker-base";
+
+/// The `memoryos` commands `setup --local` runs. Tests use a recording double.
+trait Local {
+    /// Runs `memoryos <args>` with its output shown.
+    fn run(&self, args: &[&str], what: &str) -> Result<(), String>;
+    /// Runs `memoryos <args>` and returns what it printed on stdout.
+    fn output(&self, args: &[&str], what: &str) -> Result<String, String>;
+    fn key_works(&self, url: &str, key: &str) -> Result<bool, String>;
+}
+
+/// This program, so the server and keys come from the same build as `setup`.
+struct LocalServer {
+    exe: PathBuf,
+}
+
+impl LocalServer {
+    fn new() -> Result<Self, String> {
+        let exe = std::env::current_exe().map_err(|e| format!("cannot find this program: {e}"))?;
+        Ok(Self { exe })
+    }
+}
+
+impl Local for LocalServer {
+    fn run(&self, args: &[&str], what: &str) -> Result<(), String> {
+        let status = Command::new(&self.exe)
+            .args(args)
+            .status()
+            .map_err(|e| format!("{what} failed: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{what} failed. The output above says why."))
+        }
+    }
+
+    fn output(&self, args: &[&str], what: &str) -> Result<String, String> {
+        let output = Command::new(&self.exe)
+            .args(args)
+            .output()
+            .map_err(|e| format!("{what} failed: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if output.status.success() && !stdout.is_empty() {
+            Ok(stdout)
+        } else {
+            Err(format!(
+                "{what} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
+    fn key_works(&self, url: &str, key: &str) -> Result<bool, String> {
+        key_accepted(url, key)
+    }
+}
+
+struct LocalKeys<'a> {
+    local: &'a dyn Local,
+    url: String,
+}
+
+impl KeyMaker for LocalKeys<'_> {
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    fn create_key(&self, spec: &KeySpec) -> Result<String, String> {
+        self.local
+            .output(&spec.args(), &format!("creating the {} key", spec.name))
+    }
+
+    fn key_works(&self, key: &str) -> Result<bool, String> {
+        self.local.key_works(&self.url, key)
+    }
+}
+
+fn server_env(env: Env<'_>) -> Result<PathBuf, String> {
+    Ok(config::memoryos_dir(env)?.join(settings::FILE))
+}
+
+/// `~/.local/share/memoryos`, where the SQLite database and the server log live.
+fn local_data_dir(env: Env<'_>) -> Result<PathBuf, String> {
+    Ok(config::home(env)?.join(".local/share/memoryos"))
+}
+
+/// The last value `server.env` gives `name`.
+fn setting(lines: &[(String, String)], name: &str) -> Option<String> {
+    lines
+        .iter()
+        .rev()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.clone())
+}
+
+/// The SQLite file of a local install, read from `server.env`. `None` for Docker, or for a local
+/// server on Postgres, whose data `setup` did not create.
+fn local_sqlite_file(env: Env<'_>) -> Result<Option<PathBuf>, String> {
+    let lines = settings::read(&server_env(env)?)?;
+    if setting(&lines, "MEMORYOS_STORE").as_deref() != Some("sqlite") {
+        return Ok(None);
+    }
+    Ok(setting(&lines, "DATABASE_URL")
+        .and_then(|url| url.strip_prefix("sqlite://").map(PathBuf::from))
+        .filter(|path| path.is_absolute()))
+}
+
+fn setup_local(
+    env: Env<'_>,
+    local: &dyn Local,
+    agent: Agent,
+    global: bool,
+    project: &Path,
+) -> Result<String, String> {
+    // A configuration file that cannot be merged stops this before anything starts.
+    let plans = install::plan_install(agent, global, project, env)?;
+
+    let path = server_env(env)?;
+    let data = local_data_dir(env)?;
+    fs::create_dir_all(&data).map_err(|e| format!("cannot create {}: {e}", data.display()))?;
+    let existing = settings::read(&path)?;
+    let defaults = [
+        ("MEMORYOS_STORE", "sqlite".to_owned()),
+        (
+            "DATABASE_URL",
+            format!("sqlite://{}", data.join("memoryos.db").display()),
+        ),
+        ("MEMORYOS_BIND", LOCAL_BIND.to_owned()),
+        ("MEMORYOS_RERANK_MODEL", LOCAL_RERANK_MODEL.to_owned()),
+    ];
+    let missing: Vec<(&str, String)> = defaults
+        .into_iter()
+        .filter(|(name, _)| setting(&existing, name).is_none())
+        .collect();
+    if !missing.is_empty() {
+        settings::write(&path, &missing)?;
+    }
+    println!("Settings are in {}.", path.display());
+
+    local.run(&["migrate"], "migrating the database")?;
+    println!("Starting the server. The first start downloads about 760 MB of models.");
+    local.run(&["restart"], "starting the server")?;
+
+    let bind =
+        setting(&settings::read(&path)?, "MEMORYOS_BIND").unwrap_or_else(|| LOCAL_BIND.to_owned());
+    let url = format!("http://{}", bind.replacen("0.0.0.0:", "127.0.0.1:", 1));
+    let keys = ensure_keys(env, &LocalKeys { local, url })?;
+    let written = install::apply(&plans, false)?;
+
+    let mut lines = vec![keys, written];
+    lines.extend(agent_notes(agent, env));
+    lines.push(format!(
+        "Done. Data is in {}. After a reboot the agent's `memoryos mcp` starts the server.",
+        data.display()
+    ));
+    Ok(lines.join("\n"))
+}
+
 // ---- The commands ------------------------------------------------------------------------------
 
 pub fn run(args: &SetupArgs) -> Result<(), String> {
@@ -490,6 +687,7 @@ pub fn run(args: &SetupArgs) -> Result<(), String> {
         let report = uninstall(
             &process_env,
             &Docker,
+            &LocalServer::new()?,
             args.agent,
             args.global,
             args.delete_data,
@@ -499,7 +697,17 @@ pub fn run(args: &SetupArgs) -> Result<(), String> {
         return Ok(());
     }
     let agent = args.agent.ok_or("--agent is required")?;
-    let report = setup(&process_env, &Docker, agent, args.global, &project)?;
+    let report = if args.local {
+        setup_local(
+            &process_env,
+            &LocalServer::new()?,
+            agent,
+            args.global,
+            &project,
+        )?
+    } else {
+        setup(&process_env, &Docker, agent, args.global, &project)?
+    };
     println!("{report}");
     Ok(())
 }
@@ -529,7 +737,13 @@ fn setup(
     stack.wait_ready(&settings)?;
     println!("The server is ready.");
 
-    let keys = ensure_keys(env, stack, &settings)?;
+    let keys = ensure_keys(
+        env,
+        &DockerKeys {
+            stack,
+            settings: &settings,
+        },
+    )?;
     let written = install::apply(&plans, false)?;
 
     let mut lines = vec![keys, written];
@@ -540,17 +754,12 @@ fn setup(
 
 /// Keeps every stored key the server still accepts. Saves after each one, so a failure between the
 /// two cannot lose a token that was already shown once.
-fn ensure_keys(env: Env<'_>, stack: &dyn Stack, settings: &Settings) -> Result<String, String> {
-    let url = settings.url();
+fn ensure_keys(env: Env<'_>, keys: &dyn KeyMaker) -> Result<String, String> {
     let mut stored = credentials::load(env)?.unwrap_or_default();
-    stored.url.clone_from(&url);
+    stored.url = keys.url();
 
-    let agent_state = ensure_key(env, stack, settings, &AGENT_KEY, &mut stored, |c| {
-        &mut c.agent_key
-    })?;
-    let admin_state = ensure_key(env, stack, settings, &ADMIN_KEY, &mut stored, |c| {
-        &mut c.admin_key
-    })?;
+    let agent_state = ensure_key(env, keys, &AGENT_KEY, &mut stored, |c| &mut c.agent_key)?;
+    let admin_state = ensure_key(env, keys, &ADMIN_KEY, &mut stored, |c| &mut c.admin_key)?;
     credentials::save(env, &stored)?;
     Ok(format!(
         "Agent key {agent_state}, admin key {admin_state}, in {}.",
@@ -560,18 +769,17 @@ fn ensure_keys(env: Env<'_>, stack: &dyn Stack, settings: &Settings) -> Result<S
 
 fn ensure_key(
     env: Env<'_>,
-    stack: &dyn Stack,
-    settings: &Settings,
+    keys: &dyn KeyMaker,
     spec: &KeySpec,
     stored: &mut Credentials,
     slot: fn(&mut Credentials) -> &mut Option<String>,
 ) -> Result<&'static str, String> {
     if let Some(key) = slot(stored).as_deref() {
-        if stack.key_works(&settings.url(), key)? {
+        if keys.key_works(key)? {
             return Ok("kept");
         }
     }
-    let token = stack.create_key(settings, spec)?;
+    let token = keys.create_key(spec)?;
     *slot(stored) = Some(token);
     credentials::save(env, stored)?;
     Ok("created")
@@ -602,6 +810,7 @@ fn on_path(env: Env<'_>) -> bool {
 fn uninstall(
     env: Env<'_>,
     stack: &dyn Stack,
+    local: &dyn Local,
     agent: Option<Agent>,
     global: bool,
     delete_data: bool,
@@ -617,6 +826,7 @@ fn uninstall(
     for agent in agents {
         plans.extend(install::plan_uninstall(agent, global, project, env)?);
     }
+    let local_database = local_sqlite_file(env)?;
     let settings = Settings::load(env)?;
     if delete_data && settings.is_some() {
         // Docker being down must not leave half of this done.
@@ -626,6 +836,14 @@ fn uninstall(
     let dir = config::memoryos_dir(env)?;
 
     if !delete_data {
+        if local_database.is_some() {
+            lines.push(format!(
+                "Data and credentials are kept in {}. The local server is still running. Stop it \
+                 with: memoryos stop\nDelete everything with: memoryos setup --uninstall \
+                 --delete-data",
+                dir.display()
+            ));
+        }
         if let Some(settings) = settings {
             lines.push(format!(
                 "Data and credentials are kept in {}. The server is still running. Stop it with: \
@@ -642,13 +860,33 @@ fn uninstall(
     if let Some(settings) = &settings {
         stack.destroy(settings)?;
     }
+    if let Some(database) = &local_database {
+        local.run(&["stop"], "stopping the local server")?;
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", database.display()));
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot remove {}: {error}", path.display())),
+            }
+        }
+        lines.push(format!(
+            "Deleted the local database {}. The models stay in the user cache directory, under \
+             memoryos/models.",
+            database.display()
+        ));
+    }
     if dir.exists() {
         fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
     }
-    lines.push(format!(
-        "Deleted the database, the model cache, the credentials and {}. The image is kept.",
-        dir.display()
-    ));
+    if settings.is_some() || local_database.is_none() {
+        lines.push(format!(
+            "Deleted the database, the model cache, the credentials and {}. The image is kept.",
+            dir.display()
+        ));
+    } else {
+        lines.push(format!("Deleted the credentials and {}.", dir.display()));
+    }
     Ok(lines.join("\n"))
 }
 
@@ -709,6 +947,31 @@ mod tests {
         }
     }
 
+    /// Records each `memoryos` command and hands out numbered tokens for `key create`.
+    #[derive(Default)]
+    struct FakeLocal {
+        calls: RefCell<Vec<String>>,
+        issued: RefCell<Vec<String>>,
+    }
+
+    impl Local for FakeLocal {
+        fn run(&self, args: &[&str], _what: &str) -> Result<(), String> {
+            self.calls.borrow_mut().push(args.join(" "));
+            Ok(())
+        }
+
+        fn output(&self, args: &[&str], _what: &str) -> Result<String, String> {
+            self.calls.borrow_mut().push(args[..2].join(" "));
+            let token = format!("mos_local_{}", self.issued.borrow().len());
+            self.issued.borrow_mut().push(token.clone());
+            Ok(token)
+        }
+
+        fn key_works(&self, _url: &str, key: &str) -> Result<bool, String> {
+            Ok(self.issued.borrow().iter().any(|k| k == key))
+        }
+    }
+
     struct Sandbox {
         _root: tempfile::TempDir,
         home: PathBuf,
@@ -760,6 +1023,145 @@ mod tests {
             }
             out
         }
+    }
+
+    #[test]
+    fn setup_local_writes_sqlite_settings_starts_the_server_and_makes_two_keys() {
+        let sandbox = Sandbox::new();
+        let local = FakeLocal::default();
+        let report = setup_local(
+            &sandbox.env(),
+            &local,
+            Agent::ClaudeCode,
+            false,
+            &sandbox.project,
+        )
+        .expect("setup");
+
+        assert_eq!(
+            *local.calls.borrow(),
+            ["migrate", "restart", "key create", "key create"]
+        );
+        let lines = settings::read(&sandbox.dir().join("server.env")).expect("read");
+        let database = sandbox.home.join(".local/share/memoryos/memoryos.db");
+        assert_eq!(setting(&lines, "MEMORYOS_STORE").as_deref(), Some("sqlite"));
+        assert_eq!(
+            setting(&lines, "DATABASE_URL"),
+            Some(format!("sqlite://{}", database.display()))
+        );
+        assert_eq!(
+            setting(&lines, "MEMORYOS_RERANK_MODEL").as_deref(),
+            Some("bge-reranker-base")
+        );
+        let stored = sandbox.credentials();
+        assert_eq!(stored.url, "http://127.0.0.1:8080");
+        assert_eq!(stored.agent_key.as_deref(), Some("mos_local_0"));
+        assert_eq!(stored.admin_key.as_deref(), Some("mos_local_1"));
+        assert!(sandbox.project.join(".mcp.json").exists());
+        assert!(report.contains("created"), "{report}");
+        assert!(!sandbox.dir().join(".env").exists(), "no Docker settings");
+    }
+
+    #[test]
+    fn setup_local_again_keeps_changed_settings_and_working_keys() {
+        let sandbox = Sandbox::new();
+        let local = FakeLocal::default();
+        let run = || {
+            setup_local(
+                &sandbox.env(),
+                &local,
+                Agent::ClaudeCode,
+                false,
+                &sandbox.project,
+            )
+        };
+        run().expect("first");
+        let path = sandbox.dir().join("server.env");
+        settings::write(
+            &path,
+            &[
+                ("MEMORYOS_RERANK_MODEL", "bge-reranker-v2-m3".to_owned()),
+                ("MEMORYOS_BIND", "127.0.0.1:9090".to_owned()),
+            ],
+        )
+        .expect("write");
+
+        let report = run().expect("second");
+
+        let lines = settings::read(&path).expect("read");
+        assert_eq!(
+            setting(&lines, "MEMORYOS_RERANK_MODEL").as_deref(),
+            Some("bge-reranker-v2-m3")
+        );
+        assert_eq!(local.issued.borrow().len(), 2, "no new keys");
+        assert_eq!(sandbox.credentials().url, "http://127.0.0.1:9090");
+        assert!(report.contains("kept"), "{report}");
+    }
+
+    #[test]
+    fn delete_data_stops_the_local_server_and_removes_its_database() {
+        let sandbox = Sandbox::new();
+        let local = FakeLocal::default();
+        setup_local(
+            &sandbox.env(),
+            &local,
+            Agent::ClaudeCode,
+            false,
+            &sandbox.project,
+        )
+        .expect("setup");
+        let database = sandbox.home.join(".local/share/memoryos/memoryos.db");
+        fs::write(&database, "db").expect("db");
+        fs::write(sandbox.home.join(".local/share/memoryos/server.log"), "log").expect("log");
+
+        let report = uninstall(
+            &sandbox.env(),
+            &FakeStack::default(),
+            &local,
+            Some(Agent::ClaudeCode),
+            false,
+            true,
+            &sandbox.project,
+        )
+        .expect("uninstall");
+
+        assert_eq!(
+            local.calls.borrow().last().map(String::as_str),
+            Some("stop")
+        );
+        assert!(!database.exists());
+        assert!(sandbox
+            .home
+            .join(".local/share/memoryos/server.log")
+            .exists());
+        assert!(!sandbox.dir().exists());
+        assert!(!report.contains("image"), "{report}");
+    }
+
+    #[test]
+    fn uninstall_without_delete_data_says_how_to_stop_the_local_server() {
+        let sandbox = Sandbox::new();
+        let local = FakeLocal::default();
+        setup_local(
+            &sandbox.env(),
+            &local,
+            Agent::ClaudeCode,
+            false,
+            &sandbox.project,
+        )
+        .expect("setup");
+        let report = uninstall(
+            &sandbox.env(),
+            &FakeStack::default(),
+            &local,
+            Some(Agent::ClaudeCode),
+            false,
+            false,
+            &sandbox.project,
+        )
+        .expect("uninstall");
+        assert!(report.contains("memoryos stop"), "{report}");
+        assert!(sandbox.dir().join("server.env").exists());
     }
 
     #[test]
@@ -905,8 +1307,16 @@ mod tests {
         let stack = FakeStack::default();
         sandbox.setup(&stack, Agent::Opencode).expect("setup");
 
-        let report = uninstall(&sandbox.env(), &stack, None, false, false, &sandbox.project)
-            .expect("uninstall");
+        let report = uninstall(
+            &sandbox.env(),
+            &stack,
+            &FakeLocal::default(),
+            None,
+            false,
+            false,
+            &sandbox.project,
+        )
+        .expect("uninstall");
 
         assert!(!sandbox.project.join("opencode.json").exists());
         assert!(!sandbox
@@ -928,6 +1338,7 @@ mod tests {
         uninstall(
             &sandbox.env(),
             &stack,
+            &FakeLocal::default(),
             Some(Agent::ClaudeCode),
             false,
             true,
@@ -952,6 +1363,7 @@ mod tests {
         let result = uninstall(
             &sandbox.env(),
             &down,
+            &FakeLocal::default(),
             Some(Agent::ClaudeCode),
             false,
             true,

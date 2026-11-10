@@ -13,6 +13,7 @@ mod files;
 mod hook;
 mod install;
 mod mcp;
+pub mod settings;
 mod setup;
 mod stats;
 mod turns;
@@ -24,12 +25,6 @@ use memoryos_sdk::Scope;
 use uuid::Uuid;
 
 pub use install::Agent;
-
-/// `$XDG_CONFIG_HOME/memoryos`, or `~/.config/memoryos`: where `credentials.json` and the server's
-/// `server.env` live.
-pub fn config_dir() -> Result<PathBuf, String> {
-    config::memoryos_dir(&config::process_env)
-}
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -99,6 +94,9 @@ pub struct SetupArgs {
     /// Use the user's configuration under the home directory.
     #[arg(long)]
     pub global: bool,
+    /// Run the server on this machine with SQLite instead of Docker and Postgres.
+    #[arg(long, conflicts_with = "uninstall")]
+    pub local: bool,
     /// Remove the hooks and MCP configuration. Data stays unless `--delete-data` is given.
     #[arg(long)]
     pub uninstall: bool,

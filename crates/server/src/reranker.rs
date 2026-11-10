@@ -5,7 +5,7 @@ use clap::Subcommand;
 use memoryos_embed::{bench, RerankModel};
 
 use crate::config::{RerankerMode, RerankerSettings, DEFAULT_BIND};
-use crate::settings::{self, Lookup};
+use memoryos_hooks::settings::{self, Lookup};
 
 const MODE: &str = "MEMORYOS_RERANKER";
 const MODEL: &str = "MEMORYOS_RERANK_MODEL";
@@ -89,7 +89,7 @@ fn server_line(bind: &str, current: RerankerSettings) -> String {
     let Ok(address) = bind.trim().parse() else {
         return format!("MEMORYOS_BIND {bind:?} is not an address like 127.0.0.1:8080");
     };
-    let url = crate::restart::ready_url(address);
+    let url = crate::local_server::ready_url(address);
     let Some(body) = fetch(&url) else {
         return format!("not reachable at {url}");
     };
@@ -167,7 +167,7 @@ fn save(updates: &[(&str, String)], no_restart: bool) -> Result<(), String> {
         println!("restart the server to apply: memoryos restart");
         return Ok(());
     }
-    crate::restart::run()
+    crate::local_server::restart()
 }
 
 fn bench_models(names: &[String]) -> Result<(), String> {
