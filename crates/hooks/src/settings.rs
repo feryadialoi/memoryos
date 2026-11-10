@@ -3,14 +3,18 @@
 //! of the file as it was.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const FILE: &str = "server.env";
+use crate::config::{self, process_env};
+use crate::credentials;
+
+pub const FILE: &str = "server.env";
 
 /// The file's path, or `None` when there is no home directory to put it in.
 pub fn path() -> Option<PathBuf> {
-    memoryos_hooks::config_dir().ok().map(|dir| dir.join(FILE))
+    config::memoryos_dir(&process_env)
+        .ok()
+        .map(|dir| dir.join(FILE))
 }
 
 /// Looks a name up in the process environment, then in `server.env`. Empty counts as unset in both.
@@ -71,7 +75,7 @@ fn parse(text: &str) -> Vec<(String, String)> {
 
 /// Sets each `(name, value)` in the file: replaces the first line for that name, drops any later
 /// ones, and appends names it did not have. Other lines, comments included, stay as they were. The
-/// file is created with mode 0600, since it can hold the database password.
+/// file is written with mode 0600, since it can hold the database password.
 pub fn write(path: &Path, updates: &[(&str, String)]) -> Result<(), String> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -82,22 +86,7 @@ pub fn write(path: &Path, updates: &[(&str, String)]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options
-        .open(path)
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    // A file made by hand keeps its mode on open, so narrow it before writing.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("cannot restrict {}: {e}", path.display()))?;
-    }
-    file.write_all(updated.as_bytes())
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+    credentials::write_private(path, updated.as_bytes())
 }
 
 fn update(text: &str, updates: &[(&str, String)]) -> String {
@@ -178,6 +167,11 @@ mod tests {
         assert!(read(&path).unwrap().is_empty());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
         write(&path, &[("A", "1".to_owned())]).unwrap();
         write(&path, &[("B", "2".to_owned()), ("A", "3".to_owned())]).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "A=3\nB=2\n");

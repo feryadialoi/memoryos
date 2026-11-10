@@ -40,6 +40,27 @@ change and sources that lie.
 
 ## 🚀 Quickstart
 
+One line on macOS (Apple silicon) or Linux (x86_64, arm64, glibc 2.38 or newer), with no Docker,
+no Rust and no API key:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/feryadialoi/memoryos/main/install.sh | bash
+```
+
+It puts `memoryos` in `~/.local/bin` and runs `memoryos setup --local`: SQLite in
+`~/.local/share/memoryos`, the server on `127.0.0.1:8080` with the `bge-reranker-base` reranker,
+two keys, and Claude Code's hooks and MCP. The first start downloads about 760 MB of models. After
+a reboot, the `memoryos mcp` that Claude Code launches starts the server again.
+`MEMORYOS_AGENT=opencode` or `pi` connects another agent.
+
+| | |
+|---|---|
+| Update to the latest release | `memoryos update` (migrates and restarts the server too) |
+| Start, stop, restart the server | `memoryos start`, `memoryos stop`, `memoryos restart` |
+| Remove it | `memoryos setup --uninstall --global`, add `--delete-data` to delete the database |
+
+### With Docker and Postgres
+
 Needs Docker running, and nothing else: no API key, no `.env`, no provider account. The agent's own
 model decides what to remember, and embeddings run locally in the container.
 

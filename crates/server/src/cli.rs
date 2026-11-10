@@ -26,7 +26,7 @@ const ADMIN_DB_CONNECTIONS: u32 = 2;
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
-#[command(name = "memoryos", version, about = "Long-term memory for AI agents")]
+#[command(name = "memoryos", version = crate::VERSION, about = "Long-term memory for AI agents")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -36,9 +36,16 @@ pub struct Cli {
 pub enum Command {
     /// Run the API server. Reads `~/.config/memoryos/server.env` under the environment.
     Serve,
+    /// Start the local server in the background on `MEMORYOS_BIND`, unless one runs, and wait
+    /// until it is ready.
+    Start,
+    /// Stop the local server on `MEMORYOS_BIND`.
+    Stop,
     /// Stop the local server on `MEMORYOS_BIND` if one runs, start it in the background, and wait
     /// until it is ready.
     Restart,
+    /// Replace this program with the latest release, then migrate and restart a local server.
+    Update,
     /// Choose, tune and bench the reranking model.
     #[command(subcommand)]
     Reranker(RerankerCommand),
@@ -87,8 +94,11 @@ pub enum KeyCommand {
 pub fn dispatch(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Serve => serve(),
-        Command::Restart => crate::restart::run(),
+        Command::Start => crate::local_server::start(),
+        Command::Stop => crate::local_server::stop(),
+        Command::Restart => crate::local_server::restart(),
         Command::Reranker(command) => reranker::run(command),
+        Command::Update => crate::update::run(),
         Command::Migrate => block_on(migrate()),
         Command::Key(KeyCommand::Create {
             tenant,
