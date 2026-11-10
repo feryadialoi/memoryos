@@ -446,6 +446,7 @@ These are goals, not measured results:
 | Document | Contents |
 |---|---|
 | [`docs/runbook.md`](docs/runbook.md) | Install, upgrades, backup and restore, keys, monitoring, incidents |
+| [`docs/vps-deployment.md`](docs/vps-deployment.md) | Running it privately on a VPS, deployed on every merge |
 | [`docs/SPEC.md`](docs/SPEC.md) | Behavior and contracts |
 | [`docs/comparison.md`](docs/comparison.md) | How MemoryOS differs from Mem0 and Graphiti |
 | [`docs/PLAN.md`](docs/PLAN.md) | Development waves and ownership |
