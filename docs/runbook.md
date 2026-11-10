@@ -60,6 +60,10 @@ Chinese test questions, where fused order alone did for 8, at a median 207 ms pe
   `dc up -d memoryos`. `/readyz` then shows `"reranker":"off"`. `memoryos setup` rewrites its `.env`
   on every run, so add the line again after one.
 - `MEMORYOS_RERANK_TOP` (default 10) caps how many facts one recall sends to it.
+- `MEMORYOS_RERANK_MODEL` picks a smaller model, see `memoryos reranker list`. In Docker set it in
+  the same `.env`. In a local install `memoryos reranker use <model>` writes it to `server.env` and
+  restarts the server, and `memoryos reranker bench` scores every model on the 15 test questions
+  first.
 - An install made before the reranker keeps its old Compose file and the old `1536m` limit. Run
   `memoryos setup` again, which rewrites the Compose file, or for the stack run by hand set
   `MEMORYOS_MEM_LIMIT=2560m` in `deploy/.env`. Otherwise the reranker load can be OOM killed (exit

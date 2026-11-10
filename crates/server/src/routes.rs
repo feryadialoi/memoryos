@@ -240,6 +240,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
         "database": if database_up { "ok" } else { "unavailable" },
         "embedder": embedder.label(),
         "reranker": reranker.label(),
+        "reranker_model": state.reranker_model.map(|model| model.name()),
     });
     (status, Json(body)).into_response()
 }

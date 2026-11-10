@@ -81,6 +81,17 @@ starts the local server on the same address, so hooks, MCP and `credentials.json
 unchanged. The Docker containers are stopped and their volumes kept as they were at the move;
 nothing saved after it goes back to Docker.
 
+The local server reads its settings from `~/.config/memoryos/server.env`. To choose the reranking
+model there, compare them on this machine first, then switch:
+
+```bash
+memoryos reranker bench                    # right-fact-first score and speed of every model
+memoryos reranker use bge-reranker-base    # saves to server.env and restarts the server
+memoryos reranker status                   # settings, and the model the running server uses
+```
+
+`memoryos reranker top 5` reranks fewer facts per recall, and `memoryos reranker use off` turns it off.
+
 | | |
 |---|---|
 | 📁 **Where things live** | `~/.config/memoryos`: `credentials.json` (mode 0600), the database and the generated password |

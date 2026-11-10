@@ -332,6 +332,10 @@ adds a scope rule. A block update that omits `max_chars` keeps its limit.
 
 ## 10. Configuration
 
+`memoryos serve`, `migrate` and `key` read each variable from the environment, then from
+`~/.config/memoryos/server.env` (`$XDG_CONFIG_HOME/memoryos` when set), a file of `KEY=VALUE` lines.
+The environment wins. A missing file is no settings; one that cannot be read stops the command.
+
 | Variable | Default | Notes |
 |---|---|---|
 | `MEMORYOS_STORE` | `postgres` | `postgres` or `sqlite` |
@@ -344,6 +348,7 @@ adds a scope rule. A block update that omits `max_chars` keeps its limit.
 | `MEMORYOS_MODEL_CACHE` | user cache dir | Local models, the embedder's and the reranker's. Leave `HF_HOME` unset, since it overrides this |
 | `MEMORYOS_SINGLE_VALUED_PREDICATES` | the list in section 3, step 6 | Comma list that replaces the default. Names are normalized to lowercase snake case. A value with no names, such as `,`, turns the rule off |
 | `MEMORYOS_RERANKER` | `local` | `local` or `off`. Off saves the 571 MB download and about 1.3 GiB of memory; recall keeps the fused order |
+| `MEMORYOS_RERANK_MODEL` | `bge-reranker-v2-m3` | One of `bge-reranker-v2-m3`, `bge-reranker-base`, `jina-reranker-v1-turbo-en`, `ms-marco-minilm-l6`, each pinned to a Hugging Face revision. `memoryos reranker list` shows sizes and languages |
 | `MEMORYOS_RERANK_TOP` | `10` | Most facts one recall sends to the reranker, as `min(limit * 2, this)`. Below 2 nothing is reranked |
 
 The reranker loads after the embedder. It never stops the server from starting: until it has loaded, or
