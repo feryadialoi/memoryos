@@ -8,7 +8,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::Response;
 use axum::Router;
 use memoryos_core::{Embedder, MemoryStore, Reranker};
-use memoryos_embed::{LocalEmbedder, LocalReranker};
+use memoryos_embed::{LocalEmbedder, LocalReranker, RerankModel};
 use memoryos_ingest::HostCommitter;
 use memoryos_retrieve::Retriever;
 use memoryos_store::Store;
@@ -36,6 +36,8 @@ pub struct AppState {
     pub(crate) failed_auth: Arc<FailedAuthLimiter>,
     pub(crate) readiness: Arc<ModelReadiness>,
     pub(crate) reranker_readiness: Arc<ModelReadiness>,
+    /// The model this server reranks with, `None` when reranking is off.
+    pub(crate) reranker_model: Option<RerankModel>,
     pub(crate) request_timeout: Duration,
 }
 
@@ -50,7 +52,7 @@ fn build_reranker(config: &Config) -> (Option<Arc<dyn Reranker>>, ModelReadiness
     if config.reranker == RerankerMode::Off {
         return (None, ModelReadiness::off());
     }
-    match LocalReranker::new(None) {
+    match LocalReranker::new(None, config.rerank_model) {
         Ok(reranker) => (Some(Arc::new(reranker)), ModelReadiness::default()),
         Err(error) => {
             tracing::warn!(reason = %error, "cannot set up the local reranker, recall keeps the fused order");
@@ -93,6 +95,7 @@ pub async fn serve(
     let memory_store: Arc<dyn MemoryStore> = store.clone();
     let embedder = build_embedder(&config)?;
     let (reranker, reranker_readiness) = build_reranker(&config);
+    let reranker_model = reranker.as_ref().map(|_| config.rerank_model);
     let mut retriever = Retriever::new(memory_store.clone(), embedder.clone());
     if let Some(reranker) = &reranker {
         retriever = retriever.with_reranker(reranker.clone(), config.rerank_top);
@@ -123,6 +126,7 @@ pub async fn serve(
         failed_auth: Arc::new(FailedAuthLimiter::new()),
         readiness,
         reranker_readiness,
+        reranker_model,
         request_timeout: config.request_timeout,
     };
 

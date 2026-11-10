@@ -11,6 +11,7 @@
 #   make docker-upgrade  after pulling new code
 #
 # Local Postgres listens on localhost only and trusts local connections, so it needs no password.
+# `memoryos serve` reads ~/.config/memoryos/server.env; `memoryos reranker` changes its reranker lines.
 
 PG := $(shell brew --prefix postgresql@18 2>/dev/null)/bin
 DIR := $(HOME)/.local/share/memoryos
@@ -19,6 +20,7 @@ PORT ?= 6432
 BIN := $(HOME)/.cargo/bin/memoryos
 PSQL_ARGS := -h localhost -p $(PORT) -U memoryos
 COMPOSE := docker compose -f $(HOME)/.config/memoryos/docker-compose.yml
+SERVER_ENV := $(HOME)/.config/memoryos/server.env
 
 export DATABASE_URL := postgres://memoryos@localhost:$(PORT)/memoryos
 export MEMORYOS_BIND ?= 127.0.0.1:8080
@@ -37,6 +39,9 @@ local-setup: install
 	$(PG)/initdb -D $(PGDATA) -U memoryos --auth=trust -E UTF8 --locale=C
 	$(MAKE) local-db
 	$(PG)/createdb $(PSQL_ARGS) memoryos
+	mkdir -p $(dir $(SERVER_ENV))
+	test -f $(SERVER_ENV) || printf 'DATABASE_URL=%s\nMEMORYOS_BIND=%s\nRUST_LOG=%s\n' \
+		"$(DATABASE_URL)" "$(MEMORYOS_BIND)" "$(RUST_LOG)" > $(SERVER_ENV)
 	$(BIN) migrate
 	cargo clean
 
@@ -55,13 +60,12 @@ local-import: local-db
 
 # Starts the server, or restarts it when it is already running.
 local-start: local-db
-	-pkill -f "$(BIN) serve"
-	nohup $(BIN) serve >> $(DIR)/server.log 2>&1 &
-	until curl -fs -o /dev/null http://$(MEMORYOS_BIND)/readyz; do sleep 1; done
-	@echo "memoryos is running on http://$(MEMORYOS_BIND)"
+	$(BIN) restart
 
+# Postgres refuses to start without a locale ("postmaster became multithreaded during startup"), which a
+# shell started by launchd or cron may not have.
 local-db:
-	$(PG)/pg_ctl -D $(PGDATA) status >/dev/null || $(PG)/pg_ctl -D $(PGDATA) -o "-p $(PORT)" -l $(DIR)/postgres.log start
+	$(PG)/pg_ctl -D $(PGDATA) status >/dev/null || LC_ALL=C $(PG)/pg_ctl -D $(PGDATA) -o "-p $(PORT)" -l $(DIR)/postgres.log start
 
 local-upgrade: install local-db
 	$(BIN) migrate

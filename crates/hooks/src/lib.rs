@@ -25,6 +25,12 @@ use uuid::Uuid;
 
 pub use install::Agent;
 
+/// `$XDG_CONFIG_HOME/memoryos`, or `~/.config/memoryos`: where `credentials.json` and the server's
+/// `server.env` live.
+pub fn config_dir() -> Result<PathBuf, String> {
+    config::memoryos_dir(&config::process_env)
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Search memories.

@@ -1,5 +1,5 @@
-//! On-device reranking with the int8 ONNX export of `BAAI/bge-reranker-v2-m3`, through
-//! `fastembed` and ONNX Runtime.
+//! On-device reranking with the int8 ONNX export of a [`RerankModel`], through `fastembed` and
+//! ONNX Runtime.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,13 +16,9 @@ use memoryos_core::{Error, Reranker, Result};
 use tokio::sync::Mutex;
 
 use crate::local::{model_cache_dir, provider_error_for};
+use crate::models::RerankModel;
 
 const PROVIDER: &str = "local reranker";
-const REPO: &str = "onnx-community/bge-reranker-v2-m3-ONNX";
-/// Pinned, so every machine downloads the same files.
-const REVISION: &str = "6f5ff65298512715a1e669753bc754d2bc8f367b";
-/// 571 MB.
-const MODEL_FILE: &str = "onnx/model_int8.onnx";
 /// Each (query, statement) pair is cut to this many tokens, the longer side first. Facts are short
 /// statements, and 512 made a recall of 20 long statements take 8.7 s, past the timeout.
 const MAX_TOKENS: usize = 256;
@@ -43,10 +39,10 @@ pub struct LocalReranker {
 impl LocalReranker {
     /// Uses `cache_dir`, else `MEMORYOS_MODEL_CACHE`, else `memoryos/models` in the user cache
     /// directory. Creates the directory but loads nothing.
-    pub fn new(cache_dir: Option<PathBuf>) -> Result<Self> {
+    pub fn new(cache_dir: Option<PathBuf>, model: RerankModel) -> Result<Self> {
         let cache_dir = model_cache_dir(cache_dir)?;
         Ok(Self {
-            engine: Engine::new(move || load_model(cache_dir.clone())),
+            engine: Engine::new(move || load_model(cache_dir.clone(), model)),
         })
     }
 }
@@ -62,8 +58,8 @@ impl Reranker for LocalReranker {
     }
 }
 
-fn load_model(cache_dir: PathBuf) -> Result<TextRerank> {
-    let repo = repo(cache_dir)?;
+fn load_model(cache_dir: PathBuf, model: RerankModel) -> Result<TextRerank> {
+    let repo = repo(cache_dir, model)?;
     let fetch = |file: &str| {
         repo.get(file)
             .map_err(|e| provider_error_for(PROVIDER, &format!("download of {file} failed"), &e))
@@ -79,13 +75,13 @@ fn load_model(cache_dir: PathBuf) -> Result<TextRerank> {
         special_tokens_map_file: read("special_tokens_map.json")?,
         tokenizer_config_file: read("tokenizer_config.json")?,
     };
-    let model = UserDefinedRerankingModel::new(fetch(MODEL_FILE)?, tokenizer_files);
+    let onnx = UserDefinedRerankingModel::new(fetch(model.file())?, tokenizer_files);
     // Without PreferCPU, ort registers CoreML on macOS.
     let options = RerankInitOptionsUserDefined::new()
         .with_max_length(MAX_TOKENS)
         .with_auto_device(AutoDevicePolicy::PreferCPU)
         .with_intra_threads(intra_threads());
-    TextRerank::try_new_from_user_defined(model, options)
+    TextRerank::try_new_from_user_defined(onnx, options)
         .map_err(|e| provider_error_for(PROVIDER, "model load failed", &e))
 }
 
@@ -101,7 +97,7 @@ fn intra_threads() -> usize {
 
 /// The Hugging Face settings fastembed uses for the embedder, so both models share one cache and
 /// one set of overrides.
-fn repo(cache_dir: PathBuf) -> Result<ApiRepo> {
+fn repo(cache_dir: PathBuf, model: RerankModel) -> Result<ApiRepo> {
     let cache_dir = std::env::var("HF_HOME")
         .map(PathBuf::from)
         .unwrap_or(cache_dir);
@@ -120,9 +116,9 @@ fn repo(cache_dir: PathBuf) -> Result<ApiRepo> {
         .build()
         .map_err(|e| provider_error_for(PROVIDER, "cannot set up the download", &e))?;
     Ok(api.repo(Repo::with_revision(
-        REPO.to_owned(),
+        model.repo().to_owned(),
         RepoType::Model,
-        REVISION.to_owned(),
+        model.revision().to_owned(),
     )))
 }
 
@@ -324,7 +320,7 @@ mod tests {
     fn new_creates_the_cache_directory_without_loading() {
         let dir = std::env::temp_dir().join(format!("memoryos-rerank-{}", std::process::id()));
         let cache = dir.join("nested");
-        LocalReranker::new(Some(cache.clone())).unwrap();
+        LocalReranker::new(Some(cache.clone()), RerankModel::default()).unwrap();
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }

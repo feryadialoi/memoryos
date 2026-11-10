@@ -4,9 +4,12 @@
 use std::fmt;
 use std::time::Duration;
 
+use memoryos_embed::RerankModel;
 use memoryos_ingest::SingleValued;
 use memoryos_retrieve::DEFAULT_RERANK_TOP;
 use memoryos_store::Backend;
+
+use crate::settings::Lookup;
 
 #[derive(Clone)]
 pub struct Config {
@@ -21,6 +24,8 @@ pub struct Config {
     pub single_valued: SingleValued,
     /// `MEMORYOS_RERANKER`: whether recall reorders its top facts with the local reranker.
     pub reranker: RerankerMode,
+    /// `MEMORYOS_RERANK_MODEL`: which local model reranks, by its name in `RerankModel`.
+    pub rerank_model: RerankModel,
     /// `MEMORYOS_RERANK_TOP`: the most fused facts one recall sends to the reranker.
     pub rerank_top: usize,
     /// `MEMORYOS_TEST_EMBEDDER`, in milliseconds per call: use the test embedder, not the model.
@@ -46,20 +51,52 @@ impl fmt::Debug for Config {
 
 pub type ConfigResult<T> = std::result::Result<T, String>;
 
+pub const DEFAULT_BIND: &str = "0.0.0.0:8080";
+
+/// The three reranker settings, which `memoryos reranker` reads without the rest of the
+/// configuration, so it works where `DATABASE_URL` is not set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RerankerSettings {
+    pub mode: RerankerMode,
+    pub model: RerankModel,
+    pub top: usize,
+}
+
+impl RerankerSettings {
+    pub fn from_lookup(lookup: &Lookup) -> ConfigResult<Self> {
+        Self::from_get(&|name: &str| lookup.get(name))
+    }
+
+    fn from_get(get: &impl Fn(&str) -> Option<String>) -> ConfigResult<Self> {
+        Ok(Self {
+            mode: reranker_mode(get)?,
+            model: get("MEMORYOS_RERANK_MODEL")
+                .map(|name| name.parse())
+                .transpose()
+                .map_err(|e| format!("MEMORYOS_RERANK_MODEL: {e}"))?
+                .unwrap_or_default(),
+            top: number(get, "MEMORYOS_RERANK_TOP", DEFAULT_RERANK_TOP)?,
+        })
+    }
+}
+
 impl Config {
+    /// The process environment, then `server.env`.
     pub fn from_env() -> ConfigResult<Self> {
-        Self::from_lookup(|name| std::env::var(name).ok())
+        let lookup = Lookup::load()?;
+        Self::from_lookup(|name| lookup.get(name))
     }
 
     /// An empty variable counts as unset, as it does for most tools reading the same environment.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> ConfigResult<Self> {
         let get = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
         let (store_backend, database_url) = database_from(&get)?;
+        let rerank = RerankerSettings::from_get(&get)?;
 
         Ok(Self {
             store_backend,
             database_url,
-            bind: get("MEMORYOS_BIND").unwrap_or_else(|| "0.0.0.0:8080".into()),
+            bind: get("MEMORYOS_BIND").unwrap_or_else(|| DEFAULT_BIND.into()),
             db_max_connections: number(&get, "MEMORYOS_DB_MAX_CONNECTIONS", 20)?,
             rate_limit_rps: number(&get, "MEMORYOS_RATE_LIMIT_RPS", 100)?,
             request_timeout: Duration::from_secs(number(
@@ -70,8 +107,9 @@ impl Config {
             single_valued: get("MEMORYOS_SINGLE_VALUED_PREDICATES")
                 .map(|list| SingleValued::parse(&list))
                 .unwrap_or_default(),
-            reranker: reranker_mode(&get)?,
-            rerank_top: number(&get, "MEMORYOS_RERANK_TOP", DEFAULT_RERANK_TOP)?,
+            reranker: rerank.mode,
+            rerank_model: rerank.model,
+            rerank_top: rerank.top,
             #[cfg(feature = "test-embedder")]
             test_embedder_delay: get("MEMORYOS_TEST_EMBEDDER")
                 .map(|millis| {
@@ -86,9 +124,10 @@ impl Config {
     }
 }
 
-/// For the commands that only touch the database.
+/// For the commands that only touch the database. The process environment, then `server.env`.
 pub fn database_from_env() -> ConfigResult<(Backend, String)> {
-    database_from(&|name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
+    let lookup = Lookup::load()?;
+    database_from(&|name: &str| lookup.get(name))
 }
 
 fn database_from(get: &impl Fn(&str) -> Option<String>) -> ConfigResult<(Backend, String)> {
@@ -223,6 +262,16 @@ mod tests {
         assert_eq!(config.rerank_top, 8);
         let config = load(&[DB, ("MEMORYOS_RERANKER", "local")]).expect("valid");
         assert_eq!(config.reranker, RerankerMode::Local);
+    }
+
+    #[test]
+    fn the_rerank_model_defaults_and_is_chosen_by_name() {
+        let config = load(&[DB]).expect("valid");
+        assert_eq!(config.rerank_model, RerankModel::BgeRerankerV2M3);
+        let config = load(&[DB, ("MEMORYOS_RERANK_MODEL", "ms-marco-minilm-l6")]).expect("valid");
+        assert_eq!(config.rerank_model, RerankModel::MsMarcoMiniLmL6);
+        let bad = load(&[DB, ("MEMORYOS_RERANK_MODEL", "gpt-5")]);
+        assert!(message(bad).contains("MEMORYOS_RERANK_MODEL"));
     }
 
     #[test]

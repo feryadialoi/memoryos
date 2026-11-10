@@ -17,7 +17,8 @@ use uuid::Uuid;
 
 use crate::auth::{generate_token, hash_token, validate_pattern};
 use crate::config::{database_from_env, Config};
-use crate::{app, telemetry, tui, ui};
+use crate::reranker::RerankerCommand;
+use crate::{app, reranker, telemetry, tui, ui};
 
 const ADMIN_DB_CONNECTIONS: u32 = 2;
 /// Blocking tasks cannot be cancelled, and a stalled model download is one. Past this the process
@@ -33,8 +34,14 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run the API server.
+    /// Run the API server. Reads `~/.config/memoryos/server.env` under the environment.
     Serve,
+    /// Stop the local server on `MEMORYOS_BIND` if one runs, start it in the background, and wait
+    /// until it is ready.
+    Restart,
+    /// Choose, tune and bench the reranking model.
+    #[command(subcommand)]
+    Reranker(RerankerCommand),
     /// Apply database migrations.
     Migrate,
     /// Manage API keys.
@@ -80,6 +87,8 @@ pub enum KeyCommand {
 pub fn dispatch(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Serve => serve(),
+        Command::Restart => crate::restart::run(),
+        Command::Reranker(command) => reranker::run(command),
         Command::Migrate => block_on(migrate()),
         Command::Key(KeyCommand::Create {
             tenant,
