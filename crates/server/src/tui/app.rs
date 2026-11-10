@@ -12,16 +12,19 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
+use super::map::{Direction, Graph};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Facts,
     Review,
     Ask,
     Timeline,
+    Map,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Facts, Tab::Review, Tab::Ask, Tab::Timeline];
+    const ALL: [Tab; 5] = [Tab::Facts, Tab::Review, Tab::Ask, Tab::Timeline, Tab::Map];
 
     fn title(self) -> &'static str {
         match self {
@@ -29,6 +32,7 @@ impl Tab {
             Tab::Review => "Review",
             Tab::Ask => "Ask",
             Tab::Timeline => "Timeline",
+            Tab::Map => "Map",
         }
     }
 
@@ -91,6 +95,9 @@ pub struct App {
     pub timeline: Vec<FactView>,
     pub review: Vec<Fact>,
     pub answers: Vec<ScoredFact>,
+    pub map: Option<Graph>,
+    /// On Map, the selected node's facts are listed to choose one to open.
+    entity: bool,
     question: String,
     selected: usize,
     /// Text being typed after `/`: a question on Ask, a filter elsewhere.
@@ -175,6 +182,13 @@ impl App {
                 KeyCode::Enter => {
                     let text = self.input.take().unwrap_or_default();
                     self.selected = 0;
+                    if self.tab() == Tab::Map {
+                        let found = self.map.as_mut().is_some_and(|map| map.find(&text));
+                        if !found && !text.trim().is_empty() {
+                            self.say(format!("Nothing on the map is named \"{}\".", clean(&text)));
+                        }
+                        return Effect::None;
+                    }
                     if self.tab() == Tab::Ask {
                         let question = text.trim().to_owned();
                         return if question.is_empty() || self.scope().is_none() {
@@ -202,13 +216,18 @@ impl App {
             }
             return Effect::None;
         }
+        if self.tab() == Tab::Map {
+            if let Some(effect) = self.map_key(key.code) {
+                return effect;
+            }
+        }
         match key.code {
             KeyCode::Char('q') => Effect::Quit,
             KeyCode::Esc => {
                 self.filter.clear();
                 Effect::None
             }
-            KeyCode::Char(c @ '1'..='4') => self.switch(Tab::ALL[c as usize - '1' as usize]),
+            KeyCode::Char(c @ '1'..='5') => self.switch(Tab::ALL[c as usize - '1' as usize]),
             KeyCode::Tab => self.switch(Tab::ALL[(self.tab().index() + 1) % Tab::ALL.len()]),
             KeyCode::Char(']') => self.move_scope(1),
             KeyCode::Char('[') => self.move_scope(self.scopes.len().saturating_sub(1)),
@@ -240,8 +259,44 @@ impl App {
         }
     }
 
+    /// Keys only Map has. `None` leaves the key to the keys every view has.
+    fn map_key(&mut self, code: KeyCode) -> Option<Effect> {
+        if self.entity {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => self.entity = false,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let last = self.rows().len().saturating_sub(1);
+                    self.selected = (self.selected + 1).min(last);
+                }
+                KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
+                KeyCode::Enter => return Some(self.chosen().map_or(Effect::None, Effect::Open)),
+                _ => {}
+            }
+            return Some(Effect::None);
+        }
+        let map = self.map.as_mut()?;
+        match code {
+            KeyCode::Left | KeyCode::Char('h') => map.hop(Direction::Left),
+            KeyCode::Right | KeyCode::Char('l') => map.hop(Direction::Right),
+            KeyCode::Up | KeyCode::Char('k') => map.hop(Direction::Up),
+            KeyCode::Down | KeyCode::Char('j') => map.hop(Direction::Down),
+            KeyCode::Char('+' | '=') => map.zoom_in(),
+            KeyCode::Char('-') => map.zoom_out(),
+            KeyCode::Char('0') => map.fit(),
+            KeyCode::Enter => {
+                if map.selected().is_some_and(|node| !node.facts.is_empty()) {
+                    self.entity = true;
+                    self.selected = 0;
+                }
+            }
+            _ => return None,
+        }
+        Some(Effect::None)
+    }
+
     fn switch(&mut self, tab: Tab) -> Effect {
         self.tab = TabState(tab);
+        self.entity = false;
         self.selected = 0;
         self.filter.clear();
         if tab == Tab::Ask {
@@ -257,6 +312,7 @@ impl App {
         }
         self.scope = (self.scope + step) % self.scopes.len();
         self.selected = 0;
+        self.entity = false;
         self.answers.clear();
         self.question.clear();
         Effect::LoadTab
@@ -326,6 +382,21 @@ impl App {
                     rank: Some(rank + 1),
                 })
                 .collect(),
+            Tab::Map => {
+                let Some(map) = &self.map else {
+                    return Vec::new();
+                };
+                map.selected().map_or_else(Vec::new, |node| {
+                    node.facts
+                        .iter()
+                        .map(|at| Row {
+                            fact: &map.facts[*at].fact,
+                            subject: None,
+                            rank: None,
+                        })
+                        .collect()
+                })
+            }
         }
     }
 
@@ -338,7 +409,20 @@ impl App {
         .areas(frame.area());
         self.draw_header(frame, header);
         let rows = self.rows();
-        if body.width >= PREVIEW_MIN_WIDTH && !rows.is_empty() {
+        if self.tab() == Tab::Map {
+            match &self.map {
+                Some(map) => map.draw(
+                    frame,
+                    body,
+                    self.scope_line(),
+                    body.width >= PREVIEW_MIN_WIDTH,
+                ),
+                None => self.draw_list(frame, body, &[]),
+            }
+            if self.entity {
+                self.draw_entity(frame, &rows);
+            }
+        } else if body.width >= PREVIEW_MIN_WIDTH && !rows.is_empty() {
             let [list, preview] =
                 Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                     .areas(body);
@@ -361,6 +445,8 @@ impl App {
             (Tab::Review, count(|s| s.quarantined)),
             (Tab::Ask, None),
             (Tab::Timeline, count(|s| s.current + s.past)),
+            // The scope's entity count includes ones only past facts name, which the map leaves out.
+            (Tab::Map, None),
         ]
         .into_iter()
         .enumerate()
@@ -422,6 +508,7 @@ impl App {
                 question => format!(" Ask: {} ", clean(question)),
             },
             Tab::Timeline => " Everything, oldest first ".to_owned(),
+            Tab::Map => " Map ".to_owned(),
         };
         if !self.filter.is_empty() {
             title.push_str(&format!("· filter \"{}\" ", clean(&self.filter)));
@@ -511,7 +598,7 @@ impl App {
                 format!("{}  {}", trust(row.fact.trust), date(row.fact.recorded_at)),
                 Style::new().fg(MUTED),
             ),
-            Tab::Facts | Tab::Ask => (date(row.fact.valid_from), Style::new().fg(MUTED)),
+            Tab::Facts | Tab::Ask | Tab::Map => (date(row.fact.valid_from), Style::new().fg(MUTED)),
         };
         let room = width.saturating_sub(prefix.width() + right.width() + 2);
         let text = fit(&clean(&row.fact.statement), room);
@@ -544,6 +631,24 @@ impl App {
             ))
         } else if self.detail.is_some() {
             hints(&[("↑↓", "scroll"), ("Esc", "close")])
+        } else if self.entity {
+            hints(&[
+                ("↑↓", "move"),
+                ("Enter", "open"),
+                ("Esc", "back to the map"),
+            ])
+        } else if self.tab() == Tab::Map {
+            hints(&[
+                ("1-5", "view"),
+                ("[ ]", "scope"),
+                ("←↑↓→", "hop"),
+                ("+ -", "zoom"),
+                ("0", "fit"),
+                ("Enter", "facts"),
+                ("/", "find"),
+                ("R", "reload"),
+                ("q", "quit"),
+            ])
         } else {
             let slash = if self.tab() == Tab::Ask {
                 "ask"
@@ -551,7 +656,7 @@ impl App {
                 "filter"
             };
             let mut keys = vec![
-                ("1-4", "view"),
+                ("1-5", "view"),
                 ("[ ]", "scope"),
                 ("↑↓", "move"),
                 ("Enter", "open"),
@@ -565,12 +670,44 @@ impl App {
         };
         frame.render_widget(Paragraph::new(line), area);
     }
+
+    /// The selected node's facts over the map, to choose one to open.
+    fn draw_entity(&self, frame: &mut Frame, rows: &[Row]) {
+        let Some(node) = self.map.as_ref().and_then(Graph::selected) else {
+            return;
+        };
+        let area = centered(frame.area(), 80, 70);
+        let width = area.width.saturating_sub(4) as usize;
+        let items: Vec<ListItem> = rows
+            .iter()
+            .map(|row| ListItem::new(self.row_line(row, width)))
+            .collect();
+        let mut state = ListState::default().with_selected(Some(self.selected));
+        frame.render_widget(Clear, area);
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().fg(ACCENT))
+                        .title(Span::styled(
+                            format!(" {} · {} ", clean(&node.name), humanize(&node.kind)),
+                            Style::new().bold(),
+                        )),
+                )
+                .highlight_style(Style::new().bg(SELECTED).bold())
+                .highlight_symbol("▌ ")
+                .highlight_spacing(ratatui::widgets::HighlightSpacing::Always),
+            area,
+            &mut state,
+        );
+    }
 }
 
 /// Lines terminals below this width give the list alone, without the preview.
 const PREVIEW_MIN_WIDTH: u16 = 110;
-const ACCENT: Color = Color::Cyan;
-const MUTED: Color = Color::DarkGray;
+pub(super) const ACCENT: Color = Color::Cyan;
+pub(super) const MUTED: Color = Color::DarkGray;
 const SELECTED: Color = Color::Indexed(237);
 
 fn hints(keys: &[(&str, &str)]) -> Line<'static> {
@@ -589,7 +726,7 @@ fn hints(keys: &[(&str, &str)]) -> Line<'static> {
 }
 
 /// `text` cut to `room` columns, with an ellipsis when cut. Wide characters count as two.
-fn fit(text: &str, room: usize) -> String {
+pub(super) fn fit(text: &str, room: usize) -> String {
     if text.width() <= room {
         return text.to_owned();
     }
@@ -742,7 +879,7 @@ fn date(at: DateTime<Utc>) -> String {
     at.format("%Y-%m-%d").to_string()
 }
 
-fn humanize(predicate: &str) -> String {
+pub(super) fn humanize(predicate: &str) -> String {
     clean(&predicate.replace('_', " "))
 }
 
@@ -975,6 +1112,32 @@ mod tests {
             !screen(&app, 90).contains("Selected"),
             "no room for it at 90 columns"
         );
+    }
+
+    #[test]
+    fn map_shows_names_and_enter_lists_a_nodes_facts_to_open() {
+        let mut app = with_facts();
+        assert_eq!(press(&mut app, KeyCode::Char('5')), Effect::LoadTab);
+        assert_eq!(app.tab(), Tab::Map);
+        app.map = Some(Graph::new(super::super::map::tests::sample()));
+        let text = screen(&app, 140);
+        assert!(text.contains("Map · 4 people and things"), "{text}");
+        assert!(text.contains("◉ Ada"), "{text}");
+        assert!(text.contains("● Bandung"), "{text}");
+        assert!(text.contains("Selected"), "{text}");
+
+        // Arrows hop on the map instead of moving a list.
+        assert_eq!(press(&mut app, KeyCode::Down), Effect::None);
+        press(&mut app, KeyCode::Char('/'));
+        typed(&mut app, "ada");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(press(&mut app, KeyCode::Enter), Effect::None);
+        assert!(screen(&app, 140).contains("Ada · person"));
+        press(&mut app, KeyCode::Down);
+        let second = app.rows()[1].fact.id;
+        assert_eq!(press(&mut app, KeyCode::Enter), Effect::Open(second));
+        press(&mut app, KeyCode::Esc);
+        assert!(!screen(&app, 140).contains("Ada · person"));
     }
 
     #[test]

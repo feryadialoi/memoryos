@@ -1,10 +1,12 @@
-//! `memoryos tui`: the `memoryos ui` page's Facts, Review, Ask and Timeline views, in the terminal.
+//! `memoryos tui`: the `memoryos ui` page's Facts, Review, Ask, Timeline and Map views, in the
+//! terminal.
 //!
 //! It talks to the server with the same key from `credentials.json`, and every request goes
 //! through the page's allowlist ([`crate::ui::upstream_path`]), so it can read and review but never
 //! purge, retract, delete or write facts.
 
 mod app;
+mod map;
 
 use std::time::Duration;
 
@@ -16,6 +18,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub use app::{App, Decision, Detail, Effect, Tab};
+pub use map::Graph;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// How many facts a list view loads. The web page uses the same order of magnitude.
@@ -196,6 +199,20 @@ async fn load_tab(app: &mut App, api: &Api) -> Result<(), String> {
                 .get("quarantine", &[("scopes", &scope), ("limit", "200")])
                 .await?;
             app.review = facts.facts;
+        }
+        Tab::Map => {
+            let limit = map::LIMIT.to_string();
+            let facts: Facts<FactView> = api
+                .get(
+                    "facts",
+                    &[("scope", &scope), ("state", "current"), ("limit", &limit)],
+                )
+                .await?;
+            let mut graph = Graph::new(facts.facts);
+            if let Some(node) = app.map.as_ref().and_then(Graph::selected) {
+                graph.keep_selection(node.id);
+            }
+            app.map = Some(graph);
         }
         Tab::Ask => {}
     }
