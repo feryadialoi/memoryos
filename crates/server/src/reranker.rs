@@ -87,7 +87,7 @@ fn status() -> Result<(), String> {
 /// What `/readyz` says, and whether the server runs other settings than the file's.
 fn server_line(bind: &str, current: RerankerSettings) -> String {
     let Ok(address) = bind.trim().parse() else {
-        return format!("MEMORYOS_BIND {bind:?} is not an address like 127.0.0.1:8080");
+        return format!("MEMORYOS_BIND {bind:?} is not an address like 127.0.0.1:6366");
     };
     let url = crate::local_server::ready_url(address);
     let Some(body) = fetch(&url) else {

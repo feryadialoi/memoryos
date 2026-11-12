@@ -4,7 +4,7 @@
 //! use memoryos_sdk::{date, Commit, CommitFact, EntityRef, MemoryOs, Scope};
 //!
 //! # async fn example() -> Result<(), memoryos_sdk::Error> {
-//! let mem = MemoryOs::connect("http://localhost:8080", "mos_...").await?;
+//! let mem = MemoryOs::connect("http://localhost:6366", "mos_...").await?;
 //! let user = Scope::user("u_123");
 //!
 //! let fact = CommitFact::new("Ada moved to Bandung", EntityRef::new("Ada", "person"), "lives_in");

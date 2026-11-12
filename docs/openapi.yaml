@@ -3,7 +3,7 @@ info:
   title: MemoryOS API
   version: 0.1.0
 servers:
-  - url: http://localhost:8080
+  - url: http://localhost:6366
 security:
   - bearer: []
 paths:

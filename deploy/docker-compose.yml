@@ -68,7 +68,7 @@ services:
     security_opt:
       - no-new-privileges:true
     ports:
-      - ${MEMORYOS_PUBLISH:-127.0.0.1:8080}:8080
+      - ${MEMORYOS_PUBLISH:-127.0.0.1:6366}:6366
     volumes:
       - model-cache:/var/lib/memoryos/models
     environment:

@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/feryadialoi/memoryos/main/install.s
 ```
 
 It puts `memoryos` in `~/.local/bin` and runs `memoryos setup --local`: SQLite in
-`~/.local/share/memoryos`, the server on `127.0.0.1:8080` with the `bge-reranker-base` reranker,
+`~/.local/share/memoryos`, the server on `127.0.0.1:6366` with the `bge-reranker-base` reranker,
 two keys, and Claude Code's hooks and MCP. The first start downloads about 760 MB of models. After
 a reboot, the `memoryos mcp` that Claude Code launches starts the server again.
 `MEMORYOS_AGENT=opencode` or `pi` connects another agent.

@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::credentials;
 
-pub const DEFAULT_URL: &str = "http://localhost:8080";
+pub const DEFAULT_URL: &str = "http://localhost:6366";
 const DEFAULT_HOOK_SCOPES: &str = "agent:coding-agent";
 const DEFAULT_STOP_EVERY: u64 = 20;
 
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn url_defaults_and_loses_its_trailing_slash() {
-        assert_eq!(base_url(&with(&[])).expect("url"), "http://localhost:8080");
+        assert_eq!(base_url(&with(&[])).expect("url"), "http://localhost:6366");
         let env = with(&[("MEMORYOS_URL", "https://m.example/base/")]);
         assert_eq!(base_url(&env).expect("url"), "https://m.example/base");
     }

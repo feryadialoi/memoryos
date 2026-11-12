@@ -23,7 +23,7 @@ COMPOSE := docker compose -f $(HOME)/.config/memoryos/docker-compose.yml
 SERVER_ENV := $(HOME)/.config/memoryos/server.env
 
 export DATABASE_URL := postgres://memoryos@localhost:$(PORT)/memoryos
-export MEMORYOS_BIND ?= 127.0.0.1:8080
+export MEMORYOS_BIND ?= 127.0.0.1:6366
 export RUST_LOG ?= info,opentelemetry=warn,opentelemetry_sdk=warn,hyper=warn
 
 .PHONY: help install local-setup local-import local-start local-db local-upgrade docker-setup docker-upgrade

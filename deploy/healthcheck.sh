@@ -4,7 +4,7 @@
 # not reachable from here; override the healthcheck in that case.
 set -eu
 
-bind=${MEMORYOS_BIND:-0.0.0.0:8080}
+bind=${MEMORYOS_BIND:-0.0.0.0:6366}
 exec 3<>"/dev/tcp/127.0.0.1/${bind##*:}"
 printf 'GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3
 read -r _ status _ <&3
