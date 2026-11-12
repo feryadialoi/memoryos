@@ -58,7 +58,7 @@ fn bind() -> Result<(String, SocketAddr), String> {
     let address = bind
         .trim()
         .parse()
-        .map_err(|_| format!("MEMORYOS_BIND {bind:?} is not an address like 127.0.0.1:8080"))?;
+        .map_err(|_| format!("MEMORYOS_BIND {bind:?} is not an address like 127.0.0.1:6366"))?;
     Ok((bind, address))
 }
 
@@ -233,8 +233,8 @@ mod tests {
     #[test]
     fn an_unspecified_bind_is_checked_on_loopback() {
         let url = |bind: &str| ready_url(bind.parse().expect("address"));
-        assert_eq!(url("0.0.0.0:8080"), "http://127.0.0.1:8080/readyz");
+        assert_eq!(url("0.0.0.0:6366"), "http://127.0.0.1:6366/readyz");
         assert_eq!(url("127.0.0.1:9000"), "http://127.0.0.1:9000/readyz");
-        assert_eq!(url("[::]:8080"), "http://[::1]:8080/readyz");
+        assert_eq!(url("[::]:6366"), "http://[::1]:6366/readyz");
     }
 }

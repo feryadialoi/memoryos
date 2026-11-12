@@ -40,11 +40,11 @@ To run the stack by hand from the repository instead:
 cp deploy/.env.example deploy/.env
 sed -i.bak "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 32)/" deploy/.env && rm deploy/.env.bak
 dc up -d --build
-until curl -sf http://localhost:8080/readyz; do sleep 5; done
+until curl -sf http://localhost:6366/readyz; do sleep 5; done
 ```
 
 The stack is `postgres` (not published on the host), `migrate` (one-shot) and `memoryos` (published on
-`127.0.0.1:8080`). MemoryOS needs no LLM key. `/healthz`, `/readyz` and `/metrics` answer without a token, so
+`127.0.0.1:6366`). MemoryOS needs no LLM key. `/healthz`, `/readyz` and `/metrics` answer without a token, so
 keep a TLS reverse proxy in front before setting `MEMORYOS_PUBLISH` to a public address.
 
 Leave `HF_HOME` unset, because it overrides `MEMORYOS_MODEL_CACHE`.
@@ -148,7 +148,7 @@ until dc exec -T postgres pg_isready -U memoryos -d memoryos; do sleep 1; done
 dc exec -T postgres psql -U memoryos -d memoryos -c "CREATE ROLE memoryos_app NOLOGIN;"
 dc exec -T postgres pg_restore -U memoryos -d memoryos --exit-on-error < memoryos.dump
 dc up -d
-until curl -sf http://localhost:8080/readyz; do sleep 5; done
+until curl -sf http://localhost:6366/readyz; do sleep 5; done
 ```
 
 The order matters:
@@ -258,9 +258,9 @@ An admin key reviews facts that the trust gate held back. Each scope is named ex
 Commits to `user:*` or `shared:*` always land here.
 
 ```bash
-curl -sS -H "Authorization: Bearer $TOKEN" "http://localhost:8080/v1/quarantine?scopes=user:alice"
-curl -sS -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:8080/v1/quarantine/$FACT_ID/approve"
-curl -sS -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:8080/v1/quarantine/$FACT_ID/reject"
+curl -sS -H "Authorization: Bearer $TOKEN" "http://localhost:6366/v1/quarantine?scopes=user:alice"
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:6366/v1/quarantine/$FACT_ID/approve"
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:6366/v1/quarantine/$FACT_ID/reject"
 ```
 
 - Quarantined and rejected facts never appear in recall. The drill returned no facts for
@@ -272,7 +272,7 @@ curl -sS -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:8080/v1/qua
   restored:
 
 ```bash
-curl -sS -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:8080/v1/episodes/$EPISODE_ID/purge"
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:6366/v1/episodes/$EPISODE_ID/purge"
 ```
 
 - The trail is in `audit_events`:

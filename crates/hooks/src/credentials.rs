@@ -76,7 +76,7 @@ mod tests {
 
     fn sample() -> Credentials {
         Credentials {
-            url: "http://127.0.0.1:8080".to_owned(),
+            url: "http://127.0.0.1:6366".to_owned(),
             agent_key: Some("mos_agent".to_owned()),
             admin_key: Some("mos_admin".to_owned()),
         }

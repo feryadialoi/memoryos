@@ -44,7 +44,7 @@ struct Wiremock {
 async fn start_wiremock() -> Wiremock {
     let slot = WIREMOCK_SLOTS.acquire().await.expect("never closed");
     let container = GenericImage::new("wiremock/wiremock", "3.3.1")
-        .with_exposed_port(8080.tcp())
+        .with_exposed_port(6366.tcp())
         .with_wait_for(WaitFor::message_on_stdout("port:"))
         .with_startup_timeout(Duration::from_secs(120))
         // Without a limit the JVM takes a quarter of the Docker VM, and two of these grew to about
@@ -55,7 +55,7 @@ async fn start_wiremock() -> Wiremock {
         .await
         .expect("wiremock starts");
     let port = container
-        .get_host_port_ipv4(8080.tcp())
+        .get_host_port_ipv4(6366.tcp())
         .await
         .expect("mapped port");
     let url = format!("http://127.0.0.1:{port}");

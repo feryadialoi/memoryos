@@ -22,7 +22,7 @@ use crate::SetupArgs;
 const COMPOSE_FILE: &str = include_str!("../../../deploy/docker-compose.yml");
 const DEFAULT_PROJECT: &str = "memoryos";
 const DEFAULT_IMAGE: &str = "memoryos:local";
-const DEFAULT_PUBLISH: &str = "127.0.0.1:8080";
+const DEFAULT_PUBLISH: &str = "127.0.0.1:6366";
 const TENANT: &str = "local";
 const POSTGRES_DIR_IN_CONTAINER: &str = "/var/lib/postgresql/data";
 /// Compose gets these from `.env`. A value in the user's shell would override the file.
@@ -518,7 +518,7 @@ fn http_client() -> Result<reqwest::Client, String> {
 
 /// Settings `setup --local` writes to `server.env` when the file has none of its own, so a second
 /// run keeps what the user changed, such as the reranking model or a Postgres `DATABASE_URL`.
-const LOCAL_BIND: &str = "127.0.0.1:8080";
+const LOCAL_BIND: &str = "127.0.0.1:6366";
 /// As accurate as the larger default on the bench, and about three times faster.
 const LOCAL_RERANK_MODEL: &str = "bge-reranker-base";
 
@@ -1054,7 +1054,7 @@ mod tests {
             Some("bge-reranker-base")
         );
         let stored = sandbox.credentials();
-        assert_eq!(stored.url, "http://127.0.0.1:8080");
+        assert_eq!(stored.url, "http://127.0.0.1:6366");
         assert_eq!(stored.agent_key.as_deref(), Some("mos_local_0"));
         assert_eq!(stored.admin_key.as_deref(), Some("mos_local_1"));
         assert!(sandbox.project.join(".mcp.json").exists());
@@ -1185,7 +1185,7 @@ mod tests {
         sandbox.setup(&stack, Agent::ClaudeCode).expect("setup");
 
         let stored = sandbox.credentials();
-        assert_eq!(stored.url, "http://127.0.0.1:8080");
+        assert_eq!(stored.url, "http://127.0.0.1:6366");
         let agent = stored.agent_key.expect("agent key");
         let admin = stored.admin_key.expect("admin key");
         assert!(agent.contains("agent"), "{agent}");

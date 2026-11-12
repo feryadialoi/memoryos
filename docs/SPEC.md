@@ -340,7 +340,7 @@ The environment wins. A missing file is no settings; one that cannot be read sto
 |---|---|---|
 | `MEMORYOS_STORE` | `postgres` | `postgres` or `sqlite` |
 | `DATABASE_URL` | required | PostgreSQL URL, or a `sqlite:` URL such as `sqlite:///absolute/path/memoryos.db` |
-| `MEMORYOS_BIND` | `0.0.0.0:8080` | |
+| `MEMORYOS_BIND` | `0.0.0.0:6366` | |
 | `MEMORYOS_DB_MAX_CONNECTIONS` | `20` | PostgreSQL only; SQLite uses one connection |
 | `MEMORYOS_RATE_LIMIT_RPS` | `100` | Per key |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Traces are exported only when set |

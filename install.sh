@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/feryadialoi/memoryos/main/install.sh | bash
 #
 # Downloads the latest release into ~/.local/bin, checks its SHA-256, then runs
-# `memoryos setup --local`: SQLite in ~/.local/share/memoryos, the server on 127.0.0.1:8080, the
+# `memoryos setup --local`: SQLite in ~/.local/share/memoryos, the server on 127.0.0.1:6366, the
 # bge-reranker-base reranker, two keys, and Claude Code's hooks and MCP in ~/.claude.
 #
 # MEMORYOS_BIN_DIR   where to put the program (default ~/.local/bin)

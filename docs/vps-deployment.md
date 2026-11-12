@@ -41,7 +41,7 @@ docker compose -f deploy/docker-compose.yml exec memoryos memoryos key create \
 ```
 
 It prints the token once. A process on the VPS reaches the server at `http://127.0.0.1:8280`. A
-container reaches it by joining the `memoryos_default` network and using `http://memoryos:8080`,
+container reaches it by joining the `memoryos_default` network and using `http://memoryos:6366`,
 since the host's loopback is not visible from inside a container.
 
 ## Operating it
