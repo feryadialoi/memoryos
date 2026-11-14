@@ -350,9 +350,11 @@ searched at the present only; older versions are read by version.
      each part keeping the heading. Empty sections are dropped. Sections never change after insert.
   3. Embed `heading + "\n" + text` for every section in one embedder call. If that fails, nothing is
      stored and the response is `provider_error`.
-  4. The store applies the write atomically. `expected_version` omitted creates the page and fails
-     with `version_conflict` if it exists. Set, the page must exist (`not_found`) and that version must
-     be current (`version_conflict`, current 0 when the page has no current version yet).
+  4. The store applies the write atomically. `expected_version` omitted creates the page, or adds a
+     first version with no base to a page that has no current version (its versions are all pending or
+     rejected), and fails with `version_conflict` when the page has a current version. Set, the page
+     must exist (`not_found`) and that version must be current (`version_conflict`, current 0 when the
+     page has no current version).
   5. Status. Write trust is `agent`, or `external` when the key's `max_trust` is `external`. The version
      is quarantined when the source rule of section 5 applies (`external` anywhere, `agent` in
      `user:*` or `shared:*`) or when the current version's trust is higher than the write's, and active

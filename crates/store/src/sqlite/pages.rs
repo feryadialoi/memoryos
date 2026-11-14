@@ -343,6 +343,9 @@ pub(super) async fn put_page(
             .map_err(db)?;
             PageRow { id, current: None }
         }
+        // A page with no current version, because its only versions are pending or rejected, takes
+        // another first version, so a rejected first draft never leaves its slug stuck.
+        (Some(existing), None) if existing.current.is_none() => existing,
         (Some(existing), None) => {
             return Err(Error::VersionConflict {
                 expected: 0,

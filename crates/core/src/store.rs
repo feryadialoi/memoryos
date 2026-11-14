@@ -194,7 +194,8 @@ pub trait MemoryStore: Send + Sync {
         version: i64,
     ) -> Result<PageVersion>;
     /// Writes a new version atomically:
-    /// - `expected_version = None` creates the page and fails with `VersionConflict` if it exists.
+    /// - `expected_version = None` creates the page, or adds a version with no base to a page with
+    ///   no current version, and fails with `VersionConflict` when the page has a current version.
     ///   `Some(v)` fails with `NotFound` if the page does not exist, and with `VersionConflict`
     ///   unless `v` is the current version. A page with no current version reports current 0.
     /// - With `approve_up_to = Some(t)`, the version is active, unless the current version's trust

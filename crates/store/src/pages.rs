@@ -304,6 +304,9 @@ pub(crate) async fn put_page(
             }
             LockedPage { id, current: None }
         }
+        // A page with no current version, because its only versions are pending or rejected, takes
+        // another first version, so a rejected first draft never leaves its slug stuck.
+        (Some(existing), None) if existing.current.is_none() => existing,
         (Some(existing), None) => {
             return Err(Error::VersionConflict {
                 expected: 0,

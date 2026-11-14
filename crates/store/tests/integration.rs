@@ -3814,23 +3814,42 @@ async fn pages_create_read_update_and_report_version_conflicts() -> TestResult {
         db.store.get_page_version(&c, Uuid::now_v7(), 1).await
     ));
 
-    // A page whose only version is pending reports current 0 to a create and to an edit.
+    // A page with no current version takes another first version, and an edit reports current 0.
     let shared = Scope::shared("team");
-    db.store
+    let held = db
+        .store
         .put_page(&c, page_write(&shared, "held", "x", Trust::Agent, None, 0))
         .await?;
+    let second = db
+        .store
+        .put_page(&c, page_write(&shared, "held", "y", Trust::Agent, None, 0))
+        .await?;
+    assert_eq!(second.version, 2);
+    assert_eq!(second.base_version, None);
+    assert_eq!(second.status, PageVersionStatus::Quarantined);
+    // Approving one first version makes the other stale.
+    db.store.approve_page_version(&c, held.page_id, 1).await?;
     assert!(is_conflict(
-        db.store
-            .put_page(&c, page_write(&shared, "held", "y", Trust::Agent, None, 0))
-            .await,
+        db.store.approve_page_version(&c, held.page_id, 2).await,
         0,
-        0
+        1
     ));
+    // A rejected first draft does not leave its slug stuck.
+    let draft = db
+        .store
+        .put_page(&c, page_write(&shared, "draft", "x", Trust::Agent, None, 0))
+        .await?;
+    db.store.reject_page_version(&c, draft.page_id, 1).await?;
+    let retry = db
+        .store
+        .put_page(&c, page_write(&shared, "draft", "z", Trust::Agent, None, 0))
+        .await?;
+    assert_eq!(retry.version, 2);
     assert!(is_conflict(
         db.store
             .put_page(
                 &c,
-                page_write(&shared, "held", "y", Trust::Agent, Some(1), 0)
+                page_write(&shared, "draft", "y", Trust::Agent, Some(1), 0)
             )
             .await,
         1,
