@@ -59,7 +59,7 @@ pub fn candidates(
 }
 
 pub fn commit(file: Option<&Path>, json: bool) -> Result<(), String> {
-    let text = read_input(file)?;
+    let text = read_input(file, "no commit JSON: pass a file, or pipe it to stdin")?;
     let request = parse_commit(&text)?;
     call(|client| async move {
         let response = client.commit(&request).await.map_err(describe)?;
@@ -143,14 +143,15 @@ fn describe(error: Error) -> String {
     }
 }
 
-fn read_input(file: Option<&Path>) -> Result<String, String> {
+/// The file, or stdin when it is absent or `-`. `missing` is the error for a terminal on stdin.
+pub(crate) fn read_input(file: Option<&Path>, missing: &str) -> Result<String, String> {
     match file.filter(|path| *path != Path::new("-")) {
         Some(path) => std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display())),
         None => {
             let mut stdin = std::io::stdin();
             if stdin.is_terminal() {
-                return Err("no commit JSON: pass a file, or pipe it to stdin".to_owned());
+                return Err(missing.to_owned());
             }
             let mut text = String::new();
             stdin
@@ -367,7 +368,8 @@ mod tests {
 
     #[test]
     fn a_missing_file_names_the_path() {
-        let error = read_input(Some(Path::new("/nonexistent/commit.json"))).expect_err("missing");
+        let error =
+            read_input(Some(Path::new("/nonexistent/commit.json")), "none").expect_err("missing");
         assert!(error.contains("/nonexistent/commit.json"));
     }
 }
