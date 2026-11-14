@@ -4660,6 +4660,11 @@ async fn purge_scope_deletes_its_pages_and_scope_summaries_count_them() -> TestR
             page_write(&kept, "one", "kept words", Trust::User, None, 51),
         )
         .await?;
+    // A scope whose only page waits for review is listed, with no current page.
+    let fresh = Scope::shared("fresh");
+    db.store
+        .put_page(&c, page_write(&fresh, "draft", "x", Trust::Agent, None, 52))
+        .await?;
 
     let summaries = db.store.scope_summaries(&c).await?;
     let pages_in = |scope: &Scope| {
@@ -4670,6 +4675,7 @@ async fn purge_scope_deletes_its_pages_and_scope_summaries_count_them() -> TestR
     };
     assert_eq!(pages_in(&doomed), Some(2));
     assert_eq!(pages_in(&kept), Some(1));
+    assert_eq!(pages_in(&fresh), Some(0));
 
     let report = db.store.purge_scope(&c, &doomed).await?;
     assert_eq!(report.pages_deleted, 3);
@@ -4683,7 +4689,8 @@ async fn purge_scope_deletes_its_pages_and_scope_summaries_count_them() -> TestR
         db.store.get_page(&c, &kept, "one", None).await?.body,
         "kept words"
     );
-    assert_eq!(count(&db, "SELECT count(*) FROM page_sections").await?, 1);
+    // The kept page and the pending draft in `fresh`.
+    assert_eq!(count(&db, "SELECT count(*) FROM page_sections").await?, 2);
     assert_eq!(
         count(
             &db,

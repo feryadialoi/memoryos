@@ -370,6 +370,8 @@ searched at the present only; older versions are read by version.
 - Delete hard-deletes the page with every version and section, and writes `page.delete`.
   `purge_scope` and `DELETE /v1/users/{id}/memory` delete the scope's pages and report
   `pages_deleted`. Purging an episode never touches pages.
+- `GET /v1/scopes` lists every scope that holds a page, with `pages` counting those that have a current
+  version, so a scope whose only page waits for its first review is listed with `pages` 0.
 
 ## 9. API
 

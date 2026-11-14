@@ -785,8 +785,8 @@ pub(super) async fn count_by_scope(
     ctx: &RequestContext,
 ) -> Result<Vec<(String, i64)>> {
     sqlx::query_as(
-        "SELECT scope, count(*) FROM pages \
-         WHERE tenant = ?1 AND current_version IS NOT NULL GROUP BY scope",
+        "SELECT scope, sum(current_version IS NOT NULL) FROM pages \
+         WHERE tenant = ?1 GROUP BY scope",
     )
     .bind(&ctx.tenant)
     .fetch_all(conn)

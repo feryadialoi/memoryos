@@ -692,7 +692,7 @@ fn section_hits(found: &[PgRow]) -> Result<Vec<PageSectionHit>> {
 /// `pages` count per scope for `scope_summaries`: pages with a current version.
 pub(crate) async fn count_by_scope(conn: &mut PgConnection) -> Result<Vec<(String, i64)>> {
     sqlx::query_as(
-        "SELECT scope, count(*) FROM pages WHERE current_version IS NOT NULL GROUP BY scope",
+        "SELECT scope, count(*) FILTER (WHERE current_version IS NOT NULL) FROM pages GROUP BY scope",
     )
     .fetch_all(conn)
     .await
