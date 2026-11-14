@@ -30,6 +30,7 @@ change and sources that lie.
 | 👤 **Personal memory** | Facts scoped per user, reconciled so new information adds to, replaces or repeats what is known |
 | 🕰️ **Memory over time** | A replaced fact is closed, not deleted, so you can ask what is true now or what was true then |
 | ✍️ **Self-editing agents** | Size-limited, versioned blocks that agents edit through tools, with conflict detection |
+| 📖 **Knowledge pages** | Agents write and read how-to and reference pages, such as runbooks. Pages are split into sections for recall, versioned, and reviewed before an agent's edit reaches a shared scope |
 | 🕸️ **Shared knowledge graph** | Every fact is also an edge between entities, shared across agents through scoped access |
 | 🛡️ **Poisoning defense** | Low-trust content is quarantined, and every fact traces back to its source |
 | 🔁 **One-call saving** | A repeated fact is matched on the server and counted as another source, and the response lists `related` facts, so the agent rarely needs a lookup before saving |
@@ -58,6 +59,7 @@ a reboot, the `memoryos mcp` that Claude Code launches starts the server again.
 | Update to the latest release | `memoryos update` (migrates and restarts the server too) |
 | Start, stop, restart the server | `memoryos start`, `memoryos stop`, `memoryos restart` |
 | Remove it | `memoryos setup --uninstall --global`, add `--delete-data` to delete the database |
+| Read and write knowledge pages | `memoryos page list`, `read`, `write` (markdown from a file or stdin), `delete` |
 
 ### With Docker and Postgres
 
@@ -237,6 +239,7 @@ disagree:
 - **Entities:** the people, places and things that facts connect.
 - **Facts:** statements with two timelines, when they were true and when we learned them.
 - **Blocks:** versioned working notes that an agent edits directly.
+- **Pages:** versioned markdown knowledge, such as runbooks, searched by section.
 
 ## 🛡️ Security
 
@@ -259,8 +262,11 @@ Research shows a poisoned memory survives across sessions, unlike ordinary promp
 
 ## 🪝 Agent hooks
 
-The agent reads and saves memories through MCP tools. Hooks only load memories and remind the agent to
-save, and they cannot bypass validation or quarantine. `memoryos setup` installs them for you.
+The agent reads and saves memories through MCP tools: `recall`, `recall_candidates`, `commit_facts`,
+`graph_neighbors`, `block_read`, `block_replace`, and for knowledge pages `page_read`, `page_write` and
+`page_list`. `recall` also returns the best matching page sections. Hooks only load memories and
+remind the agent to save, and they cannot bypass validation or quarantine. `memoryos setup` installs
+them for you.
 
 ```mermaid
 flowchart LR

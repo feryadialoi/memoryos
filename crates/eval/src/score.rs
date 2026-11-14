@@ -8,9 +8,12 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::client::{RecallResponse, Trust};
-use crate::dataset::{POISONING_DATASET, RECALL_DATASET, STALENESS_DATASET};
+use crate::dataset::{PAGES_DATASET, POISONING_DATASET, RECALL_DATASET, STALENESS_DATASET};
+use crate::pages::{PagesRun, QuestionDetail, PAGE_TOP_K};
 use crate::report::{Counts, Gate, SuiteReport};
-use crate::suites::{CaseResult, CaseStatus, PoisoningDetail, RecallDetail, StalenessDetail};
+use crate::suites::{
+    CaseResult, CaseStatus, PoisoningDetail, RecallDetail, StalenessDetail, Verdict,
+};
 
 /// Recall is measured at this depth.
 pub const TOP_K: usize = 5;
@@ -27,6 +30,14 @@ const POISONING_PROVES: &str =
 admin approves them, cannot close a fact of higher trust, and purge removes them and restores what \
 they closed. The highest trust a commit can have is agent, so this covers external against agent, \
 never user or system. Far-future dating is refused, so sleepers are probed at their later dates. It does not test whether a model would extract or obey the planted text.";
+
+const PAGES_PROVES: &str =
+    "Page search finds the page, and the section, that answers a question, among 21 \
+hand-written pages in English, Chinese and Indonesian that share a scope with the recall corpus. A \
+host's edit to a reviewed page in a shared scope stays out of page reads and recall until approved, \
+and shows up once it is. Fact results are the same with page_limit 0 and 3. It does not measure \
+how well a model writes pages, the pages are short, and the questions were written by the same \
+author as the pages.";
 
 pub fn contains_ci(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
@@ -282,6 +293,131 @@ pub fn poisoning_report(
     )
 }
 
+/// Nearest-rank percentile of `values`, `p` between 0 and 1. 0 for no values.
+pub fn percentile(values: &[f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = (p * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+fn round_ms(ms: f64) -> f64 {
+    (ms * 10.0).round() / 10.0
+}
+
+pub fn pages_report(run: &PagesRun, min_page_hit: f64) -> Result<SuiteReport, serde_json::Error> {
+    let questions = count(&run.questions);
+    let facts = count(&run.facts);
+    let quarantine = count(&run.quarantine);
+    let counts = Counts {
+        total: questions.total + facts.total + quarantine.total,
+        passed: questions.passed + facts.passed + quarantine.passed,
+        failed: questions.failed + facts.failed + quarantine.failed,
+        errors: questions.errors + facts.errors + quarantine.errors,
+    };
+    let answered = |r: &&CaseResult<QuestionDetail>| r.status != CaseStatus::Error;
+    let ranked_within = |k: usize| {
+        run.questions
+            .iter()
+            .filter(answered)
+            .filter(|r| r.detail.rank.is_some_and(|rank| rank <= k))
+            .count()
+    };
+    let mrr = if run.questions.is_empty() {
+        0.0
+    } else {
+        run.questions
+            .iter()
+            .filter(answered)
+            .filter_map(|r| r.detail.rank)
+            .filter(|rank| *rank <= PAGE_TOP_K)
+            .map(|rank| 1.0 / rank as f64)
+            .sum::<f64>()
+            / run.questions.len() as f64
+    };
+    let with_section = run
+        .questions
+        .iter()
+        .filter(|r| r.detail.expected_section.is_some())
+        .count();
+    let section_hits = run
+        .questions
+        .iter()
+        .filter(answered)
+        .filter(|r| r.detail.section_matched == Some(true))
+        .count();
+    let page_top3 = ratio(ranked_within(PAGE_TOP_K), questions.total);
+    let facts_changed = run
+        .facts
+        .iter()
+        .filter(|r| r.status != CaseStatus::Error && !r.detail.problems().is_empty())
+        .count();
+    let leaks: usize = run.quarantine.iter().map(|r| r.detail.leaks.len()).sum();
+    let control_failures = run
+        .quarantine
+        .iter()
+        .filter(|r| !r.detail.control_problems.is_empty() || !r.detail.completed)
+        .count();
+
+    let mut metrics = json!({
+        "questions": questions.total,
+        "page_top1_rate": ratio(ranked_within(1), questions.total),
+        "page_top3_rate": page_top3,
+        "page_mrr": mrr,
+        "section_questions": with_section,
+        "section_top1_rate": ratio(section_hits, with_section),
+        "facts_cases": facts.total,
+        "facts_unchanged_rate": ratio(facts.passed, facts.total),
+        "quarantine_leaks": leaks,
+        "quarantine_control_failures": control_failures,
+    });
+    if let Some(latency) = &run.latency {
+        metrics["latency_calls"] = json!(latency.calls);
+        metrics["latency_errors"] = json!(latency.errors);
+        metrics["latency_p50_ms_page_limit_0"] = json!(round_ms(latency.p50_ms_page_limit_0));
+        metrics["latency_p95_ms_page_limit_0"] = json!(round_ms(latency.p95_ms_page_limit_0));
+        metrics["latency_p50_ms_page_limit_3"] = json!(round_ms(latency.p50_ms_page_limit_3));
+        metrics["latency_p95_ms_page_limit_3"] = json!(round_ms(latency.p95_ms_page_limit_3));
+    }
+
+    let gates = vec![
+        no_errors_gate("pages", counts),
+        Gate::at_most("pages.quarantine_leaks", leaks as f64, 0.0),
+        // Without a working control, a held edit that never showed proves nothing.
+        Gate::at_most(
+            "pages.quarantine_control_failures",
+            control_failures as f64,
+            0.0,
+        ),
+        // SPEC section 7: fact results are the same with page_limit 0 and 3.
+        Gate::at_most("pages.facts_changed_cases", facts_changed as f64, 0.0),
+        Gate::at_least("pages.page_top3_rate", page_top3, min_page_hit),
+    ];
+
+    let mut cases = Vec::new();
+    for value in run.questions.iter().map(serde_json::to_value) {
+        cases.push(value?);
+    }
+    for value in run.facts.iter().map(serde_json::to_value) {
+        cases.push(value?);
+    }
+    for value in run.quarantine.iter().map(serde_json::to_value) {
+        cases.push(value?);
+    }
+    Ok(SuiteReport::new(
+        "pages",
+        PAGES_DATASET,
+        PAGES_PROVES,
+        counts,
+        metrics,
+        gates,
+        cases,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,7 +636,11 @@ mod tests {
 
     fn leaks_in(facts: Vec<ScoredFact>, stage: Stage) -> Vec<String> {
         find_leaks(
-            &RecallResponse { facts },
+            &RecallResponse {
+                facts,
+                pages: Vec::new(),
+                pages_skipped: None,
+            },
             &s(&["Reykjavik"]),
             poison(),
             stage,
@@ -586,6 +726,130 @@ mod tests {
         let report = poisoning_report(&results).expect("report");
         assert!(!report.passed);
         assert_eq!(report.metrics["control_failure_cases"], json!(1));
+    }
+
+    #[test]
+    fn percentile_uses_the_nearest_rank() {
+        let values: Vec<f64> = (1..=100).map(f64::from).collect();
+        assert_eq!(percentile(&values, 0.50), 50.0);
+        assert_eq!(percentile(&values, 0.95), 95.0);
+        assert_eq!(percentile(&[7.0], 0.95), 7.0);
+        assert_eq!(percentile(&[], 0.5), 0.0);
+        assert_eq!(percentile(&[3.0, 1.0, 2.0], 0.5), 2.0);
+    }
+
+    use crate::pages::{FactsDetail, Latency, QuarantineDetail};
+
+    fn question_result(
+        status: CaseStatus,
+        rank: Option<usize>,
+        section: Option<bool>,
+    ) -> CaseResult<QuestionDetail> {
+        result(
+            status,
+            QuestionDetail {
+                expected_slug: "p".to_owned(),
+                expected_section: section.map(|_| "P > S".to_owned()),
+                rank,
+                section_matched: section,
+                ..QuestionDetail::default()
+            },
+        )
+    }
+
+    fn good_quarantine() -> CaseResult<QuarantineDetail> {
+        result(
+            CaseStatus::Passed,
+            QuarantineDetail {
+                completed: true,
+                ..QuarantineDetail::default()
+            },
+        )
+    }
+
+    fn same_facts() -> CaseResult<FactsDetail> {
+        result(
+            CaseStatus::Passed,
+            FactsDetail {
+                compared: true,
+                ..FactsDetail::default()
+            },
+        )
+    }
+
+    fn pages_run(questions: Vec<CaseResult<QuestionDetail>>) -> PagesRun {
+        PagesRun {
+            questions,
+            facts: vec![same_facts()],
+            quarantine: vec![good_quarantine()],
+            latency: None,
+        }
+    }
+
+    #[test]
+    fn pages_metrics_count_ranks_sections_and_errors() {
+        let run = pages_run(vec![
+            question_result(CaseStatus::Passed, Some(1), Some(true)),
+            question_result(CaseStatus::Passed, Some(3), None),
+            question_result(CaseStatus::Failed, Some(2), Some(false)),
+            question_result(CaseStatus::Error, Some(1), Some(true)),
+        ]);
+        let report = pages_report(&run, 0.0).expect("report");
+        assert_eq!(report.metrics["page_top1_rate"], json!(0.25));
+        assert_eq!(report.metrics["page_top3_rate"], json!(0.75));
+        assert_eq!(report.metrics["section_questions"], json!(3));
+        assert!(
+            (report.metrics["section_top1_rate"].as_f64().expect("rate") - 1.0 / 3.0).abs() < 1e-9
+        );
+        let mrr = (1.0 + 1.0 / 3.0 + 0.5) / 4.0;
+        assert!((report.metrics["page_mrr"].as_f64().expect("mrr") - mrr).abs() < 1e-9);
+        assert_eq!(report.total, 6);
+        // The errored question fails the errors gate.
+        assert!(!report.passed);
+    }
+
+    #[test]
+    fn pages_pass_with_no_errors_leaks_or_changed_facts() {
+        let run = pages_run(vec![question_result(CaseStatus::Failed, None, None)]);
+        assert!(pages_report(&run, 0.0).expect("report").passed);
+        assert!(!pages_report(&run, 0.5).expect("report").passed);
+    }
+
+    #[test]
+    fn a_leaked_edit_or_a_failed_control_fails_pages() {
+        let mut run = pages_run(vec![question_result(CaseStatus::Passed, Some(1), None)]);
+        run.quarantine[0].detail.leaks.push("leak".to_owned());
+        assert!(!pages_report(&run, 0.0).expect("report").passed);
+
+        let mut run = pages_run(vec![question_result(CaseStatus::Passed, Some(1), None)]);
+        run.quarantine[0]
+            .detail
+            .control_problems
+            .push("missing".to_owned());
+        let report = pages_report(&run, 0.0).expect("report");
+        assert!(!report.passed);
+        assert_eq!(report.metrics["quarantine_control_failures"], json!(1));
+    }
+
+    #[test]
+    fn changed_facts_fail_pages_and_latency_is_reported() {
+        let mut run = pages_run(vec![question_result(CaseStatus::Passed, Some(1), None)]);
+        run.facts[0].detail.with_pages.push(Uuid::nil());
+        run.facts[0].status = CaseStatus::Failed;
+        run.latency = Some(Latency {
+            calls: 100,
+            warmup_calls: 10,
+            errors: 0,
+            p50_ms_page_limit_0: 12.34,
+            p95_ms_page_limit_0: 20.0,
+            p50_ms_page_limit_3: 15.0,
+            p95_ms_page_limit_3: 25.06,
+        });
+        let report = pages_report(&run, 0.0).expect("report");
+        assert!(!report.passed);
+        assert_eq!(report.metrics["facts_unchanged_rate"], json!(0.0));
+        assert_eq!(report.metrics["latency_p50_ms_page_limit_0"], json!(12.3));
+        assert_eq!(report.metrics["latency_p95_ms_page_limit_3"], json!(25.1));
     }
 
     #[test]

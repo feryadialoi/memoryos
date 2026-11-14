@@ -45,7 +45,7 @@ impl RunContext {
         Self { client, run_id }
     }
 
-    fn scope(&self, kind: ScopeKind, name: &str) -> String {
+    pub(crate) fn scope(&self, kind: ScopeKind, name: &str) -> String {
         format!("{}:eval-{}-{name}", kind.as_str(), self.run_id)
     }
 
@@ -73,7 +73,7 @@ impl RunContext {
 
     /// Commits as the host and gets the facts to `active`, approving them where the scope holds
     /// `agent` trust for review. A status the trust rules do not predict is a problem to report.
-    async fn establish(
+    pub(crate) async fn establish(
         &self,
         ids: (&str, &str),
         kind: ScopeKind,
@@ -167,15 +167,15 @@ pub trait Verdict {
     fn problems(&self) -> Vec<String>;
 }
 
-struct CaseMeta<'a> {
-    id: &'a str,
-    lang: &'a str,
-    class: Option<String>,
-    scope: String,
-    started: Instant,
+pub(crate) struct CaseMeta<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) lang: &'a str,
+    pub(crate) class: Option<String>,
+    pub(crate) scope: String,
+    pub(crate) started: Instant,
 }
 
-fn finish<D: Verdict>(
+pub(crate) fn finish<D: Verdict>(
     meta: CaseMeta<'_>,
     outcome: Result<(), CaseError>,
     detail: D,
@@ -204,7 +204,7 @@ fn finish<D: Verdict>(
 }
 
 /// Runs cases with bounded concurrency and returns results in dataset order.
-async fn run_all<'a, C, D, F, Fut>(
+pub(crate) async fn run_all<'a, C, D, F, Fut>(
     cases: &'a [C],
     concurrency: usize,
     run_case: F,
@@ -1023,6 +1023,8 @@ mod tests {
     fn a_host_chooses_the_candidate_stating_every_value() {
         let response = RecallResponse {
             facts: vec![scored(1, "lives in Oslo"), scored(2, "Oslo and Rome")],
+            pages: Vec::new(),
+            pages_skipped: None,
         };
         let values = ["oslo".to_owned(), "rome".to_owned()];
         assert_eq!(

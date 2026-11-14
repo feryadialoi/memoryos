@@ -127,10 +127,69 @@ pub struct ScoredFact {
     pub score: f64,
 }
 
-/// The body of both `POST /v1/recall` and `POST /v1/candidates`.
+/// The body of both `POST /v1/recall` and `POST /v1/candidates`. Candidates never has pages.
 #[derive(Debug, Deserialize)]
 pub struct RecallResponse {
     pub facts: Vec<ScoredFact>,
+    #[serde(default)]
+    pub pages: Vec<PageHit>,
+    #[serde(default)]
+    pub pages_skipped: Option<String>,
+}
+
+/// The best section of one current page version, as `POST /v1/recall` returns it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PageHit {
+    pub page_id: Uuid,
+    pub scope: String,
+    pub slug: String,
+    pub title: String,
+    pub version: i64,
+    pub section: String,
+    pub snippet: String,
+    pub score: f64,
+}
+
+/// The body of `PUT /v1/pages/{scope}/{slug}`.
+#[derive(Debug, Serialize)]
+pub struct PageWrite<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub approve: bool,
+}
+
+/// A version as written or listed. Bodies are left out: the suite never needs them back.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PageVersion {
+    pub page_id: Uuid,
+    pub version: i64,
+    pub trust: Trust,
+    pub status: String,
+}
+
+/// A page as read, at its current version.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Page {
+    pub id: Uuid,
+    pub version: i64,
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageVersionList {
+    versions: Vec<PageVersion>,
+}
+
+/// Which key writes a page. Page write trust comes from the key, as commit trust does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageWriter {
+    /// The host's key, `max_trust` of `agent`.
+    Agent,
+    /// The admin key, which may pass `approve: true`.
+    Admin,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -152,6 +211,9 @@ struct RecallBody<'a> {
     limit: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     as_of: Option<DateTime<Utc>>,
+    /// Left out, the server's default of 3 applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_limit: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -251,12 +313,36 @@ impl Client {
         limit: u32,
         as_of: Option<DateTime<Utc>>,
     ) -> Result<RecallResponse, CaseError> {
-        let body = to_body(&RecallBody {
+        self.recall_body(&RecallBody {
             scopes: [scope],
             query,
             limit,
             as_of,
-        });
+            page_limit: None,
+        })
+        .await
+    }
+
+    /// Recall with an explicit `page_limit`. 0 turns page search off.
+    pub async fn recall_pages(
+        &self,
+        scope: &str,
+        query: &str,
+        limit: u32,
+        page_limit: u32,
+    ) -> Result<RecallResponse, CaseError> {
+        self.recall_body(&RecallBody {
+            scopes: [scope],
+            query,
+            limit,
+            as_of: None,
+            page_limit: Some(page_limit),
+        })
+        .await
+    }
+
+    async fn recall_body(&self, request: &RecallBody<'_>) -> Result<RecallResponse, CaseError> {
+        let body = to_body(request);
         let (status, text) = self
             .send(
                 &self.keys.agent,
@@ -267,6 +353,51 @@ impl Client {
             )
             .await?;
         decode(Method::POST, "/v1/recall", StatusCode::OK, status, text)
+    }
+
+    pub async fn write_page(
+        &self,
+        writer: PageWriter,
+        (scope, slug): (&str, &str),
+        request: &PageWrite<'_>,
+    ) -> Result<PageVersion, CaseError> {
+        let token = match writer {
+            PageWriter::Agent => &self.keys.agent,
+            PageWriter::Admin => &self.keys.admin,
+        };
+        let path = format!("/v1/pages/{scope}/{slug}");
+        let body = to_body(request);
+        let (status, text) = self
+            .send(token, Method::PUT, &path, &[], Some(&body))
+            .await?;
+        decode(Method::PUT, &path, StatusCode::OK, status, text)
+    }
+
+    /// The current version, as any reader sees it.
+    pub async fn read_page(&self, scope: &str, slug: &str) -> Result<Page, CaseError> {
+        let path = format!("/v1/pages/{scope}/{slug}");
+        let (status, text) = self
+            .send(&self.keys.agent, Method::GET, &path, &[], None)
+            .await?;
+        decode(Method::GET, &path, StatusCode::OK, status, text)
+    }
+
+    pub async fn page_quarantine(&self, scope: &str) -> Result<Vec<PageVersion>, CaseError> {
+        let path = "/v1/pages/quarantine";
+        let query = [("scopes", scope), ("limit", QUARANTINE_PAGE)];
+        let (status, text) = self
+            .send(&self.keys.admin, Method::GET, path, &query, None)
+            .await?;
+        let list: PageVersionList = decode(Method::GET, path, StatusCode::OK, status, text)?;
+        Ok(list.versions)
+    }
+
+    pub async fn approve_page(&self, page_id: Uuid, version: i64) -> Result<Page, CaseError> {
+        let path = format!("/v1/pages/quarantine/{page_id}/{version}/approve");
+        let (status, text) = self
+            .send(&self.keys.admin, Method::POST, &path, &[], None)
+            .await?;
+        decode(Method::POST, &path, StatusCode::OK, status, text)
     }
 
     pub async fn quarantine(&self, scope: &str) -> Result<Vec<Fact>, CaseError> {

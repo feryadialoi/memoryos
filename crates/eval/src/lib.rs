@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod dataset;
+pub mod pages;
 pub mod report;
 pub mod score;
 pub mod suites;
@@ -22,7 +23,7 @@ use suites::RunContext;
 #[derive(Parser)]
 #[command(
     name = "memoryos-eval",
-    about = "Black-box recall, staleness and poisoning evaluation of a MemoryOS server"
+    about = "Black-box recall, staleness, poisoning and pages evaluation of a MemoryOS server"
 )]
 pub struct Args {
     #[arg(long)]
@@ -48,6 +49,14 @@ pub struct Args {
     /// Minimum recall@5. SPEC section 12 sets no target, so by default recall is only reported.
     #[arg(long, default_value_t = 0.0, value_parser = parse_ratio)]
     pub min_recall: f64,
+    /// Minimum share of page questions with their page in the top 3 page hits. No target is set,
+    /// so by default it is only reported.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_ratio)]
+    pub min_page_hit: f64,
+    /// Timed recalls per page_limit setting (0 and 3) in the pages suite, after one warm-up pass.
+    /// 0 skips the latency measurement.
+    #[arg(long, default_value_t = 0)]
+    pub latency_calls: usize,
     /// Cases run at the same time within a suite.
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..))]
     pub concurrency: u64,
@@ -58,6 +67,7 @@ pub enum Suite {
     Recall,
     Staleness,
     Poisoning,
+    Pages,
     All,
 }
 
@@ -97,6 +107,13 @@ pub async fn run(args: &Args) -> Result<Report, Box<dyn std::error::Error>> {
         let cases = dataset::load_poisoning()?;
         let results = suites::run_poisoning(&ctx, &cases, concurrency).await;
         suites.push(score::poisoning_report(&results)?);
+    }
+    if matches!(args.suite, Suite::Pages | Suite::All) {
+        let data = dataset::load_pages()?;
+        let recall_cases = dataset::load_recall()?;
+        let run =
+            pages::run_pages(&ctx, &data, &recall_cases, concurrency, args.latency_calls).await;
+        suites.push(score::pages_report(&run, args.min_page_hit)?);
     }
 
     let report = Report::new(

@@ -23,6 +23,8 @@ const EXTERNAL_TOKEN: &str = "mos_external_token";
 const ADMIN_TOKEN: &str = "mos_admin_token";
 const OVERRIDE_PRIORITY: u32 = 1;
 const AS_OF_PRIORITY: u32 = 2;
+/// Above the recall suite's query stubs, which match the same queries in any scope.
+const PAGES_PRIORITY: u32 = 3;
 const DEFAULT_PRIORITY: u32 = 5;
 const NOW: &str = "2026-01-01T00:00:00Z";
 
@@ -641,6 +643,232 @@ fn poison_case_stubs(case: &PoisonCase, ids: &mut Ids) -> Vec<Value> {
     stubs
 }
 
+fn page_version_json(page_id: Uuid, version: i64, trust: &str, status: &str) -> Value {
+    json!({
+        "page_id": page_id,
+        "scope": "agent:stub",
+        "slug": "stub",
+        "version": version,
+        "base_version": null,
+        "title": "stub",
+        "summary": null,
+        "trust": trust,
+        "status": status,
+        "edited_by": "stub",
+        "edited_at": NOW,
+        "redacted": false,
+    })
+}
+
+fn page_hit_json(slug: &str, section: &str, version: i64, snippet: &str) -> Value {
+    json!({
+        "page_id": Uuid::nil(),
+        "scope": "agent:stub",
+        "slug": slug,
+        "title": "stub",
+        "version": version,
+        "section": section,
+        "snippet": snippet,
+        "score": 0.03,
+    })
+}
+
+/// `POST /v1/recall` in a scope ending in `scope_suffix`, optionally for one query and one
+/// `page_limit`.
+fn page_recall_stub(
+    scope_suffix: &str,
+    query: Option<&str>,
+    page_limit: Option<u32>,
+    priority: u32,
+    body: &Value,
+) -> Value {
+    let mut patterns = vec![json!({ "matchesJsonPath": {
+        "expression": "$.scopes[0]",
+        "matches": format!(".*-{scope_suffix}$"),
+    }})];
+    if let Some(query) = query {
+        patterns.push(json!({ "matchesJsonPath": { "expression": "$.query", "equalTo": query } }));
+    }
+    if let Some(limit) = page_limit {
+        patterns.push(json!({ "matchesJsonPath": format!("$[?(@.page_limit == {limit})]") }));
+    }
+    json!({
+        "priority": priority,
+        "request": {
+            "method": "POST",
+            "urlPath": "/v1/recall",
+            "headers": auth(AGENT_TOKEN),
+            "bodyPatterns": patterns,
+        },
+        "response": json_response(200, body),
+    })
+}
+
+/// Stubs under which every pages case passes: pages are found at their sections, facts do not
+/// change with page_limit, and the held edit shows only once approved.
+fn healthy_pages_server(ids: &mut Ids) -> Vec<Value> {
+    let data = dataset::load_pages().expect("pages data");
+    let mut stubs = Vec::new();
+    for page in &data.pages {
+        stubs.push(json!({
+            "priority": DEFAULT_PRIORITY,
+            "request": {
+                "method": "PUT",
+                "urlPathPattern": format!("/v1/pages/agent:eval-[a-z0-9]+-pages/{}", page.slug),
+                "headers": auth(AGENT_TOKEN),
+                "bodyPatterns": [{ "matchesJsonPath": { "expression": "$.title", "equalTo": page.title } }],
+            },
+            "response": json_response(200, &page_version_json(ids.of(&page.slug), 1, "agent", "active")),
+        }));
+    }
+    for question in &data.questions {
+        let title = &data.page(&question.slug).expect("page").title;
+        let section = question
+            .expected_section(title)
+            .unwrap_or_else(|| format!("{title} > any"));
+        let hits = json!({
+            "facts": [],
+            "pages": [
+                page_hit_json("noise", "Noise > A", 1, "noise"),
+                page_hit_json(&question.slug, &section, 1, "answer"),
+            ],
+        });
+        // A section question needs its page on top; a page question is fine at rank 2.
+        let hits = if question.section.is_some() {
+            json!({ "facts": [], "pages": [page_hit_json(&question.slug, &section, 1, "answer")] })
+        } else {
+            hits
+        };
+        stubs.push(page_recall_stub(
+            "pages",
+            Some(&question.query),
+            None,
+            PAGES_PRIORITY,
+            &hits,
+        ));
+    }
+    for case in dataset::load_recall().expect("recall data") {
+        for (index, commit) in case.commits.iter().enumerate() {
+            let label = format!("pages-{index}");
+            let facts: Vec<(Uuid, &str)> = commit
+                .facts
+                .iter()
+                .map(|fact| {
+                    (
+                        ids.of(&format!("{}/pages/{}", case.id, fact.statement)),
+                        "active",
+                    )
+                })
+                .collect();
+            let episode = ids.of(&format!("{}/{label}", case.id));
+            stubs.push(commit_stub(AGENT_TOKEN, &case.id, &label, episode, &facts));
+        }
+        let fact = fact_json(
+            ids.of(&format!("{}/answer", case.id)),
+            "answer",
+            "active",
+            "agent",
+            &[],
+        );
+        stubs.push(page_recall_stub(
+            "pages",
+            Some(&case.query),
+            None,
+            PAGES_PRIORITY,
+            &scored(vec![fact]),
+        ));
+    }
+    stubs.extend(quarantine_probe_stubs(&data.quarantine[0], ids));
+    stubs
+}
+
+const PAGE_HELD: &str = "Started";
+const PAGE_APPROVED: &str = "page approved";
+
+fn quarantine_probe_stubs(probe: &dataset::QuarantineProbe, ids: &mut Ids) -> Vec<Value> {
+    let page_id = ids.of(&probe.slug);
+    let scenario = format!("page-{}", probe.id);
+    let path = format!(
+        "/v1/pages/shared:eval-[a-z0-9]+-{}/{}",
+        probe.id, probe.slug
+    );
+    let put = |token: &str, version: i64, status: &str| {
+        json!({
+            "priority": DEFAULT_PRIORITY,
+            "request": { "method": "PUT", "urlPathPattern": path, "headers": auth(token) },
+            "response": json_response(200, &page_version_json(page_id, version, "agent", status)),
+        })
+    };
+    let base_section = format!("{} > Escalation", probe.title);
+    vec![
+        put(ADMIN_TOKEN, 1, "active"),
+        put(AGENT_TOKEN, 2, "quarantined"),
+        json!({
+            "priority": DEFAULT_PRIORITY,
+            "request": { "method": "GET", "urlPathPattern": path, "headers": auth(AGENT_TOKEN) },
+            "response": json_response(200, &json!({
+                "id": page_id, "scope": "shared:stub", "slug": probe.slug, "title": probe.title,
+                "body": probe.base_body, "summary": null, "version": 1, "trust": "agent",
+                "status": "active", "edited_by": "stub", "edited_at": NOW,
+            })),
+        }),
+        json!({
+            "priority": DEFAULT_PRIORITY,
+            "request": {
+                "method": "GET",
+                "urlPath": "/v1/pages/quarantine",
+                "headers": auth(ADMIN_TOKEN),
+            },
+            "response": json_response(200, &json!({
+                "versions": [page_version_json(page_id, 2, "agent", "quarantined")],
+            })),
+        }),
+        in_state(
+            json!({
+                "priority": DEFAULT_PRIORITY,
+                "request": {
+                    "method": "POST",
+                    "urlPath": format!("/v1/pages/quarantine/{page_id}/2/approve"),
+                    "headers": auth(ADMIN_TOKEN),
+                },
+                "response": json_response(200, &json!({
+                    "id": page_id, "scope": "shared:stub", "slug": probe.slug,
+                    "title": probe.title, "body": probe.edit_body, "summary": null,
+                    "version": 2, "trust": "agent", "status": "active",
+                    "edited_by": "stub", "edited_at": NOW,
+                })),
+            }),
+            &scenario,
+            PAGE_HELD,
+            Some(PAGE_APPROVED),
+        ),
+        in_state(
+            page_recall_stub(
+                &probe.id,
+                None,
+                None,
+                DEFAULT_PRIORITY,
+                &json!({ "facts": [], "pages": [page_hit_json(&probe.slug, &base_section, 1, "the secondary")] }),
+            ),
+            &scenario,
+            PAGE_HELD,
+            None,
+        ),
+        in_state(
+            page_recall_stub(
+                &probe.id,
+                None,
+                None,
+                DEFAULT_PRIORITY,
+                &json!({ "facts": [], "pages": [page_hit_json(&probe.slug, &base_section, 2, &probe.planted[0])] }),
+            ),
+            &scenario,
+            PAGE_APPROVED,
+            None,
+        ),
+    ]
+}
+
 /// Stubs under which every case of every suite passes.
 fn healthy_server(ids: &mut Ids) -> Vec<Value> {
     let mut stubs = Vec::new();
@@ -653,6 +881,7 @@ fn healthy_server(ids: &mut Ids) -> Vec<Value> {
     for case in dataset::load_poisoning().expect("poisoning data") {
         stubs.extend(poison_case_stubs(&case, ids));
     }
+    stubs.extend(healthy_pages_server(ids));
     stubs
 }
 
@@ -764,6 +993,10 @@ async fn a_correct_server_passes_every_suite_through_the_host_flow_only() {
     assert_eq!(poisoning["metrics"]["purge_exercised_cases"], json!(30));
     assert_eq!(poisoning["metrics"]["truth_restored_cases"], json!(30));
     assert_eq!(poisoning["metrics"]["control_failure_cases"], json!(0));
+
+    let pages = suite(&run.report, "pages");
+    assert_eq!(pages["passed"], json!(true));
+    assert_eq!(pages["metrics"]["page_top3_rate"], json!(1.0));
 
     let table = stdout(&run);
     assert!(table.contains("result: PASS"), "{table}");
@@ -1191,4 +1424,99 @@ async fn a_purge_that_leaves_the_episode_behind_fails() {
             .contains("after purge"),
         "{failed}"
     );
+}
+
+#[tokio::test]
+async fn a_correct_server_passes_the_pages_suite() {
+    let wiremock = start_wiremock().await;
+    let mut ids = Ids::default();
+    wiremock.import(healthy_pages_server(&mut ids)).await;
+
+    let run = run_harness(&wiremock.url, &["--suite", "pages"]).await;
+
+    assert_eq!(
+        run.output.status.code(),
+        Some(0),
+        "{} unmatched: {:#?}",
+        stdout(&run),
+        wiremock.unmatched().await
+    );
+    let data = dataset::load_pages().expect("data");
+    let recall_cases = dataset::load_recall().expect("data");
+    let pages = suite(&run.report, "pages");
+    assert_eq!(
+        pages["total"],
+        json!(data.questions.len() + recall_cases.len() + data.quarantine.len())
+    );
+    assert_eq!(pages["metrics"]["page_top3_rate"], json!(1.0));
+    assert_eq!(pages["metrics"]["section_top1_rate"], json!(1.0));
+    assert_eq!(pages["metrics"]["facts_unchanged_rate"], json!(1.0));
+    assert_eq!(pages["metrics"]["quarantine_leaks"], json!(0));
+    assert!(pages["metrics"].get("latency_calls").is_none());
+    // Every request matched a stub, so each carried the key and body shape the stub requires.
+    let unmatched = wiremock.unmatched().await;
+    assert!(unmatched.is_empty(), "{unmatched:#?}");
+}
+
+#[tokio::test]
+async fn a_held_page_edit_in_recall_is_a_leak() {
+    let wiremock = start_wiremock().await;
+    let mut ids = Ids::default();
+    let mut stubs = healthy_pages_server(&mut ids);
+    let probe = &dataset::load_pages().expect("data").quarantine[0];
+    stubs.push(page_recall_stub(
+        &probe.id,
+        None,
+        None,
+        OVERRIDE_PRIORITY,
+        &json!({ "facts": [], "pages": [page_hit_json(&probe.slug, "x", 2, &probe.planted[0])] }),
+    ));
+    wiremock.import(stubs).await;
+
+    let run = run_harness(&wiremock.url, &["--suite", "pages"]).await;
+
+    assert_eq!(run.output.status.code(), Some(1), "{}", stdout(&run));
+    let pages = suite(&run.report, "pages");
+    assert_eq!(case(pages, &probe.id)["status"], json!("failed"));
+    assert!(
+        pages["metrics"]["quarantine_leaks"]
+            .as_u64()
+            .expect("leaks")
+            >= 1
+    );
+    assert!(stdout(&run).contains("gate failed: pages.quarantine_leaks"));
+}
+
+#[tokio::test]
+async fn facts_that_change_with_page_search_fail_and_latency_is_measured() {
+    let wiremock = start_wiremock().await;
+    let mut ids = Ids::default();
+    let mut stubs = healthy_pages_server(&mut ids);
+    let target = &dataset::load_recall().expect("data")[0];
+    let other = fact_json(
+        Uuid::from_u128(u128::MAX - 7),
+        "other",
+        "active",
+        "agent",
+        &[],
+    );
+    stubs.push(page_recall_stub(
+        "pages",
+        Some(&target.query),
+        Some(3),
+        OVERRIDE_PRIORITY,
+        &scored(vec![other]),
+    ));
+    wiremock.import(stubs).await;
+
+    let run = run_harness(&wiremock.url, &["--suite", "pages", "--latency-calls", "5"]).await;
+
+    assert_eq!(run.output.status.code(), Some(1), "{}", stdout(&run));
+    let pages = suite(&run.report, "pages");
+    let failed = case(pages, &target.id);
+    assert_eq!(failed["class"], json!("facts_unchanged"));
+    assert_eq!(failed["status"], json!("failed"));
+    assert_eq!(pages["metrics"]["latency_calls"], json!(5));
+    assert_eq!(pages["metrics"]["latency_errors"], json!(0));
+    assert!(stdout(&run).contains("gate failed: pages.facts_changed_cases = 1"));
 }
