@@ -440,6 +440,27 @@ pub async fn scopes_are_enforced(h: &Harness) {
         .await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["versions"], json!([]));
+
+    // A scope whose only page waits for its first review is still covered by a pattern.
+    let (status, first) = h
+        .put(
+            &agent_for(h, "shared:fresh").await,
+            "shared:fresh",
+            "draft",
+            json!({"title": "Draft", "body": "first"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["status"], "quarantined");
+    let (status, listed) = h.get(&root, "/v1/pages/quarantine?scopes=shared:*").await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let slugs: Vec<&str> = listed["versions"]
+        .as_array()
+        .expect("versions")
+        .iter()
+        .filter_map(|v| v["slug"].as_str())
+        .collect();
+    assert!(slugs.contains(&"draft"), "{listed}");
 }
 
 async fn agent_for(h: &Harness, scope: &str) -> String {

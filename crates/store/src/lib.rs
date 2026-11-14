@@ -78,6 +78,19 @@ impl PgStore {
         Ok(result)
     }
 
+    /// Every scope holding a page in any state, including pages whose only versions wait for
+    /// review, which `scope_summaries` does not count. For expanding scope patterns.
+    pub async fn page_scopes(&self, ctx: &RequestContext) -> Result<Vec<Scope>> {
+        let mut tx = self.tenant_tx(ctx).await?;
+        let found: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT scope FROM pages ORDER BY scope")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        found.iter().map(|scope| scope.parse()).collect()
+    }
+
     /// Every scope of the tenant with its counts. Scans the tenant's facts, so it is for occasional
     /// reads and not a hot path.
     pub async fn scope_summaries(&self, ctx: &RequestContext) -> Result<Vec<ScopeSummary>> {

@@ -355,10 +355,10 @@ searched at the present only; older versions are read by version.
      rejected), and fails with `version_conflict` when the page has a current version. Set, the page
      must exist (`not_found`) and that version must be current (`version_conflict`, current 0 when the
      page has no current version).
-  5. Status. Write trust is `agent`, or `external` when the key's `max_trust` is `external`. The version
-     is quarantined when the source rule of section 5 applies (`external` anywhere, `agent` in
-     `user:*` or `shared:*`) or when the current version's trust is higher than the write's, and active
-     otherwise. With `approve: true` from an admin key, the version is active unless the current
+  5. Status. Write trust is `agent`: a key below `agent` cannot write pages (section 6), and no request
+     sets a higher trust. The store still applies the source rule of section 5 to the trust it is given
+     (`external` anywhere, `agent` in `user:*` or `shared:*`). The version is quarantined when that rule
+     applies or when the current version's trust is higher than the write's, and active otherwise. With `approve: true` from an admin key, the version is active unless the current
      version's trust is above the key's `max_trust`, which is `forbidden`.
   6. An active version becomes current: the previous one becomes `superseded` and its sections are
      deleted. A quarantined version keeps its sections so that approval needs no embedder.

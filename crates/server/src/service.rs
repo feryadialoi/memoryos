@@ -471,7 +471,7 @@ impl Services {
     }
 
     /// Scopes and patterns follow `GET /v1/quarantine`. The store takes exact scopes only, so a
-    /// pattern stands for the tenant's scopes that `scope_summaries` knows and the pattern covers.
+    /// pattern stands for the tenant's page scopes that the pattern covers.
     pub async fn list_page_quarantine(
         &self,
         caller: &Caller,
@@ -488,14 +488,16 @@ impl Services {
         }
         let mut exact = selection.exact;
         if !selection.prefixes.is_empty() {
-            for summary in self.store.scope_summaries(&caller.ctx).await? {
-                let name = summary.scope.to_string();
+            // Every scope holding a page, so a scope whose only page waits for its first review
+            // is still covered.
+            for scope in self.store.page_scopes(&caller.ctx).await? {
+                let name = scope.to_string();
                 let covered = selection
                     .prefixes
                     .iter()
                     .any(|prefix| name.starts_with(prefix.as_str()));
-                if covered && !exact.contains(&summary.scope) {
-                    exact.push(summary.scope);
+                if covered && !exact.contains(&scope) {
+                    exact.push(scope);
                 }
             }
         }

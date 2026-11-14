@@ -65,6 +65,10 @@ impl Store {
         dispatch!(self, migrate())
     }
 
+    pub async fn page_scopes(&self, ctx: &RequestContext) -> Result<Vec<Scope>> {
+        dispatch!(self, page_scopes(ctx))
+    }
+
     pub async fn scope_summaries(&self, ctx: &RequestContext) -> Result<Vec<ScopeSummary>> {
         dispatch!(self, scope_summaries(ctx))
     }
