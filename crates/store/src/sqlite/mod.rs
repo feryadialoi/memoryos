@@ -16,6 +16,7 @@ use sqlx::{AssertSqlSafe, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 mod facts;
+mod pages;
 mod rows;
 mod store_impl;
 
@@ -137,6 +138,7 @@ impl SqliteStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
+        let pages = pages::count_by_scope(&mut tx, ctx).await?;
         tx.commit().await.map_err(db)?;
 
         fn entry<'a>(
@@ -178,6 +180,9 @@ impl SqliteStore {
         }
         for (scope, count) in blocks {
             entry(&mut all, &scope)?.blocks = count;
+        }
+        for (scope, count) in pages {
+            entry(&mut all, &scope)?.pages = count;
         }
         Ok(all.into_values().collect())
     }

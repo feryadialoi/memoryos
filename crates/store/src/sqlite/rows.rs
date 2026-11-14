@@ -4,7 +4,10 @@
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
-use memoryos_core::{ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, Result};
+use memoryos_core::{
+    ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, Page, PageSectionHit, PageSummary,
+    PageVersion, Result,
+};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Decode, Row, Sqlite, Type};
 use uuid::Uuid;
@@ -22,6 +25,16 @@ pub(super) const FACT_COLS: &str = "f.id, f.scope, f.subject_id, f.predicate, f.
         SELECT s.episode_id FROM fact_sources s \
         WHERE s.tenant = f.tenant AND s.fact_id = f.id ORDER BY s.episode_id\
     )) AS source_episode_ids";
+
+/// Page columns require the aliases `p` for `pages` and `v` for `page_versions`, and section hit
+/// columns also `s` for `page_sections`.
+pub(super) const PAGE_COLS: &str = "p.id, p.scope, p.slug, v.title, v.body, v.summary, v.version, \
+    v.trust, v.status, v.edited_by, v.edited_at";
+pub(super) const PAGE_SUMMARY_COLS: &str = "p.id, p.scope, p.slug, v.title, v.version, v.edited_at";
+pub(super) const PAGE_VERSION_COLS: &str = "p.id AS page_id, p.scope, p.slug, v.version, \
+    v.base_version, v.title, v.summary, v.trust, v.status, v.edited_by, v.edited_at";
+pub(super) const PAGE_SECTION_HIT_COLS: &str = "s.id AS section_id, s.page_id, p.scope, p.slug, \
+    v.title, s.version, s.heading, s.text";
 
 /// SPEC section 4 visibility for `facts f`. Callers bind concrete transaction-stable Unix
 /// microsecond timestamps at positions `t` and `k` (defaults are resolved in Rust).
@@ -166,5 +179,63 @@ pub(super) fn api_key(row: &SqliteRow) -> Result<ApiKey> {
         scopes: json(row, "scopes")?,
         max_trust: parsed(row, "max_trust")?,
         is_admin: get(row, "is_admin")?,
+    })
+}
+
+pub(super) fn page(row: &SqliteRow) -> Result<Page> {
+    Ok(Page {
+        id: uuid(row, "id")?,
+        scope: parsed(row, "scope")?,
+        slug: get(row, "slug")?,
+        title: get(row, "title")?,
+        body: get(row, "body")?,
+        summary: get(row, "summary")?,
+        version: get(row, "version")?,
+        trust: parsed(row, "trust")?,
+        status: parsed(row, "status")?,
+        edited_by: get(row, "edited_by")?,
+        edited_at: time(row, "edited_at")?,
+    })
+}
+
+pub(super) fn page_summary(row: &SqliteRow) -> Result<PageSummary> {
+    Ok(PageSummary {
+        id: uuid(row, "id")?,
+        scope: parsed(row, "scope")?,
+        slug: get(row, "slug")?,
+        title: get(row, "title")?,
+        version: get(row, "version")?,
+        edited_at: time(row, "edited_at")?,
+    })
+}
+
+pub(super) fn page_version(row: &SqliteRow) -> Result<PageVersion> {
+    Ok(PageVersion {
+        page_id: uuid(row, "page_id")?,
+        scope: parsed(row, "scope")?,
+        slug: get(row, "slug")?,
+        version: get(row, "version")?,
+        base_version: get(row, "base_version")?,
+        title: get(row, "title")?,
+        summary: get(row, "summary")?,
+        trust: parsed(row, "trust")?,
+        status: parsed(row, "status")?,
+        edited_by: get(row, "edited_by")?,
+        edited_at: time(row, "edited_at")?,
+    })
+}
+
+/// A section hit without its score, which text search computes after decoding.
+pub(super) fn page_section_hit(row: &SqliteRow, score: f64) -> Result<PageSectionHit> {
+    Ok(PageSectionHit {
+        section_id: uuid(row, "section_id")?,
+        page_id: uuid(row, "page_id")?,
+        scope: parsed(row, "scope")?,
+        slug: get(row, "slug")?,
+        title: get(row, "title")?,
+        version: get(row, "version")?,
+        heading: get(row, "heading")?,
+        text: get(row, "text")?,
+        score,
     })
 }

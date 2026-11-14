@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use memoryos_core::{
     normalize_name, ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, FactFilter, FactOp,
-    FactStatus, GraphNeighborhood, MemoryStore, NewEntity, NewEpisode, PurgeReport, RequestContext,
+    FactStatus, GraphNeighborhood, MemoryStore, NewEntity, NewEpisode, NewPageVersion, Page,
+    PageSectionHit, PageSummary, PageVersion, PendingPageVersion, PurgeReport, RequestContext,
     Result, Scope, ScoredFact, Trust,
 };
 use pgvector::Vector;
@@ -16,7 +17,7 @@ use sqlx::{AssertSqlSafe, PgConnection, Row};
 use uuid::Uuid;
 
 use crate::rows::{self, visible, API_KEY_COLS, BLOCK_COLS, ENTITY_COLS, EPISODE_COLS, FACT_COLS};
-use crate::{db, facts, validate, PgStore};
+use crate::{db, facts, pages, validate, PgStore};
 
 /// Hard cap on `neighbors`, so a depth-5 walk through a hub cannot load an unbounded graph, whatever
 /// limit the caller asks for.
@@ -28,7 +29,7 @@ const MAX_BLOCK_VERSIONS: i64 = 100;
 
 /// Applies pgvector's iterative scan for this transaction, so rows removed by scope and time
 /// filters do not shrink the result below `limit`.
-async fn tune_vector_scan(conn: &mut PgConnection, limit: i64) -> Result<()> {
+pub(crate) async fn tune_vector_scan(conn: &mut PgConnection, limit: i64) -> Result<()> {
     let ef_search = (limit * 4).clamp(200, 1000).to_string();
     sqlx::query(
         "SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true), \
@@ -1023,6 +1024,99 @@ impl MemoryStore for PgStore {
         result.reverse();
         tx.commit().await.map_err(db)?;
         Ok(result)
+    }
+
+    async fn list_pages(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        prefix: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<PageSummary>> {
+        pages::list_pages(self, ctx, scope, prefix, limit).await
+    }
+
+    async fn get_page(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        slug: &str,
+        version: Option<i64>,
+    ) -> Result<Page> {
+        pages::get_page(self, ctx, scope, slug, version).await
+    }
+
+    async fn get_page_version(
+        &self,
+        ctx: &RequestContext,
+        page_id: Uuid,
+        version: i64,
+    ) -> Result<PageVersion> {
+        pages::get_page_version(self, ctx, page_id, version).await
+    }
+
+    async fn put_page(&self, ctx: &RequestContext, page: NewPageVersion) -> Result<PageVersion> {
+        pages::put_page(self, ctx, page).await
+    }
+
+    async fn page_versions(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        slug: &str,
+    ) -> Result<Vec<PageVersion>> {
+        pages::page_versions(self, ctx, scope, slug).await
+    }
+
+    async fn delete_page(&self, ctx: &RequestContext, scope: &Scope, slug: &str) -> Result<()> {
+        pages::delete_page(self, ctx, scope, slug).await
+    }
+
+    async fn list_quarantined_pages(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        limit: i64,
+    ) -> Result<Vec<PendingPageVersion>> {
+        pages::list_quarantined_pages(self, ctx, scopes, limit).await
+    }
+
+    async fn approve_page_version(
+        &self,
+        ctx: &RequestContext,
+        page_id: Uuid,
+        version: i64,
+    ) -> Result<Page> {
+        pages::approve_page_version(self, ctx, page_id, version).await
+    }
+
+    async fn reject_page_version(
+        &self,
+        ctx: &RequestContext,
+        page_id: Uuid,
+        version: i64,
+    ) -> Result<PageVersion> {
+        pages::reject_page_version(self, ctx, page_id, version).await
+    }
+
+    async fn search_page_sections_vector(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<PageSectionHit>> {
+        pages::search_page_sections_vector(self, ctx, scopes, embedding, limit).await
+    }
+
+    async fn search_page_sections_text(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<PageSectionHit>> {
+        pages::search_page_sections_text(self, ctx, scopes, query, limit).await
     }
 
     async fn find_api_key(&self, key_hash: &str) -> Result<Option<ApiKey>> {
