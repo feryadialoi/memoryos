@@ -10,7 +10,7 @@
 //!   fragment, which is never sent over the network, and another site can neither read it nor send
 //!   that header without a CORS preflight, which this never approves.
 //!
-//! Fact text is untrusted: agents write it, and it can quote hostile pages. `app.js` only ever sets it
+//! Fact and page text is untrusted: agents write it, and it can quote hostile pages. `app.js` only ever sets it
 //! as text, and the content security policy below refuses inline scripts as a second layer.
 
 use std::net::SocketAddr;
@@ -23,6 +23,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
+use memoryos_core::{validate_slug, Scope};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -196,7 +197,8 @@ fn token_matches(state: &UiState, headers: &HeaderMap) -> bool {
 }
 
 /// The server path for a page request, or `None` when the page has no business making it. Purge,
-/// user deletion, retraction, commits and block edits are not here on purpose. `target` is already
+/// user deletion, retraction, commits, block edits and page writes or deletes are not here on
+/// purpose. Knowledge pages are read and reviewed only. `target` is already
 /// percent-decoded, so every variable segment is checked before it goes into a URL.
 pub(crate) fn upstream_path(method: &Method, target: &str) -> Option<String> {
     let segments: Vec<&str> = target.split('/').collect();
@@ -218,8 +220,35 @@ pub(crate) fn upstream_path(method: &Method, target: &str) -> Option<String> {
         ("GET", ["agents", agent, "blocks"]) if safe_agent_id(agent) => {
             Some(format!("/v1/agents/{agent}/blocks"))
         }
+        ("GET", ["pages"]) => Some("/v1/pages".to_owned()),
+        ("GET", ["pages", "quarantine"]) => Some("/v1/pages/quarantine".to_owned()),
+        ("POST", ["pages", "quarantine", page, version, action @ ("approve" | "reject")])
+            if id(page) && page_version(version) =>
+        {
+            Some(format!("/v1/pages/quarantine/{page}/{version}/{action}"))
+        }
+        ("GET", ["pages", scope, slug]) if page_address(scope, slug) => {
+            Some(format!("/v1/pages/{scope}/{slug}"))
+        }
+        ("GET", ["pages", scope, slug, "versions"]) if page_address(scope, slug) => {
+            Some(format!("/v1/pages/{scope}/{slug}/versions"))
+        }
         _ => None,
     }
+}
+
+/// A scope such as `shared:team` and a slug, both in the forms the server accepts, so neither can
+/// carry a separator or a dot segment into the server path.
+fn page_address(scope: &str, slug: &str) -> bool {
+    scope.parse::<Scope>().is_ok() && validate_slug(slug).is_ok()
+}
+
+/// A version number as the server takes it: digits only, at least 1.
+fn page_version(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 18
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && text.parse::<i64>().is_ok_and(|n| n >= 1)
 }
 
 fn safe_agent_id(text: &str) -> bool {
@@ -362,6 +391,92 @@ mod tests {
         assert!(!allowed(Method::POST, "facts"));
         assert!(!allowed(Method::GET, &format!("quarantine/{ID}/approve")));
         assert!(!allowed(Method::POST, &format!("quarantine/{ID}/delete")));
+    }
+
+    #[test]
+    fn the_page_reads_and_reviews_knowledge_pages() {
+        assert_eq!(
+            upstream_path(&Method::GET, "pages").as_deref(),
+            Some("/v1/pages")
+        );
+        assert_eq!(
+            upstream_path(&Method::GET, "pages/quarantine").as_deref(),
+            Some("/v1/pages/quarantine")
+        );
+        assert_eq!(
+            upstream_path(&Method::GET, "pages/shared:team/run-book.v2").as_deref(),
+            Some("/v1/pages/shared:team/run-book.v2")
+        );
+        assert_eq!(
+            upstream_path(&Method::GET, "pages/agent:claude-code/guide/versions").as_deref(),
+            Some("/v1/pages/agent:claude-code/guide/versions")
+        );
+        for action in ["approve", "reject"] {
+            assert_eq!(
+                upstream_path(&Method::POST, &format!("pages/quarantine/{ID}/2/{action}")),
+                Some(format!("/v1/pages/quarantine/{ID}/2/{action}"))
+            );
+        }
+    }
+
+    #[test]
+    fn pages_are_never_written_or_deleted_through_the_page() {
+        for method in [Method::PUT, Method::POST, Method::DELETE, Method::PATCH] {
+            assert!(
+                !allowed(method.clone(), "pages/shared:team/guide"),
+                "{method}"
+            );
+            assert!(!allowed(method.clone(), "pages"), "{method}");
+        }
+        assert!(!allowed(Method::POST, "pages/quarantine"));
+        assert!(!allowed(
+            Method::DELETE,
+            &format!("pages/quarantine/{ID}/2/reject")
+        ));
+        assert!(!allowed(
+            Method::GET,
+            &format!("pages/quarantine/{ID}/2/approve")
+        ));
+        assert!(!allowed(
+            Method::POST,
+            &format!("pages/quarantine/{ID}/2/delete")
+        ));
+        assert!(!allowed(Method::POST, &format!("pages/quarantine/{ID}/2")));
+        assert!(!allowed(Method::POST, "pages/shared:team/guide/versions"));
+        assert!(!allowed(Method::GET, "pages/shared:team/guide/sections"));
+    }
+
+    #[test]
+    fn page_segments_cannot_change_the_path() {
+        // Scopes and slugs in forms the server would refuse never reach it.
+        assert!(!allowed(Method::GET, "pages/../guide"));
+        assert!(!allowed(Method::GET, "pages/shared:team/.."));
+        assert!(!allowed(Method::GET, "pages/shared:team/.hidden"));
+        assert!(!allowed(Method::GET, "pages/shared:team/Guide"));
+        assert!(!allowed(Method::GET, "pages/team/guide"));
+        assert!(!allowed(Method::GET, "pages/other:team/guide"));
+        assert!(!allowed(Method::GET, "pages/shared:/guide"));
+        assert!(!allowed(Method::GET, "pages/shared:te?am/guide"));
+        assert!(!allowed(Method::GET, "pages/shared:team/gu?ide"));
+        assert!(!allowed(Method::GET, "pages/shared:team/guide/../../facts"));
+        let decoded =
+            percent_decoded("pages/shared:team/guide%2f..%2f..%2fversions").expect("decodes");
+        assert!(!allowed(Method::GET, &decoded));
+        let decoded = percent_decoded("pages/shared%3Ateam/guide").expect("decodes");
+        assert!(allowed(Method::GET, &decoded));
+        for version in ["0", "-1", "+2", "1.5", "x", "", "99999999999999999999"] {
+            assert!(
+                !allowed(
+                    Method::POST,
+                    &format!("pages/quarantine/{ID}/{version}/approve")
+                ),
+                "{version}"
+            );
+        }
+        assert!(!allowed(
+            Method::POST,
+            "pages/quarantine/not-a-uuid/2/approve"
+        ));
     }
 
     #[test]

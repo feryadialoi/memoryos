@@ -463,3 +463,126 @@ async fn a_stopped_server_is_reported_and_not_a_hang() {
     let body: Value = response.json().await.expect("json");
     assert_eq!(body["error"]["code"], "server_unreachable");
 }
+
+async fn put_guide(server: &Server, key: &Key, body: Value) -> Value {
+    let (status, value) = server
+        .call("PUT", "/v1/pages/shared:team/guide", Some(key), Some(body))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    value
+}
+
+async fn page_json(page: &Page, path: &str) -> Value {
+    let response = page
+        .api(reqwest::Method::GET, path)
+        .send()
+        .await
+        .expect("read");
+    assert_eq!(response.status(), StatusCode::OK, "{path}");
+    response.json().await.expect("json")
+}
+
+#[tokio::test]
+async fn pages_are_read_and_reviewed_through_the_page_and_never_written() {
+    let server = Server::start().await;
+    let root = server.root("acme").await;
+    let agent = server
+        .key("acme", &["shared:team"], Trust::Agent, false)
+        .await;
+    let first = put_guide(
+        &server,
+        &root,
+        json!({"title": "Guide", "body": "one\ntwo", "approve": true}),
+    )
+    .await;
+    let page_id = first["page_id"].as_str().expect("page id").to_owned();
+    let pending = put_guide(
+        &server,
+        &agent,
+        json!({"title": "Guide", "body": "one\nthree", "expected_version": 1}),
+    )
+    .await;
+    assert_eq!(pending["status"], "quarantined");
+    let page = Page::start(&server, &root).await;
+
+    let body = page_json(&page, "pages?scope=shared%3Ateam").await;
+    assert_eq!(body["pages"][0]["slug"], "guide", "{body}");
+    let body = page_json(&page, "pages/shared%3Ateam/guide").await;
+    assert_eq!(body["body"], "one\ntwo", "{body}");
+    let body = page_json(&page, "pages/shared:team/guide/versions").await;
+    assert_eq!(body["versions"].as_array().expect("versions").len(), 2);
+    let body = page_json(&page, "pages/quarantine?scopes=*").await;
+    assert_eq!(body["versions"][0]["base_body"], "one\ntwo", "{body}");
+    assert_eq!(body["versions"][0]["body"], "one\nthree");
+
+    for (method, path) in [
+        (reqwest::Method::PUT, "pages/shared:team/guide".to_owned()),
+        (
+            reqwest::Method::DELETE,
+            "pages/shared:team/guide".to_owned(),
+        ),
+        (reqwest::Method::PUT, "pages/shared%3Ateam/guide".to_owned()),
+        (
+            reqwest::Method::GET,
+            "pages/shared:team/guide%2f..%2f..%2fquarantine".to_owned(),
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("pages/quarantine/{page_id}/2/reject"),
+        ),
+    ] {
+        let response = page
+            .api(method, &path)
+            .json(&json!({"title": "Planted", "body": "x", "expected_version": 1, "approve": true}))
+            .send()
+            .await
+            .expect("refused");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let (_, read) = server
+        .call("GET", "/v1/pages/shared:team/guide", Some(&root), None)
+        .await;
+    assert_eq!(read["version"], 1, "the page must be unchanged: {read}");
+
+    let response = page
+        .api(
+            reqwest::Method::POST,
+            &format!("pages/quarantine/{page_id}/2/approve"),
+        )
+        .send()
+        .await
+        .expect("approve");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = page_json(&page, "pages/shared:team/guide").await;
+    assert_eq!(body["version"], 2);
+    assert_eq!(body["body"], "one\nthree");
+    let body = page_json(&page, "pages/shared:team/guide?version=1").await;
+    assert_eq!(body["body"], "one\ntwo", "{body}");
+
+    // Approving an edit made over a version that is no longer current is a conflict, which the
+    // page shows as such.
+    let stale = put_guide(
+        &server,
+        &agent,
+        json!({"title": "Guide", "body": "stale", "expected_version": 2}),
+    )
+    .await;
+    put_guide(
+        &server,
+        &root,
+        json!({"title": "Guide", "body": "newer", "expected_version": 2, "approve": true}),
+    )
+    .await;
+    let response = page
+        .api(
+            reqwest::Method::POST,
+            &format!("pages/quarantine/{page_id}/{}/approve", stale["version"]),
+        )
+        .send()
+        .await
+        .expect("approve stale");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "version_conflict");
+    server.stop().await.expect("stop");
+}
