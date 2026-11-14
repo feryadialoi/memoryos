@@ -338,7 +338,8 @@ searched at the present only; older versions are read by version.
   version, recall and hooks see. Others are `quarantined` (waiting for review), `rejected` or
   `superseded`. Each version records `base_version`, the version its writer edited.
 - Limits: title 1 to 200 characters, body at most 100,000, change summary at most 500, at most 400
-  sections of at most 1,000 characters each, at most 20 quarantined versions per page. Superseded and
+  sections of at most 1,000 characters each, at most 20 quarantined versions per page. Lengths are
+  counted in characters of the stored text, after secret masking, which can lengthen it. Superseded and
   rejected versions past the newest 100 are pruned on write; the current and quarantined ones never are.
 - Write (`PUT /v1/pages/{scope}/{slug}`, MCP `page_write`):
   1. Mask secrets in title, body and summary as commits do (section 3, Rules). The response sets
