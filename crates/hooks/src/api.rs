@@ -90,7 +90,16 @@ impl Api {
         let body =
             json!({"scopes": scopes, "query": query, "limit": limit, "page_limit": page_limit});
         let request = self.request(Method::POST, &["v1", "recall"]).json(&body);
-        let value = self.send(request).await?;
+        let value = match self.send(request).await {
+            // A server from before pages refuses the unknown field. Facts still help, so ask again
+            // without it and show no pages.
+            Err(error) if error.starts_with("invalid input") && error.contains("page_limit") => {
+                let body = json!({"scopes": scopes, "query": query, "limit": limit});
+                let request = self.request(Method::POST, &["v1", "recall"]).json(&body);
+                self.send(request).await?
+            }
+            other => other?,
+        };
         serde_json::from_value(value).map_err(|e| format!("unexpected recall response: {e}"))
     }
 
@@ -328,6 +337,27 @@ mod tests {
         assert_eq!(
             body,
             json!({"scopes": ["agent:a"], "query": "q", "limit": 10, "page_limit": 5})
+        );
+    }
+
+    #[test]
+    fn a_server_without_pages_is_asked_again_without_page_limit() {
+        let refused = json!({"error": {"code": "invalid_input",
+            "message": "unknown field `page_limit`, expected one of `scopes`, `query`"}});
+        let server = Server::start(vec![
+            (400, refused.to_string()),
+            (200, json!({"facts": []}).to_string()),
+        ]);
+        let recall = runtime()
+            .block_on(api(&server.url).recall(&[Scope::agent("a")], "q", 10, 5))
+            .expect("recall falls back");
+        assert!(recall.pages.is_empty());
+        let received = server.finish();
+        assert_eq!(received.len(), 2);
+        let retry: Value = serde_json::from_str(&received[1].body).expect("json");
+        assert_eq!(
+            retry,
+            json!({"scopes": ["agent:a"], "query": "q", "limit": 10})
         );
     }
 
