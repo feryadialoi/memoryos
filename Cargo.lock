@@ -2194,6 +2194,7 @@ dependencies = [
 name = "memoryos-ingest"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "futures",
  "memoryos-core",
