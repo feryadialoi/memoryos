@@ -2,7 +2,10 @@
 
 use std::str::FromStr;
 
-use memoryos_core::{ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, Result};
+use memoryos_core::{
+    ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, Page, PageSectionHit, PageSummary,
+    PageVersion, Result,
+};
 use sqlx::postgres::PgRow;
 use sqlx::{Decode, Postgres, Row, Type};
 
@@ -17,6 +20,16 @@ pub(crate) const FACT_COLS: &str = "f.id, f.scope, f.subject_id, f.predicate, f.
     f.invalidated_at, \
     f.superseded_by, f.pending_supersede_of, ARRAY(SELECT s.episode_id FROM fact_sources s WHERE s.fact_id = f.id \
     ORDER BY s.episode_id) AS source_episode_ids";
+
+/// Page columns require the aliases `p` for `pages` and `v` for `page_versions`, and section hit
+/// columns also `s` for `page_sections`.
+pub(crate) const PAGE_COLS: &str = "p.id, p.scope, p.slug, v.title, v.body, v.summary, v.version, \
+    v.trust, v.status, v.edited_by, v.edited_at";
+pub(crate) const PAGE_SUMMARY_COLS: &str = "p.id, p.scope, p.slug, v.title, v.version, v.edited_at";
+pub(crate) const PAGE_VERSION_COLS: &str = "p.id AS page_id, p.scope, p.slug, v.version, \
+    v.base_version, v.title, v.summary, v.trust, v.status, v.edited_by, v.edited_at";
+pub(crate) const PAGE_SECTION_HIT_COLS: &str = "s.id AS section_id, s.page_id, p.scope, p.slug, \
+    v.title, s.version, s.heading, s.text";
 
 /// SPEC section 4 visibility for `facts f`, with `$t` the valid time and `$k` the knowledge time.
 /// Both parameters are nullable and default to the transaction's `now()`.
@@ -131,5 +144,62 @@ pub(crate) fn api_key(row: &PgRow) -> Result<ApiKey> {
         scopes: get(row, "scopes")?,
         max_trust: parsed(row, "max_trust")?,
         is_admin: get(row, "is_admin")?,
+    })
+}
+
+pub(crate) fn page(row: &PgRow) -> Result<Page> {
+    Ok(Page {
+        id: get(row, "id")?,
+        scope: parsed(row, "scope")?,
+        slug: get(row, "slug")?,
+        title: get(row, "title")?,
+        body: get(row, "body")?,
+        summary: get(row, "summary")?,
+        version: get(row, "version")?,
+        trust: parsed(row, "trust")?,
+        status: parsed(row, "status")?,
+        edited_by: get(row, "edited_by")?,
+        edited_at: get(row, "edited_at")?,
+    })
+}
+
+pub(crate) fn page_summary(row: &PgRow) -> Result<PageSummary> {
+    Ok(PageSummary {
+        id: get(row, "id")?,
+        scope: parsed(row, "scope")?,
+        slug: get(row, "slug")?,
+        title: get(row, "title")?,
+        version: get(row, "version")?,
+        edited_at: get(row, "edited_at")?,
+    })
+}
+
+pub(crate) fn page_version(row: &PgRow) -> Result<PageVersion> {
+    Ok(PageVersion {
+        page_id: get(row, "page_id")?,
+        scope: parsed(row, "scope")?,
+        slug: get(row, "slug")?,
+        version: get(row, "version")?,
+        base_version: get(row, "base_version")?,
+        title: get(row, "title")?,
+        summary: get(row, "summary")?,
+        trust: parsed(row, "trust")?,
+        status: parsed(row, "status")?,
+        edited_by: get(row, "edited_by")?,
+        edited_at: get(row, "edited_at")?,
+    })
+}
+
+pub(crate) fn page_section_hit(row: &PgRow) -> Result<PageSectionHit> {
+    Ok(PageSectionHit {
+        section_id: get(row, "section_id")?,
+        page_id: get(row, "page_id")?,
+        scope: parsed(row, "scope")?,
+        slug: get(row, "slug")?,
+        title: get(row, "title")?,
+        version: get(row, "version")?,
+        heading: get(row, "heading")?,
+        text: get(row, "text")?,
+        score: get(row, "score")?,
     })
 }

@@ -167,8 +167,7 @@ pub trait MemoryStore: Send + Sync {
         label: &str,
     ) -> Result<Vec<BlockVersion>>;
 
-    // Pages (docs/SPEC.md section 8). The default bodies exist only until both backends implement
-    // pages in T21, which removes them.
+    // Pages (docs/SPEC.md section 8).
     /// Pages in `scope` that have a current version, by slug, at most `limit` (1..=500), optionally
     /// only slugs starting with `prefix`.
     async fn list_pages(
@@ -177,10 +176,7 @@ pub trait MemoryStore: Send + Sync {
         scope: &Scope,
         prefix: Option<&str>,
         limit: i64,
-    ) -> Result<Vec<PageSummary>> {
-        let _ = (ctx, scope, prefix, limit);
-        Err(pages_not_implemented())
-    }
+    ) -> Result<Vec<PageSummary>>;
     /// The current version, or with `version` that version if it is active or superseded. A page
     /// with no current version, or a quarantined or rejected version, is `NotFound`.
     async fn get_page(
@@ -189,20 +185,14 @@ pub trait MemoryStore: Send + Sync {
         scope: &Scope,
         slug: &str,
         version: Option<i64>,
-    ) -> Result<Page> {
-        let _ = (ctx, scope, slug, version);
-        Err(pages_not_implemented())
-    }
+    ) -> Result<Page>;
     /// One version's metadata in any status, for scope and trust checks before review.
     async fn get_page_version(
         &self,
         ctx: &RequestContext,
         page_id: Uuid,
         version: i64,
-    ) -> Result<PageVersion> {
-        let _ = (ctx, page_id, version);
-        Err(pages_not_implemented())
-    }
+    ) -> Result<PageVersion>;
     /// Writes a new version atomically:
     /// - `expected_version = None` creates the page and fails with `VersionConflict` if it exists.
     ///   `Some(v)` fails with `NotFound` if the page does not exist, and with `VersionConflict`
@@ -216,35 +206,23 @@ pub trait MemoryStore: Send + Sync {
     /// - `InvalidInput` when the page already has `PAGE_PENDING_MAX` quarantined versions.
     /// - Prunes superseded and rejected versions past the newest `PAGE_VERSIONS_KEPT`, and writes a
     ///   `page.write` audit event, with `approved: true` when `approve_up_to` was used.
-    async fn put_page(&self, ctx: &RequestContext, page: NewPageVersion) -> Result<PageVersion> {
-        let _ = (ctx, page);
-        Err(pages_not_implemented())
-    }
+    async fn put_page(&self, ctx: &RequestContext, page: NewPageVersion) -> Result<PageVersion>;
     /// Kept versions of the page in any status, newest first, without bodies.
     async fn page_versions(
         &self,
         ctx: &RequestContext,
         scope: &Scope,
         slug: &str,
-    ) -> Result<Vec<PageVersion>> {
-        let _ = (ctx, scope, slug);
-        Err(pages_not_implemented())
-    }
+    ) -> Result<Vec<PageVersion>>;
     /// Hard-deletes the page with every version and section. Writes a `page.delete` audit event.
-    async fn delete_page(&self, ctx: &RequestContext, scope: &Scope, slug: &str) -> Result<()> {
-        let _ = (ctx, scope, slug);
-        Err(pages_not_implemented())
-    }
+    async fn delete_page(&self, ctx: &RequestContext, scope: &Scope, slug: &str) -> Result<()>;
     /// Quarantined versions in `scopes`, oldest first.
     async fn list_quarantined_pages(
         &self,
         ctx: &RequestContext,
         scopes: &[Scope],
         limit: i64,
-    ) -> Result<Vec<PendingPageVersion>> {
-        let _ = (ctx, scopes, limit);
-        Err(pages_not_implemented())
-    }
+    ) -> Result<Vec<PendingPageVersion>>;
     /// Makes a quarantined version current, as an active write would. `InvalidInput` if it is not
     /// quarantined, `VersionConflict` if its `base_version` is no longer the current version.
     /// Writes a `page.approve` audit event.
@@ -253,20 +231,14 @@ pub trait MemoryStore: Send + Sync {
         ctx: &RequestContext,
         page_id: Uuid,
         version: i64,
-    ) -> Result<Page> {
-        let _ = (ctx, page_id, version);
-        Err(pages_not_implemented())
-    }
+    ) -> Result<Page>;
     /// Rejects a quarantined version and deletes its sections. Writes a `page.reject` audit event.
     async fn reject_page_version(
         &self,
         ctx: &RequestContext,
         page_id: Uuid,
         version: i64,
-    ) -> Result<PageVersion> {
-        let _ = (ctx, page_id, version);
-        Err(pages_not_implemented())
-    }
+    ) -> Result<PageVersion>;
     /// Vector search over sections of current versions in `scopes`, nearest first.
     async fn search_page_sections_vector(
         &self,
@@ -274,10 +246,7 @@ pub trait MemoryStore: Send + Sync {
         scopes: &[Scope],
         embedding: &[f32],
         limit: i64,
-    ) -> Result<Vec<PageSectionHit>> {
-        let _ = (ctx, scopes, embedding, limit);
-        Err(pages_not_implemented())
-    }
+    ) -> Result<Vec<PageSectionHit>>;
     /// Full-text search over headings and text of sections of current versions in `scopes`.
     async fn search_page_sections_text(
         &self,
@@ -285,10 +254,7 @@ pub trait MemoryStore: Send + Sync {
         scopes: &[Scope],
         query: &str,
         limit: i64,
-    ) -> Result<Vec<PageSectionHit>> {
-        let _ = (ctx, scopes, query, limit);
-        Err(pages_not_implemented())
-    }
+    ) -> Result<Vec<PageSectionHit>>;
 
     // API keys: cross-tenant, looked up before the tenant is known
     /// `key_hash` is the hex SHA-256 of the presented token. Revoked keys return `None`.
@@ -306,8 +272,4 @@ pub trait MemoryStore: Send + Sync {
 
     /// Verifies database connectivity for `/readyz`.
     async fn ping(&self) -> Result<()>;
-}
-
-fn pages_not_implemented() -> crate::Error {
-    crate::Error::Internal("pages are not implemented by this store".to_owned())
 }

@@ -1,6 +1,11 @@
 //! Input checks that run before any SQL, so bad input is `InvalidInput` and not `Storage`.
 
-use memoryos_core::{Error, Result, Scope, EMBEDDING_DIMS};
+use std::collections::BTreeSet;
+
+use memoryos_core::{
+    validate_slug, Error, NewPageVersion, Result, Scope, EMBEDDING_DIMS, PAGE_BODY_MAX,
+    PAGE_SECTIONS_MAX, PAGE_SECTION_TEXT_MAX, PAGE_SUMMARY_MAX, PAGE_TITLE_MAX,
+};
 use pgvector::Vector;
 
 /// Upper bound for any `limit` argument. The API caps are lower.
@@ -45,6 +50,72 @@ pub(crate) fn non_empty(field: &str, value: &str) -> Result<()> {
 
 pub(crate) fn scope_strings(scopes: &[Scope]) -> Vec<String> {
     scopes.iter().map(ToString::to_string).collect()
+}
+
+/// Upper bound for `list_pages`.
+const MAX_PAGE_LIST: i64 = 500;
+
+pub(crate) fn page_list_limit(value: i64) -> Result<i64> {
+    if (1..=MAX_PAGE_LIST).contains(&value) {
+        Ok(value)
+    } else {
+        Err(Error::InvalidInput(format!(
+            "limit must be in 1..={MAX_PAGE_LIST}, got {value}"
+        )))
+    }
+}
+
+/// Unicode scalar values, the unit of `char_length` and SQLite `length`, so these checks agree
+/// with the CHECK constraints.
+fn at_most(field: &str, value: &str, max: usize) -> Result<()> {
+    let len = value.chars().count();
+    if len > max {
+        return Err(Error::InvalidInput(format!(
+            "{field} has {len} characters, at most {max} allowed"
+        )));
+    }
+    Ok(())
+}
+
+/// Every limit of SPEC section 8 except the embeddings, which each backend checks as it encodes
+/// them.
+pub(crate) fn page(page: &NewPageVersion) -> Result<()> {
+    validate_slug(&page.slug)?;
+    non_empty("title", &page.title)?;
+    at_most("title", &page.title, PAGE_TITLE_MAX)?;
+    at_most("body", &page.body, PAGE_BODY_MAX)?;
+    if let Some(summary) = &page.summary {
+        at_most("summary", summary, PAGE_SUMMARY_MAX)?;
+    }
+    if page.sections.len() > PAGE_SECTIONS_MAX {
+        return Err(Error::InvalidInput(format!(
+            "a page has at most {PAGE_SECTIONS_MAX} sections, got {}",
+            page.sections.len()
+        )));
+    }
+    if page.sections.is_empty() && !page.body.trim().is_empty() {
+        return Err(Error::InvalidInput(
+            "a page with a body needs at least one section".into(),
+        ));
+    }
+    let mut ordinals = BTreeSet::new();
+    for section in &page.sections {
+        if section.ordinal < 0 {
+            return Err(Error::InvalidInput(format!(
+                "section ordinal must not be negative, got {}",
+                section.ordinal
+            )));
+        }
+        if !ordinals.insert(section.ordinal) {
+            return Err(Error::InvalidInput(format!(
+                "section ordinal {} is repeated",
+                section.ordinal
+            )));
+        }
+        non_empty("section heading", &section.heading)?;
+        at_most("section text", &section.text, PAGE_SECTION_TEXT_MAX)?;
+    }
+    Ok(())
 }
 
 /// `api_keys.key_hash` must be a SHA-256 hex digest, so a raw token can never be stored by mistake.

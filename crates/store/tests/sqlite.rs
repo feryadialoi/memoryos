@@ -1,7 +1,8 @@
 //! Real-file SQLite integration tests for `SqliteStore`.
 //!
 //! Every test owns a temporary directory and database file. The suite exercises the same public
-//! `MemoryStore` contract as the PostgreSQL integration suite, without Docker or direct SQL.
+//! `MemoryStore` contract as the PostgreSQL integration suite, without Docker. Direct SQL only
+//! checks side tables the trait cannot read back.
 
 #![cfg(feature = "integration-sqlite")]
 
@@ -11,10 +12,13 @@ use std::sync::Arc;
 use chrono::{DateTime, TimeZone, Utc};
 use memoryos_core::{
     Error, Fact, FactFilter, FactListState, FactOp, FactStatus, MemoryStore, NewEntity, NewEpisode,
-    NewFact, RequestContext, Scope, ScoredFact, Trust, EMBEDDING_DIMS,
+    NewFact, NewPageSection, NewPageVersion, PageSectionHit, PageVersionStatus, RequestContext,
+    Scope, ScoredFact, Trust, EMBEDDING_DIMS,
 };
 use memoryos_store::SqliteStore;
 use serde_json::json;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::AssertSqlSafe;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -2309,5 +2313,1034 @@ async fn empty_tenant_and_malformed_inputs_are_domain_errors() -> TestResult {
         embedding: vec![1.0; 3],
     };
     assert!(is_invalid(db.store.upsert_entity(&c, bad_entity).await));
+    Ok(())
+}
+
+/// Direct SQL on the database file, only for side tables the trait cannot read back. The store
+/// registered sqlite-vec for the process, so this connection reads vec0 tables too.
+async fn count(db: &Db, sql: &str) -> Res<i64> {
+    let options = SqliteConnectOptions::new().filename(&db.path);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    let found = sqlx::query_scalar(AssertSqlSafe(sql))
+        .fetch_one(&pool)
+        .await?;
+    pool.close().await;
+    Ok(found)
+}
+
+/// Fails unless the external-content FTS index matches `page_sections` row for row.
+async fn fts_integrity(db: &Db) -> Res<()> {
+    let options = SqliteConnectOptions::new().filename(&db.path);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    sqlx::query("INSERT INTO page_sections_fts (page_sections_fts) VALUES ('integrity-check')")
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
+}
+
+// ---- Pages -----------------------------------------------------------------------------------
+
+/// One section per page, embedded on axis `dim`, with the body as its text.
+fn page_write(
+    scope: &Scope,
+    slug: &str,
+    body: &str,
+    trust: Trust,
+    expected_version: Option<i64>,
+    dim: usize,
+) -> NewPageVersion {
+    NewPageVersion {
+        scope: scope.clone(),
+        slug: slug.into(),
+        title: format!("Title of {slug}"),
+        body: body.into(),
+        summary: Some("change".into()),
+        trust,
+        expected_version,
+        approve_up_to: None,
+        sections: vec![NewPageSection {
+            ordinal: 0,
+            heading: format!("Title of {slug} > Part"),
+            text: body.into(),
+            embedding: axis(dim),
+        }],
+    }
+}
+
+fn is_conflict<T>(r: Result<T, Error>, expected: i64, current: i64) -> bool {
+    matches!(r, Err(Error::VersionConflict { expected: e, current: c }) if e == expected && c == current)
+}
+
+fn hit_texts(hits: &[PageSectionHit]) -> Vec<String> {
+    hits.iter().map(|h| h.text.clone()).collect()
+}
+
+#[tokio::test]
+async fn pages_create_read_update_and_report_version_conflicts() -> TestResult {
+    let db = db().await?;
+    let c = ctx("t1");
+    let scope = Scope::agent("bot");
+
+    let first = db
+        .store
+        .put_page(
+            &c,
+            page_write(&scope, "runbook", "one", Trust::Agent, None, 0),
+        )
+        .await?;
+    assert_eq!(first.version, 1);
+    assert_eq!(first.base_version, None);
+    assert_eq!(first.status, PageVersionStatus::Active);
+    assert_eq!(first.slug, "runbook");
+    assert_eq!(first.scope, scope);
+    assert_eq!(first.edited_by, "tester");
+    assert_eq!(first.summary.as_deref(), Some("change"));
+    let page = db.store.get_page(&c, &scope, "runbook", None).await?;
+    assert_eq!(
+        (page.id, page.version, page.body.as_str()),
+        (first.page_id, 1, "one")
+    );
+    assert_eq!(page.title, "Title of runbook");
+    assert_eq!(page.trust, Trust::Agent);
+
+    // Create on an existing page, and edits of a stale or missing version.
+    assert!(is_conflict(
+        db.store
+            .put_page(
+                &c,
+                page_write(&scope, "runbook", "x", Trust::Agent, None, 0)
+            )
+            .await,
+        0,
+        1
+    ));
+    let second = db
+        .store
+        .put_page(
+            &c,
+            page_write(&scope, "runbook", "two", Trust::Agent, Some(1), 1),
+        )
+        .await?;
+    assert_eq!((second.version, second.base_version), (2, Some(1)));
+    assert!(is_conflict(
+        db.store
+            .put_page(
+                &c,
+                page_write(&scope, "runbook", "x", Trust::Agent, Some(1), 0)
+            )
+            .await,
+        1,
+        2
+    ));
+    assert!(is_not_found(
+        db.store
+            .put_page(
+                &c,
+                page_write(&scope, "missing", "x", Trust::Agent, Some(1), 0)
+            )
+            .await
+    ));
+
+    assert_eq!(
+        db.store.get_page(&c, &scope, "runbook", None).await?.body,
+        "two"
+    );
+    let old = db.store.get_page(&c, &scope, "runbook", Some(1)).await?;
+    assert_eq!(
+        (old.body.as_str(), old.status),
+        ("one", PageVersionStatus::Superseded)
+    );
+    assert!(is_not_found(
+        db.store.get_page(&c, &scope, "runbook", Some(9)).await
+    ));
+    assert!(is_not_found(
+        db.store.get_page(&c, &scope, "missing", None).await
+    ));
+    assert!(is_not_found(
+        db.store
+            .get_page(&c, &Scope::agent("other"), "runbook", None)
+            .await
+    ));
+
+    let history = db.store.page_versions(&c, &scope, "runbook").await?;
+    let shape: Vec<_> = history.iter().map(|v| (v.version, v.status)).collect();
+    assert_eq!(
+        shape,
+        vec![
+            (2, PageVersionStatus::Active),
+            (1, PageVersionStatus::Superseded)
+        ]
+    );
+    assert!(is_not_found(
+        db.store.page_versions(&c, &scope, "missing").await
+    ));
+    let v1 = db.store.get_page_version(&c, first.page_id, 1).await?;
+    assert_eq!(v1.status, PageVersionStatus::Superseded);
+    assert!(is_not_found(
+        db.store.get_page_version(&c, first.page_id, 3).await
+    ));
+    assert!(is_not_found(
+        db.store.get_page_version(&c, Uuid::now_v7(), 1).await
+    ));
+
+    // A page whose only version is pending reports current 0 to a create and to an edit.
+    let shared = Scope::shared("team");
+    db.store
+        .put_page(&c, page_write(&shared, "held", "x", Trust::Agent, None, 0))
+        .await?;
+    assert!(is_conflict(
+        db.store
+            .put_page(&c, page_write(&shared, "held", "y", Trust::Agent, None, 0))
+            .await,
+        0,
+        0
+    ));
+    assert!(is_conflict(
+        db.store
+            .put_page(
+                &c,
+                page_write(&shared, "held", "y", Trust::Agent, Some(1), 0)
+            )
+            .await,
+        1,
+        0
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn page_writes_are_validated_before_any_sql() -> TestResult {
+    let db = db().await?;
+    let c = ctx("t1");
+    let scope = Scope::agent("bot");
+    let base = || page_write(&scope, "p", "body", Trust::Agent, None, 0);
+
+    let mut cases: Vec<NewPageVersion> = Vec::new();
+    let long_slug = "a".repeat(129);
+    for slug in ["", "Upper", "a/b", "-a", long_slug.as_str()] {
+        let mut p = base();
+        p.slug = slug.into();
+        cases.push(p);
+    }
+    let long_title = "t".repeat(201);
+    for title in ["", "   ", long_title.as_str()] {
+        let mut p = base();
+        p.title = title.into();
+        cases.push(p);
+    }
+    let mut p = base();
+    p.body = "b".repeat(100_001);
+    cases.push(p);
+    let mut p = base();
+    p.summary = Some("s".repeat(501));
+    cases.push(p);
+    let mut p = base();
+    p.sections.clear();
+    cases.push(p);
+    let mut p = base();
+    p.sections[0].text = "x".repeat(1001);
+    cases.push(p);
+    let mut p = base();
+    p.sections[0].heading = " ".into();
+    cases.push(p);
+    let mut p = base();
+    p.sections.push(p.sections[0].clone());
+    cases.push(p);
+    let mut p = base();
+    p.sections[0].ordinal = -1;
+    cases.push(p);
+    let mut p = base();
+    p.sections[0].embedding = vec![0.0; EMBEDDING_DIMS];
+    cases.push(p);
+    let mut p = base();
+    p.sections[0].embedding = vec![1.0; 3];
+    cases.push(p);
+    let mut p = base();
+    p.sections = (0..401)
+        .map(|i| NewPageSection {
+            ordinal: i,
+            heading: "h".into(),
+            text: "t".into(),
+            embedding: axis(0),
+        })
+        .collect();
+    cases.push(p);
+    let mut p = base();
+    p.body = "nul\0".into();
+    cases.push(p);
+    for case in cases {
+        let slug = case.slug.clone();
+        assert!(is_invalid(db.store.put_page(&c, case).await), "{slug}");
+    }
+    assert!(is_not_found(db.store.get_page(&c, &scope, "p", None).await));
+
+    // Limits count characters, not bytes, as the CHECK constraints do.
+    let mut p = base();
+    p.title = "é".repeat(200);
+    p.sections[0].text = "é".repeat(1000);
+    db.store.put_page(&c, p).await?;
+    // A blank body may have no sections.
+    let mut p = page_write(&scope, "empty", "  \n", Trust::Agent, None, 0);
+    p.sections.clear();
+    db.store.put_page(&c, p).await?;
+    assert!(is_invalid(
+        db.store.get_page(&c, &scope, "Bad/slug", None).await
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn page_version_status_follows_the_trust_rules() -> TestResult {
+    let db = db().await?;
+    let c = ctx("t1");
+    let agent = Scope::agent("bot");
+    let shared = Scope::shared("team");
+    let person = user("u1");
+    let put = |p: NewPageVersion| {
+        let store = db.store.clone();
+        let c = c.clone();
+        async move { store.put_page(&c, p).await }
+    };
+    let status = |p: NewPageVersion| async move { put(p).await.map(|v| v.status) };
+
+    assert_eq!(
+        status(page_write(&agent, "a", "x", Trust::Agent, None, 0)).await?,
+        PageVersionStatus::Active
+    );
+    assert_eq!(
+        status(page_write(&shared, "a", "x", Trust::Agent, None, 0)).await?,
+        PageVersionStatus::Quarantined
+    );
+    assert_eq!(
+        status(page_write(&person, "a", "x", Trust::Agent, None, 0)).await?,
+        PageVersionStatus::Quarantined
+    );
+    assert_eq!(
+        status(page_write(&agent, "ext", "x", Trust::External, None, 0)).await?,
+        PageVersionStatus::Quarantined
+    );
+    assert_eq!(
+        status(page_write(&shared, "by-user", "x", Trust::User, None, 0)).await?,
+        PageVersionStatus::Active
+    );
+    // A quarantined first version leaves the page without a current version.
+    assert!(is_not_found(
+        db.store.get_page(&c, &shared, "a", None).await
+    ));
+
+    // Lower trust than the current version is held, even in an agent scope.
+    assert_eq!(
+        status(page_write(&agent, "high", "x", Trust::User, None, 0)).await?,
+        PageVersionStatus::Active
+    );
+    assert_eq!(
+        status(page_write(&agent, "high", "y", Trust::Agent, Some(1), 0)).await?,
+        PageVersionStatus::Quarantined
+    );
+
+    // An approving write is active unless the current version outranks the approver.
+    let mut forbidden = page_write(&shared, "by-user", "y", Trust::Agent, Some(1), 0);
+    forbidden.approve_up_to = Some(Trust::Agent);
+    assert!(matches!(put(forbidden).await, Err(Error::Forbidden(_))));
+    let mut approved = page_write(&shared, "by-user", "y", Trust::Agent, Some(1), 0);
+    approved.approve_up_to = Some(Trust::User);
+    let written = put(approved).await?;
+    assert_eq!(
+        (written.version, written.status, written.trust),
+        (2, PageVersionStatus::Active, Trust::Agent)
+    );
+    assert_eq!(
+        db.store.get_page(&c, &shared, "by-user", None).await?.body,
+        "y"
+    );
+    // An approving write of a new page in a shared scope is active too.
+    let mut fresh = page_write(&shared, "fresh", "z", Trust::External, None, 0);
+    fresh.approve_up_to = Some(Trust::User);
+    assert_eq!(status(fresh).await?, PageVersionStatus::Active);
+
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM audit_events WHERE action = 'page.write'"
+        )
+        .await?,
+        9
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM audit_events WHERE action = 'page.write' AND json_extract(detail, '$.approved') = 1"
+        )
+        .await?,
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn approving_and_rejecting_page_versions() -> TestResult {
+    let db = db().await?;
+    let c = ctx("t1");
+    let shared = Scope::shared("team");
+    let scopes = [shared.clone()];
+
+    let v1 = db
+        .store
+        .put_page(
+            &c,
+            page_write(&shared, "doc", "first", Trust::User, None, 10),
+        )
+        .await?;
+    let id = v1.page_id;
+    let v2 = db
+        .store
+        .put_page(
+            &c,
+            page_write(&shared, "doc", "second", Trust::Agent, Some(1), 11),
+        )
+        .await?;
+    assert_eq!(v2.status, PageVersionStatus::Quarantined);
+    assert_eq!(
+        db.store.get_page(&c, &shared, "doc", None).await?.body,
+        "first"
+    );
+    assert!(is_not_found(
+        db.store.get_page(&c, &shared, "doc", Some(2)).await
+    ));
+
+    let pending = db.store.list_quarantined_pages(&c, &scopes, 10).await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        (pending[0].version.version, pending[0].body.as_str()),
+        (2, "second")
+    );
+    assert_eq!(pending[0].base_body.as_deref(), Some("first"));
+    assert!(db
+        .store
+        .list_quarantined_pages(&c, &[Scope::shared("other")], 10)
+        .await?
+        .is_empty());
+    assert!(db
+        .store
+        .list_quarantined_pages(&c, &[], 10)
+        .await?
+        .is_empty());
+
+    // The pending sections are stored but not searchable.
+    let vector = |dim: usize| {
+        let store = db.store.clone();
+        let c = c.clone();
+        let scopes = scopes.clone();
+        async move {
+            store
+                .search_page_sections_vector(&c, &scopes, &axis(dim), 10)
+                .await
+        }
+    };
+    assert_eq!(hit_texts(&vector(11).await?), vec!["first".to_owned()]);
+    assert_eq!(vector(10).await?[0].text, "first");
+
+    let approved = db.store.approve_page_version(&c, id, 2).await?;
+    assert_eq!(
+        (approved.version, approved.status, approved.body.as_str()),
+        (2, PageVersionStatus::Active, "second")
+    );
+    assert_eq!(
+        db.store.get_page(&c, &shared, "doc", None).await?.version,
+        2
+    );
+    assert_eq!(
+        db.store.get_page(&c, &shared, "doc", Some(1)).await?.status,
+        PageVersionStatus::Superseded
+    );
+    let hits = vector(10).await?;
+    assert_eq!(hit_texts(&hits), vec!["second".to_owned()]);
+    assert_eq!(hits[0].version, 2);
+    assert!(is_invalid(db.store.approve_page_version(&c, id, 2).await));
+    assert!(is_invalid(db.store.approve_page_version(&c, id, 1).await));
+    assert!(is_not_found(db.store.approve_page_version(&c, id, 9).await));
+    assert!(is_not_found(
+        db.store.approve_page_version(&c, Uuid::now_v7(), 1).await
+    ));
+
+    // Two edits of version 2: approving one moves the base of the other.
+    let v3 = db
+        .store
+        .put_page(
+            &c,
+            page_write(&shared, "doc", "third", Trust::Agent, Some(2), 12),
+        )
+        .await?;
+    let v4 = db
+        .store
+        .put_page(
+            &c,
+            page_write(&shared, "doc", "fourth", Trust::Agent, Some(2), 13),
+        )
+        .await?;
+    db.store.approve_page_version(&c, id, v3.version).await?;
+    assert!(is_conflict(
+        db.store.approve_page_version(&c, id, v4.version).await,
+        2,
+        3
+    ));
+    assert_eq!(
+        db.store.get_page_version(&c, id, 4).await?.status,
+        PageVersionStatus::Quarantined
+    );
+    let rejected = db.store.reject_page_version(&c, id, 4).await?;
+    assert_eq!(rejected.status, PageVersionStatus::Rejected);
+    assert!(is_invalid(db.store.reject_page_version(&c, id, 4).await));
+    assert!(is_invalid(db.store.reject_page_version(&c, id, 3).await));
+    assert!(is_not_found(
+        db.store.get_page(&c, &shared, "doc", Some(4)).await
+    ));
+    assert!(db
+        .store
+        .list_quarantined_pages(&c, &scopes, 10)
+        .await?
+        .is_empty());
+    assert_eq!(hit_texts(&vector(13).await?), vec!["third".to_owned()]);
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM page_sections").await?,
+        1,
+        "only the current version keeps sections"
+    );
+    for (action, expected) in [("page.approve", 2), ("page.reject", 1)] {
+        let sql = format!("SELECT count(*) FROM audit_events WHERE action = '{action}'");
+        assert_eq!(count(&db, &sql).await?, expected, "{action}");
+    }
+
+    // A first version held for review has no base, and approval makes it current.
+    let held = db
+        .store
+        .put_page(
+            &c,
+            page_write(&shared, "new", "draft", Trust::Agent, None, 14),
+        )
+        .await?;
+    let pending = db.store.list_quarantined_pages(&c, &scopes, 10).await?;
+    assert_eq!(pending[0].base_body, None);
+    let page = db.store.approve_page_version(&c, held.page_id, 1).await?;
+    assert_eq!((page.slug.as_str(), page.version), ("new", 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_page_holds_at_most_20_pending_versions() -> TestResult {
+    let db = db().await?;
+    let c = ctx("t1");
+    let shared = Scope::shared("team");
+    db.store
+        .put_page(&c, page_write(&shared, "doc", "base", Trust::User, None, 0))
+        .await?;
+    for _ in 0..20 {
+        let v = db
+            .store
+            .put_page(
+                &c,
+                page_write(&shared, "doc", "edit", Trust::Agent, Some(1), 0),
+            )
+            .await?;
+        assert_eq!(v.status, PageVersionStatus::Quarantined);
+    }
+    assert!(is_invalid(
+        db.store
+            .put_page(
+                &c,
+                page_write(&shared, "doc", "edit", Trust::Agent, Some(1), 0)
+            )
+            .await
+    ));
+    // An active write is not held back by the cap.
+    db.store
+        .put_page(
+            &c,
+            page_write(&shared, "doc", "mine", Trust::User, Some(1), 0),
+        )
+        .await?;
+    assert_eq!(
+        db.store
+            .list_quarantined_pages(&c, &[shared], 100)
+            .await?
+            .len(),
+        20
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn page_history_keeps_the_newest_100_past_versions() -> TestResult {
+    let db = db().await?;
+    let c = ctx("t1");
+    let scope = Scope::agent("bot");
+    db.store
+        .put_page(&c, page_write(&scope, "doc", "v1", Trust::Agent, None, 0))
+        .await?;
+    // A pending version is never pruned, however old.
+    let held = db
+        .store
+        .put_page(
+            &c,
+            page_write(&scope, "doc", "held", Trust::External, Some(1), 0),
+        )
+        .await?;
+    assert_eq!(held.version, 2);
+    let mut current = 1;
+    for i in 0..105 {
+        current = db
+            .store
+            .put_page(
+                &c,
+                page_write(
+                    &scope,
+                    "doc",
+                    &format!("v{i}"),
+                    Trust::Agent,
+                    Some(current),
+                    0,
+                ),
+            )
+            .await?
+            .version;
+    }
+    assert_eq!(current, 107);
+    let history = db.store.page_versions(&c, &scope, "doc").await?;
+    assert_eq!(history.len(), 102);
+    assert_eq!(history[0].version, 107);
+    assert_eq!(history[0].status, PageVersionStatus::Active);
+    let past: Vec<i64> = history
+        .iter()
+        .filter(|v| v.status == PageVersionStatus::Superseded)
+        .map(|v| v.version)
+        .collect();
+    assert_eq!(past.len(), 100);
+    assert_eq!(past.last(), Some(&7));
+    assert!(history
+        .iter()
+        .any(|v| v.version == 2 && v.status == PageVersionStatus::Quarantined));
+    assert!(is_not_found(
+        db.store.get_page(&c, &scope, "doc", Some(1)).await
+    ));
+    db.store.get_page(&c, &scope, "doc", Some(7)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_pages_orders_by_slug_and_matches_prefixes_literally() -> TestResult {
+    let db = db().await?;
+    let c = ctx("t1");
+    let scope = Scope::agent("bot");
+    for slug in ["b", "ab", "a_b", "a.c", "a"] {
+        db.store
+            .put_page(&c, page_write(&scope, slug, "x", Trust::Agent, None, 0))
+            .await?;
+    }
+    // Held for review: no current version, so not listed.
+    db.store
+        .put_page(
+            &c,
+            page_write(&scope, "aa-held", "x", Trust::External, None, 0),
+        )
+        .await?;
+    db.store
+        .put_page(
+            &c,
+            page_write(&Scope::agent("other"), "a", "x", Trust::Agent, None, 0),
+        )
+        .await?;
+
+    let slugs = |prefix: Option<&'static str>, limit: i64| {
+        let store = db.store.clone();
+        let c = c.clone();
+        let scope = scope.clone();
+        async move {
+            store
+                .list_pages(&c, &scope, prefix, limit)
+                .await
+                .map(|found| found.into_iter().map(|p| p.slug).collect::<Vec<_>>())
+        }
+    };
+    assert_eq!(slugs(None, 500).await?, vec!["a", "a.c", "a_b", "ab", "b"]);
+    assert_eq!(slugs(Some("a_"), 500).await?, vec!["a_b"]);
+    assert_eq!(slugs(Some("a."), 500).await?, vec!["a.c"]);
+    assert_eq!(slugs(Some("a"), 500).await?, vec!["a", "a.c", "a_b", "ab"]);
+    assert_eq!(slugs(Some("%"), 500).await?, Vec::<String>::new());
+    assert_eq!(slugs(None, 2).await?, vec!["a", "a.c"]);
+    let listed = db.store.list_pages(&c, &scope, Some("b"), 10).await?;
+    assert_eq!(
+        (listed[0].title.as_str(), listed[0].version),
+        ("Title of b", 1)
+    );
+    for bad in [0, 501] {
+        assert!(is_invalid(db.store.list_pages(&c, &scope, None, bad).await));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn page_search_returns_only_sections_of_current_versions() -> TestResult {
+    let db = db().await?;
+    let c = ctx("t1");
+    let agent = Scope::agent("bot");
+    let shared = Scope::shared("team");
+    let scopes = [agent.clone(), shared.clone()];
+
+    db.store
+        .put_page(
+            &c,
+            page_write(&agent, "doc", "alpha words", Trust::Agent, None, 20),
+        )
+        .await?;
+    db.store
+        .put_page(
+            &c,
+            page_write(&agent, "doc", "bravo words", Trust::Agent, Some(1), 21),
+        )
+        .await?;
+    // Pending: stored with its sections, never found.
+    db.store
+        .put_page(
+            &c,
+            page_write(&shared, "held", "charlie words", Trust::Agent, None, 22),
+        )
+        .await?;
+    // Current, but in a scope that is not searched.
+    db.store
+        .put_page(
+            &c,
+            page_write(
+                &Scope::agent("other"),
+                "doc",
+                "bravo elsewhere",
+                Trust::Agent,
+                None,
+                21,
+            ),
+        )
+        .await?;
+
+    let vector = db
+        .store
+        .search_page_sections_vector(&c, &scopes, &axis(21), 10)
+        .await?;
+    assert_eq!(hit_texts(&vector), vec!["bravo words".to_owned()]);
+    let hit = &vector[0];
+    assert_eq!(
+        (
+            hit.scope.clone(),
+            hit.slug.as_str(),
+            hit.title.as_str(),
+            hit.version
+        ),
+        (agent.clone(), "doc", "Title of doc", 2)
+    );
+    assert_eq!(hit.heading, "Title of doc > Part");
+    assert!((hit.score - 1.0).abs() < 1e-6, "score {}", hit.score);
+    // Superseded and pending sections are not among the results, however near.
+    let all = db
+        .store
+        .search_page_sections_vector(&c, &scopes, &axis(20), 10)
+        .await?;
+    assert_eq!(hit_texts(&all), vec!["bravo words".to_owned()]);
+    assert!(all[0].score < 0.5);
+
+    let text = |q: &'static str| {
+        let store = db.store.clone();
+        let c = c.clone();
+        let scopes = scopes.clone();
+        async move {
+            store
+                .search_page_sections_text(&c, &scopes, q, 10)
+                .await
+                .map(|h| hit_texts(&h))
+        }
+    };
+    assert_eq!(text("bravo").await?, vec!["bravo words".to_owned()]);
+    assert_eq!(text("alpha").await?, Vec::<String>::new());
+    assert_eq!(text("charlie").await?, Vec::<String>::new());
+    assert_eq!(text("elsewhere").await?, Vec::<String>::new());
+    // Headings are searched too.
+    assert_eq!(text("part").await?, vec!["bravo words".to_owned()]);
+    let scored = db
+        .store
+        .search_page_sections_text(&c, &scopes, "bravo", 10)
+        .await?;
+    assert!(scored[0].score > 0.0);
+    assert!(db
+        .store
+        .search_page_sections_text(&c, &[], "bravo", 10)
+        .await?
+        .is_empty());
+    assert!(db
+        .store
+        .search_page_sections_vector(&c, &[], &axis(21), 10)
+        .await?
+        .is_empty());
+    assert!(is_invalid(
+        db.store
+            .search_page_sections_vector(&c, &scopes, &vec![0.0; EMBEDDING_DIMS], 10)
+            .await
+    ));
+    assert!(is_invalid(
+        db.store
+            .search_page_sections_text(&c, &scopes, "bravo", 0)
+            .await
+    ));
+
+    // Once approved, the pending page's sections are found.
+    let held = db.store.list_quarantined_pages(&c, &scopes, 10).await?;
+    db.store
+        .approve_page_version(&c, held[0].version.page_id, 1)
+        .await?;
+    assert_eq!(text("charlie").await?, vec!["charlie words".to_owned()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn another_tenant_sees_and_changes_no_page_table() -> TestResult {
+    let db = db().await?;
+    let a = ctx("tenant-a");
+    let b = ctx("tenant-b");
+    let scope = Scope::shared("team");
+    let scopes = [scope.clone()];
+
+    let v1 = db
+        .store
+        .put_page(
+            &a,
+            page_write(&scope, "doc", "secret words", Trust::User, None, 30),
+        )
+        .await?;
+    let id = v1.page_id;
+    db.store
+        .put_page(
+            &a,
+            page_write(&scope, "doc", "pending words", Trust::Agent, Some(1), 31),
+        )
+        .await?;
+
+    assert!(db.store.list_pages(&b, &scope, None, 10).await?.is_empty());
+    assert!(is_not_found(
+        db.store.get_page(&b, &scope, "doc", None).await
+    ));
+    assert!(is_not_found(
+        db.store.get_page(&b, &scope, "doc", Some(1)).await
+    ));
+    assert!(is_not_found(db.store.get_page_version(&b, id, 1).await));
+    assert!(is_not_found(
+        db.store.page_versions(&b, &scope, "doc").await
+    ));
+    assert!(db
+        .store
+        .list_quarantined_pages(&b, &scopes, 10)
+        .await?
+        .is_empty());
+    assert!(is_not_found(db.store.approve_page_version(&b, id, 2).await));
+    assert!(is_not_found(db.store.reject_page_version(&b, id, 2).await));
+    assert!(db
+        .store
+        .search_page_sections_vector(&b, &scopes, &axis(30), 10)
+        .await?
+        .is_empty());
+    assert!(db
+        .store
+        .search_page_sections_text(&b, &scopes, "secret", 10)
+        .await?
+        .is_empty());
+    assert!(is_not_found(
+        db.store
+            .put_page(&b, page_write(&scope, "doc", "x", Trust::User, Some(1), 30))
+            .await
+    ));
+    assert!(is_not_found(db.store.delete_page(&b, &scope, "doc").await));
+    assert!(db
+        .store
+        .scope_summaries(&b)
+        .await?
+        .iter()
+        .all(|s| s.pages == 0));
+
+    // Tenant B's own page with the same scope and slug is independent of tenant A's.
+    let own = db
+        .store
+        .put_page(
+            &b,
+            page_write(&scope, "doc", "b words", Trust::User, None, 30),
+        )
+        .await?;
+    assert_eq!(own.version, 1);
+    assert_ne!(own.page_id, id);
+    let found = db
+        .store
+        .search_page_sections_vector(&b, &scopes, &axis(30), 10)
+        .await?;
+    assert_eq!(hit_texts(&found), vec!["b words".to_owned()]);
+    assert_eq!(db.store.purge_scope(&b, &scope).await?.pages_deleted, 1);
+
+    // Tenant A is untouched by all of it.
+    assert_eq!(
+        db.store.get_page(&a, &scope, "doc", None).await?.body,
+        "secret words"
+    );
+    assert_eq!(db.store.page_versions(&a, &scope, "doc").await?.len(), 2);
+    assert_eq!(
+        db.store
+            .list_quarantined_pages(&a, &scopes, 10)
+            .await?
+            .len(),
+        1
+    );
+    assert_eq!(
+        hit_texts(
+            &db.store
+                .search_page_sections_text(&a, &scopes, "secret", 10)
+                .await?
+        ),
+        vec!["secret words".to_owned()]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn deleting_a_page_removes_every_version_and_section() -> TestResult {
+    let db = db().await?;
+    let c = ctx("t1");
+    let scope = Scope::agent("bot");
+    let kept = db
+        .store
+        .put_page(
+            &c,
+            page_write(&scope, "kept", "kept words", Trust::Agent, None, 40),
+        )
+        .await?;
+    db.store
+        .put_page(&c, page_write(&scope, "doc", "one", Trust::Agent, None, 41))
+        .await?;
+    db.store
+        .put_page(
+            &c,
+            page_write(&scope, "doc", "two", Trust::Agent, Some(1), 41),
+        )
+        .await?;
+    db.store
+        .put_page(
+            &c,
+            page_write(&scope, "doc", "held", Trust::External, Some(2), 41),
+        )
+        .await?;
+
+    db.store.delete_page(&c, &scope, "doc").await?;
+    assert!(is_not_found(
+        db.store.get_page(&c, &scope, "doc", None).await
+    ));
+    assert!(is_not_found(
+        db.store.page_versions(&c, &scope, "doc").await
+    ));
+    assert!(is_not_found(db.store.delete_page(&c, &scope, "doc").await));
+    assert!(db
+        .store
+        .list_quarantined_pages(&c, std::slice::from_ref(&scope), 10)
+        .await?
+        .is_empty());
+    assert_eq!(count(&db, "SELECT count(*) FROM page_versions").await?, 1);
+    assert_eq!(count(&db, "SELECT count(*) FROM page_sections").await?, 1);
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM page_section_embeddings").await?,
+        1
+    );
+    fts_integrity(&db).await?;
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM audit_events WHERE action = 'page.delete'"
+        )
+        .await?,
+        1
+    );
+    // A new page can take the slug again.
+    let again = db
+        .store
+        .put_page(
+            &c,
+            page_write(&scope, "doc", "again", Trust::Agent, None, 41),
+        )
+        .await?;
+    assert_eq!(again.version, 1);
+    assert_eq!(
+        db.store.get_page(&c, &scope, "kept", None).await?.id,
+        kept.page_id
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn purge_scope_deletes_its_pages_and_scope_summaries_count_them() -> TestResult {
+    let db = db().await?;
+    let c = ctx("t1");
+    let doomed = Scope::shared("doomed");
+    let kept = Scope::shared("kept");
+    db.store
+        .put_page(&c, page_write(&doomed, "one", "x", Trust::User, None, 50))
+        .await?;
+    db.store
+        .put_page(&c, page_write(&doomed, "two", "x", Trust::User, None, 50))
+        .await?;
+    // Pending only: deleted by the purge, but not counted as a page in the summary.
+    db.store
+        .put_page(&c, page_write(&doomed, "held", "x", Trust::Agent, None, 50))
+        .await?;
+    db.store
+        .put_page(
+            &c,
+            page_write(&kept, "one", "kept words", Trust::User, None, 51),
+        )
+        .await?;
+
+    let summaries = db.store.scope_summaries(&c).await?;
+    let pages_in = |scope: &Scope| {
+        summaries
+            .iter()
+            .find(|s| &s.scope == scope)
+            .map(|s| s.pages)
+    };
+    assert_eq!(pages_in(&doomed), Some(2));
+    assert_eq!(pages_in(&kept), Some(1));
+
+    let report = db.store.purge_scope(&c, &doomed).await?;
+    assert_eq!(report.pages_deleted, 3);
+    assert!(db.store.list_pages(&c, &doomed, None, 10).await?.is_empty());
+    assert!(db
+        .store
+        .list_quarantined_pages(&c, std::slice::from_ref(&doomed), 10)
+        .await?
+        .is_empty());
+    assert_eq!(
+        db.store.get_page(&c, &kept, "one", None).await?.body,
+        "kept words"
+    );
+    assert_eq!(count(&db, "SELECT count(*) FROM page_sections").await?, 1);
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM page_section_embeddings").await?,
+        1
+    );
+    fts_integrity(&db).await?;
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM audit_events WHERE action = 'scope.purge' AND json_extract(detail, '$.pages_deleted') = 3"
+        )
+        .await?,
+        1
+    );
+    let summaries = db.store.scope_summaries(&c).await?;
+    assert!(summaries.iter().all(|s| s.scope != doomed));
     Ok(())
 }
