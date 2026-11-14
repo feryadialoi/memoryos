@@ -18,6 +18,10 @@ or whether a model obeys planted text. Poisoning covers external against agent t
 
 Date: 2026-11-14. Commit under test: `7b8730b` (branch `feat/knowledge-pages`). Task: T27.
 
+The first three subsections below measured the first version, where sections shared the facts'
+reranker batch. That version failed the fact gate; read "After splitting the reranker calls" for the
+current numbers.
+
 Server: `memoryos serve` built in release mode, SQLite in a temp directory, bound to `127.0.0.1:6397`,
 real embedder (`intfloat/multilingual-e5-small`) and real reranker (`bge-reranker-v2-m3`, int8 ONNX),
 `MEMORYOS_RERANK_TOP` 10, `MEMORYOS_RATE_LIMIT_RPS` 1000. Machine: Apple M1 Pro, 10 cores (8
@@ -89,6 +93,34 @@ the slowest calls approach the 2 second reranker timeout, past which recall sile
 What these numbers include: query embedding, fact and section search, and one reranker call over up
 to 10 facts plus 6 sections. The extra time with pages is almost all the larger reranker batch;
 that is an inference from the design, not separately timed.
+
+### After splitting the reranker calls
+
+Same machine, models and dataset, on the branch with the fix applied on top of `6191729` (sections get their
+own reranker call after the facts' call; SPEC section 7, step 3). Fresh SQLite database, port 6397.
+
+`memoryos-eval --suite pages --concurrency 1 --latency-calls 200`:
+
+| Check | First version | After the split |
+|---|---|---|
+| Same fact ids in the same order with `page_limit` 0 and 3 | 2 of 34, gate failed | **34 of 34** |
+| Right page in the top 3 page hits | 45 of 45 | 45 of 45 |
+| Right page as the top hit | 43 of 45 | 44 of 45 (page MRR 0.989) |
+| Right section as the top hit | 36 of 43 | 37 of 43 |
+| Held edit leaks | 0 | 0 |
+| Recall p50 / p95, `page_limit` 0 | 157.2 / 191.4 ms | 146.8 / 178.0 ms |
+| Recall p50 / p95, `page_limit` 3 | 592.8 / 691.3 ms | 384.2 / 430.1 ms |
+
+200 timed calls per setting, 0 errors, no reranker timeout logged.
+
+`memoryos-eval --suite all --latency-calls 200` at concurrency 8, on a second tenant of the same server:
+recall 28 of 34 (recall@5 0.824, MRR 0.794), staleness 32 of 32, poisoning 30 of 30 with 0 leaks,
+pages 74 of 80 with facts unchanged in 34 of 34, all gates pass. Recall p50 / p95 was 151.9 / 178.7 ms
+with pages off and 387.3 / 437.4 ms with pages on. The server logged 2 reranker timeouts during this
+run, against 42 in the same run of the first version.
+
+Page search still adds about 240 ms at p50 on this machine: the second reranker call over up to 6
+sections of up to 1,000 characters. That cost is inferred from the design, not timed on its own.
 
 ### Not measured
 

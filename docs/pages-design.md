@@ -123,9 +123,9 @@ maximum 10, `0` turns page search off). Facts are ranked exactly as today.
 2. Vector and text search over `page_sections` in the request's scopes, 20 candidates each,
    concurrently with the fact searches.
 3. Reciprocal rank fusion with `k = 60`, then keep the best section per page.
-4. Rerank: the top `page_limit * 2` sections join the facts' reranker batch, so recall still makes
-   one reranker call, of at most `MEMORYOS_RERANK_TOP + 6` pairs. Facts and sections are then
-   reordered separately by their scores.
+4. Rerank: the top `page_limit * 2` sections get their own reranker call after the facts' call.
+   A first version shared one batch, and T27 measured that it changed fact order (padding to the
+   longest pair shifts int8 scores) and made recall 3.8 times slower at p50, so the calls were split.
 5. Return up to `page_limit` hits:
 
 ```json

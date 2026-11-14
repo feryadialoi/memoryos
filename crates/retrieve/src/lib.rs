@@ -415,9 +415,11 @@ impl Rerank {
             .0
     }
 
-    /// `apply` for facts, and in the same reranker call the first `page_window` sections, each
-    /// reordered by its own scores. A window under 2 leaves that list as it came. One call keeps
-    /// recall at one reranker pass however many pages it searches.
+    /// `apply` for facts, then a second reranker call for the first `page_window` sections. The
+    /// calls stay apart on purpose: a cross-encoder batch is padded to its longest pair, so long
+    /// sections in the facts' batch would slow it and shift the facts' scores. With them apart the
+    /// facts rank exactly as with no pages. A window under 2 leaves that list as it came, and any
+    /// failure or timeout keeps that list's fused order.
     async fn apply_with_pages<'a, 'b>(
         &self,
         query: &str,
@@ -429,56 +431,71 @@ impl Rerank {
         let Some(reranker) = &self.reranker else {
             return (facts, sections);
         };
-        let window = |wanted: usize, len: usize| {
-            let window = wanted.min(len);
-            if window < 2 {
-                0
-            } else {
-                window
+        let fact_window = limit.saturating_mul(2).min(self.top).min(facts.len());
+        let facts = if fact_window < 2 {
+            facts
+        } else {
+            let statements: Vec<String> = facts[..fact_window]
+                .iter()
+                .map(|(fact, _)| fact.statement.clone())
+                .collect();
+            match self.score(reranker, query, &statements, "facts").await {
+                Some(scores) => fusion::reordered_by(facts, &scores),
+                None => facts,
             }
         };
-        let fact_window = window(limit.saturating_mul(2).min(self.top), facts.len());
-        let page_window = window(page_window, sections.len());
-        if fact_window + page_window == 0 {
-            return (facts, sections);
-        }
-        let statements: Vec<String> = facts[..fact_window]
-            .iter()
-            .map(|(fact, _)| fact.statement.clone())
-            .chain(
-                sections[..page_window]
-                    .iter()
-                    .map(|(section, _)| pages::rerank_text(section)),
-            )
-            .collect();
-        let expected = statements.len();
-        let scored = tokio::time::timeout(self.timeout, reranker.score(query, &statements)).await;
-        match scored {
-            Ok(Ok(scores)) if scores.len() == expected => {
-                let (fact_scores, page_scores) = scores.split_at(fact_window);
-                (
-                    fusion::reordered_by(facts, fact_scores),
-                    fusion::reordered_by(sections, page_scores),
-                )
+        let page_window = page_window.min(sections.len());
+        let sections = if page_window < 2 {
+            sections
+        } else {
+            let statements: Vec<String> = sections[..page_window]
+                .iter()
+                .map(|(section, _)| pages::rerank_text(section))
+                .collect();
+            match self.score(reranker, query, &statements, "pages").await {
+                Some(scores) => fusion::reordered_by(sections, &scores),
+                None => sections,
             }
+        };
+        (facts, sections)
+    }
+
+    /// One reranker call with the timeout. `None`, after a warning, on failure, timeout or a wrong
+    /// number of scores.
+    async fn score(
+        &self,
+        reranker: &Arc<dyn Reranker>,
+        query: &str,
+        statements: &[String],
+        list: &'static str,
+    ) -> Option<Vec<f32>> {
+        let expected = statements.len();
+        let scored = tokio::time::timeout(self.timeout, reranker.score(query, statements)).await;
+        match scored {
+            Ok(Ok(scores)) if scores.len() == expected => Some(scores),
             Ok(Ok(scores)) => {
                 let returned = scores.len();
                 tracing::warn!(
                     returned,
                     expected,
+                    list,
                     "reranker returned the wrong number of scores, keeping the fused order"
                 );
-                (facts, sections)
+                None
             }
             Ok(Err(error)) => {
                 let kind = fusion::error_kind(&error);
-                tracing::warn!(kind, "reranking failed, keeping the fused order");
-                (facts, sections)
+                tracing::warn!(kind, list, "reranking failed, keeping the fused order");
+                None
             }
             Err(_) => {
                 let timeout_ms = self.timeout.as_millis() as u64;
-                tracing::warn!(timeout_ms, "reranking timed out, keeping the fused order");
-                (facts, sections)
+                tracing::warn!(
+                    timeout_ms,
+                    list,
+                    "reranking timed out, keeping the fused order"
+                );
+                None
             }
         }
     }
@@ -604,6 +621,7 @@ mod tests {
             fail: bool,
             short: bool,
             seen: Mutex<Vec<String>>,
+            batches: Mutex<Vec<usize>>,
         }
 
         impl FakeReranker {
@@ -613,11 +631,16 @@ mod tests {
                     fail: false,
                     short: false,
                     seen: Mutex::new(Vec::new()),
+                    batches: Mutex::new(Vec::new()),
                 }
             }
 
             fn seen(&self) -> Vec<String> {
                 self.seen.lock().expect("lock").clone()
+            }
+
+            fn batches(&self) -> Vec<usize> {
+                self.batches.lock().expect("lock").clone()
             }
         }
 
@@ -628,6 +651,7 @@ mod tests {
                     .lock()
                     .expect("lock")
                     .extend_from_slice(statements);
+                self.batches.lock().expect("lock").push(statements.len());
                 tokio::time::sleep(self.delay).await;
                 if self.fail {
                     return Err(Error::Provider("model is not loaded yet".into()));
@@ -808,7 +832,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn facts_and_sections_share_one_call_and_reorder_apart() {
+        async fn facts_and_sections_are_scored_in_separate_calls() {
             let reranker = Arc::new(FakeReranker::new());
             let facts = facts(&[0.1, 0.9]);
             let pages = sections(&[0.2, 0.8, 0.5]);
@@ -827,6 +851,8 @@ mod tests {
                     "Page 1 > Intro\nsection1 0.8"
                 ]
             );
+            // Facts first, then sections, never in one batch.
+            assert_eq!(reranker.batches(), [2, 2]);
             // Slots keep their fused scores, so each list stays descending.
             assert_eq!(page_out[0].1, 1.0);
         }

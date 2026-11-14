@@ -307,9 +307,11 @@ Pages, when `page_limit` (default 3, maximum 10) is above 0 and neither `as_of` 
 1. Reuse the query embedding. Run vector and text search over sections of current page versions in
    the request's scopes, 20 candidates each, concurrently with the fact searches.
 2. Reciprocal rank fusion with `k = 60`, then keep the best section per page.
-3. The top `page_limit * 2` sections join the facts' reranker batch, as (query, heading and text)
-   pairs, so recall still makes one reranker call. Facts and sections are then ordered separately,
-   each by its own reranker scores, with the same fallback to the fused order.
+3. After the facts' reranker call, the top `page_limit * 2` sections get a second call of their own,
+   as (query, heading and text) pairs, with the same timeout and the same fallback to the fused order.
+   They never share the facts' batch: a cross-encoder batch is padded to its longest pair, so long
+   sections would slow the facts' call and shift their int8 scores enough to swap close facts
+   (measured: 32 of 34 eval queries changed order before the calls were split).
 4. Return up to `page_limit` hits in `pages`: page id, scope, slug, title, version, the section's
    heading as `section`, its first 300 characters as `snippet`, and score. Fact results are the same
    as with `page_limit` 0.
