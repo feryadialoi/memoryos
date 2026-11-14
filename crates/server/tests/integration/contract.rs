@@ -79,7 +79,11 @@ async fn every_documented_operation_reaches_a_handler() {
             .replace("{id}", &random_uuid().to_string())
             .replace("{agent_id}", "a1")
             .replace("{user_id}", "u1")
-            .replace("{label}", "l1");
+            .replace("{label}", "l1")
+            .replace("{page_id}", &random_uuid().to_string())
+            .replace("{version}", "1")
+            .replace("{scope}", "agent:a1")
+            .replace("{slug}", "s1");
         let body = (operation.method != "GET").then(|| json!({}));
         let (status, reply) = server
             .call(&operation.method, &path, Some(&key), body)

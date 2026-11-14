@@ -6,13 +6,14 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use memoryos_core::{
-    Block, BlockVersion, Entity, Episode, Fact, FactFilter, FactListState, FactView,
-    GraphNeighborhood, MemoryStore, PurgeReport, Scope, ScopeSummary, ScoredFact, Trust,
+    Block, BlockVersion, Entity, Episode, Error, Fact, FactFilter, FactListState, FactView,
+    GraphNeighborhood, MemoryStore, Page, PageSummary, PageVersion, PendingPageVersion,
+    PurgeReport, Scope, ScopeSummary, ScoredFact, Trust,
 };
-use memoryos_ingest::{CommitRequest, CommitResponse, HostCommitter};
+use memoryos_ingest::{CommitRequest, CommitResponse, HostCommitter, PageWrite, PageWriter};
 use memoryos_retrieve::{RecallRequest, RecallResponse, Retriever};
 use memoryos_store::Store;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::Caller;
@@ -26,6 +27,8 @@ const DEFAULT_QUARANTINE_PAGE: i64 = 50;
 const MAX_QUARANTINE_PAGE: i64 = 200;
 const DEFAULT_FACT_PAGE: i64 = 100;
 const MAX_FACT_PAGE: i64 = 500;
+const DEFAULT_PAGE_LIST: i64 = 100;
+const MAX_PAGE_LIST: i64 = 500;
 const MAX_SCOPE_SUMMARIES: usize = 500;
 const DEFAULT_DEPTH: i32 = 1;
 /// Edges one neighbors request may read. A hub entity would otherwise answer with the store's cap
@@ -51,10 +54,34 @@ pub struct PutBlockRequest {
     pub expected_version: Option<i64>,
 }
 
+/// Body of `PUT /v1/pages/{scope}/{slug}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageWriteRequest {
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub expected_version: Option<i64>,
+    /// Admin keys only: write and approve in one step.
+    #[serde(default)]
+    pub approve: bool,
+}
+
+/// The version written, with whether a secret was masked first.
+#[derive(Debug, Serialize)]
+pub struct PageWriteResponse {
+    #[serde(flatten)]
+    pub version: PageVersion,
+    pub redacted: bool,
+}
+
 pub struct Services {
     pub store: Arc<Store>,
     pub retriever: Arc<Retriever>,
     pub committer: HostCommitter,
+    pub pages: PageWriter,
     pub metrics: Metrics,
 }
 
@@ -334,6 +361,209 @@ impl Services {
             .await?)
     }
 
+    // Pages (SPEC sections 6 and 8)
+
+    pub async fn list_pages(
+        &self,
+        caller: &Caller,
+        scope: &Scope,
+        prefix: Option<&str>,
+        limit: Option<i64>,
+    ) -> ApiResult<Vec<PageSummary>> {
+        caller.require_scope(scope)?;
+        let limit = limit.unwrap_or(DEFAULT_PAGE_LIST);
+        if !(1..=MAX_PAGE_LIST).contains(&limit) {
+            return Err(ApiError::invalid_input(format!(
+                "limit must be in 1..={MAX_PAGE_LIST}, got {limit}"
+            )));
+        }
+        Ok(self
+            .store
+            .list_pages(&caller.ctx, scope, prefix, limit)
+            .await?)
+    }
+
+    pub async fn get_page(
+        &self,
+        caller: &Caller,
+        scope: &Scope,
+        slug: &str,
+        version: Option<i64>,
+    ) -> ApiResult<Page> {
+        caller.require_scope(scope)?;
+        validate_slug(slug)?;
+        if let Some(version) = version.filter(|version| *version < 1) {
+            return Err(ApiError::invalid_input(format!(
+                "version must be at least 1, got {version}"
+            )));
+        }
+        Ok(self
+            .store
+            .get_page(&caller.ctx, scope, slug, version)
+            .await?)
+    }
+
+    /// Write trust is the commit trust of SPEC section 3, computed as `HostCommitter::commit` does:
+    /// `agent`, or `external` for an `external` key. `approve` makes an admin write active up to the
+    /// key's `max_trust`.
+    pub async fn write_page(
+        &self,
+        caller: &Caller,
+        scope: &Scope,
+        slug: &str,
+        req: PageWriteRequest,
+    ) -> ApiResult<PageWriteResponse> {
+        caller.require_scope(scope)?;
+        if caller.key.max_trust < Trust::Agent {
+            return Err(ApiError::forbidden(
+                "writing a page requires at least agent trust",
+            ));
+        }
+        if req.approve && !caller.key.is_admin {
+            return Err(ApiError::forbidden(
+                "approve on a page write requires an admin key",
+            ));
+        }
+        let write = PageWrite {
+            scope: scope.clone(),
+            slug: slug.to_owned(),
+            title: req.title,
+            body: req.body,
+            summary: req.summary,
+            trust: caller.key.max_trust.min(Trust::Agent),
+            expected_version: req.expected_version,
+            approve_up_to: req.approve.then_some(caller.key.max_trust),
+        };
+        let outcome = self.pages.write(&caller.ctx, write).await?;
+        Ok(PageWriteResponse {
+            version: outcome.version,
+            redacted: outcome.redacted,
+        })
+    }
+
+    pub async fn page_versions(
+        &self,
+        caller: &Caller,
+        scope: &Scope,
+        slug: &str,
+    ) -> ApiResult<Vec<PageVersion>> {
+        caller.require_scope(scope)?;
+        validate_slug(slug)?;
+        Ok(self.store.page_versions(&caller.ctx, scope, slug).await?)
+    }
+
+    /// As with invalidation, a key that cannot add to a user or shared scope without review must
+    /// not delete from it either.
+    pub async fn delete_page(&self, caller: &Caller, scope: &Scope, slug: &str) -> ApiResult<()> {
+        caller.require_scope(scope)?;
+        validate_slug(slug)?;
+        let (needed, refusal) = match scope {
+            Scope::Agent(_) => (Trust::Agent, "deleting an agent page requires agent trust"),
+            Scope::User(_) | Scope::Shared(_) => (
+                Trust::User,
+                "deleting a page in a user or shared scope requires user trust",
+            ),
+        };
+        if caller.key.max_trust < needed {
+            return Err(ApiError::forbidden(refusal));
+        }
+        Ok(self.store.delete_page(&caller.ctx, scope, slug).await?)
+    }
+
+    /// Scopes and patterns follow `GET /v1/quarantine`. The store takes exact scopes only, so a
+    /// pattern stands for the tenant's scopes that `scope_summaries` knows and the pattern covers.
+    pub async fn list_page_quarantine(
+        &self,
+        caller: &Caller,
+        scopes: &[String],
+        limit: Option<i64>,
+    ) -> ApiResult<Vec<PendingPageVersion>> {
+        caller.require_admin()?;
+        let selection = caller.select_scopes(scopes)?;
+        let limit = limit.unwrap_or(DEFAULT_QUARANTINE_PAGE);
+        if !(1..=MAX_QUARANTINE_PAGE).contains(&limit) {
+            return Err(ApiError::invalid_input(format!(
+                "limit must be in 1..={MAX_QUARANTINE_PAGE}, got {limit}"
+            )));
+        }
+        let mut exact = selection.exact;
+        if !selection.prefixes.is_empty() {
+            for summary in self.store.scope_summaries(&caller.ctx).await? {
+                let name = summary.scope.to_string();
+                let covered = selection
+                    .prefixes
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix.as_str()));
+                if covered && !exact.contains(&summary.scope) {
+                    exact.push(summary.scope);
+                }
+            }
+        }
+        // `select_scopes` already narrowed the list. This holds even if that logic is ever wrong.
+        exact.retain(|scope| caller.may_read(scope));
+        let mut versions = self
+            .store
+            .list_quarantined_pages(&caller.ctx, &exact, limit)
+            .await?;
+        versions.retain(|pending| caller.may_read(&pending.version.scope));
+        Ok(versions)
+    }
+
+    /// A version in a scope the key cannot read is 404, as a fact loaded by id is.
+    async fn visible_page_version(
+        &self,
+        caller: &Caller,
+        page_id: Uuid,
+        version: i64,
+    ) -> ApiResult<PageVersion> {
+        let found = self
+            .store
+            .get_page_version(&caller.ctx, page_id, version)
+            .await?;
+        caller.require_visible(&found.scope)?;
+        Ok(found)
+    }
+
+    /// Approving replaces the current version, so the key must reach its trust as well.
+    pub async fn approve_page(
+        &self,
+        caller: &Caller,
+        page_id: Uuid,
+        version: i64,
+    ) -> ApiResult<Page> {
+        caller.require_admin()?;
+        let pending = self.visible_page_version(caller, page_id, version).await?;
+        require_trust(caller, "page version", pending.trust)?;
+        match self
+            .store
+            .get_page(&caller.ctx, &pending.scope, &pending.slug, None)
+            .await
+        {
+            Ok(current) => require_trust(caller, "current page version", current.trust)?,
+            Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(self
+            .store
+            .approve_page_version(&caller.ctx, page_id, version)
+            .await?)
+    }
+
+    pub async fn reject_page(
+        &self,
+        caller: &Caller,
+        page_id: Uuid,
+        version: i64,
+    ) -> ApiResult<PageVersion> {
+        caller.require_admin()?;
+        let pending = self.visible_page_version(caller, page_id, version).await?;
+        require_trust(caller, "page version", pending.trust)?;
+        Ok(self
+            .store
+            .reject_page_version(&caller.ctx, page_id, version)
+            .await?)
+    }
+
     // Users
 
     pub async fn delete_user_memory(
@@ -364,6 +594,10 @@ fn require_trust(caller: &Caller, what: &str, trust: Trust) -> ApiResult<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_slug(slug: &str) -> ApiResult<()> {
+    Ok(memoryos_core::validate_slug(slug)?)
 }
 
 fn parse_scope(kind: &str, id: &str) -> ApiResult<Scope> {

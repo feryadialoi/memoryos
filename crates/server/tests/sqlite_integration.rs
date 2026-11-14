@@ -1,5 +1,9 @@
 #![cfg(feature = "integration-sqlite")]
 
+#[macro_use]
+#[path = "pages_shared/mod.rs"]
+mod pages_shared;
+
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -178,6 +182,67 @@ async fn recall(server: &Running, token: &str) -> Value {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     body
+}
+
+/// The server in this process on a fresh SQLite file. Dropping the guard stops it and removes the
+/// file.
+struct SqliteGuard {
+    shutdown: tokio_util::sync::CancellationToken,
+    _directory: TempDir,
+}
+
+impl Drop for SqliteGuard {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+async fn sqlite() -> (pages_shared::Harness, SqliteGuard) {
+    let directory = TempDir::new().expect("temporary directory");
+    let url = database_url(&directory);
+    let store = SqliteStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let env = env(&url);
+    let config = memoryos_server::config::Config::from_lookup(|name| {
+        env.iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    })
+    .expect("test configuration");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(memoryos_server::app::serve(
+        config,
+        listener,
+        shutdown.clone(),
+    ));
+    let base = format!("http://{address}");
+    let http = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let health = http.get(format!("{base}/healthz")).send().await;
+        if health.is_ok_and(|response| response.status().is_success()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the server did not come up");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let store: std::sync::Arc<dyn MemoryStore> = std::sync::Arc::new(store);
+    let harness = pages_shared::Harness::new(base, store, "pages-tenant");
+    (
+        harness,
+        SqliteGuard {
+            shutdown,
+            _directory: directory,
+        },
+    )
+}
+
+mod pages {
+    use super::sqlite;
+
+    page_scenarios!(sqlite);
 }
 
 #[tokio::test(flavor = "multi_thread")]
