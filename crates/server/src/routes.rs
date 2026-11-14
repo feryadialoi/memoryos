@@ -24,7 +24,7 @@ use crate::app::AppState;
 use crate::auth::Caller;
 use crate::error::{ApiError, ApiResult};
 use crate::mcp;
-use crate::service::{CandidatesRequest, PutBlockRequest};
+use crate::service::{CandidatesRequest, PageWriteRequest, PutBlockRequest};
 
 const READY_DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -89,6 +89,26 @@ pub fn route_table() -> Vec<Route> {
             "GET",
             "/v1/agents/{agent_id}/blocks/{label}/versions",
             get(block_versions),
+        ),
+        bearer("GET", "/v1/pages", get(list_pages)),
+        bearer("GET", "/v1/pages/quarantine", get(list_page_quarantine)),
+        bearer(
+            "POST",
+            "/v1/pages/quarantine/{page_id}/{version}/approve",
+            post(approve_page),
+        ),
+        bearer(
+            "POST",
+            "/v1/pages/quarantine/{page_id}/{version}/reject",
+            post(reject_page),
+        ),
+        bearer("GET", "/v1/pages/{scope}/{slug}", get(get_page)),
+        bearer("PUT", "/v1/pages/{scope}/{slug}", put(write_page)),
+        bearer("DELETE", "/v1/pages/{scope}/{slug}", delete(delete_page)),
+        bearer(
+            "GET",
+            "/v1/pages/{scope}/{slug}/versions",
+            get(page_versions),
         ),
         bearer("DELETE", "/v1/users/{user_id}/memory", delete(delete_user)),
         bearer("POST", "/mcp", post(mcp::handle)),
@@ -480,6 +500,124 @@ async fn block_versions(
         .services
         .block_versions(&caller, &agent_id, &label)
         .await?;
+    Ok(Json(json!({"versions": versions})))
+}
+
+#[derive(Deserialize)]
+struct PagesQuery {
+    scope: Scope,
+    prefix: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn list_pages(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiQuery(query): ApiQuery<PagesQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let pages = state
+        .services
+        .list_pages(&caller, &query.scope, query.prefix.as_deref(), query.limit)
+        .await?;
+    Ok(Json(json!({"pages": pages})))
+}
+
+async fn list_page_quarantine(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiQuery(query): ApiQuery<QuarantineQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let scopes = parse_scope_patterns(&query.scopes);
+    let versions = state
+        .services
+        .list_page_quarantine(&caller, &scopes, query.limit)
+        .await?;
+    Ok(Json(json!({"versions": versions})))
+}
+
+async fn approve_page(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiPath((page_id, version)): ApiPath<(Uuid, i64)>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(
+        state
+            .services
+            .approve_page(&caller, page_id, version)
+            .await?,
+    ))
+}
+
+async fn reject_page(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiPath((page_id, version)): ApiPath<(Uuid, i64)>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(
+        state
+            .services
+            .reject_page(&caller, page_id, version)
+            .await?,
+    ))
+}
+
+/// `{scope}/{slug}` from the path. A malformed scope is a 400.
+fn page_path((scope, slug): (String, String)) -> ApiResult<(Scope, String)> {
+    Ok((scope.parse::<Scope>()?, slug))
+}
+
+#[derive(Deserialize)]
+struct PageQuery {
+    version: Option<i64>,
+}
+
+async fn get_page(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiPath(path): ApiPath<(String, String)>,
+    ApiQuery(query): ApiQuery<PageQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let (scope, slug) = page_path(path)?;
+    Ok(Json(
+        state
+            .services
+            .get_page(&caller, &scope, &slug, query.version)
+            .await?,
+    ))
+}
+
+async fn write_page(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiPath(path): ApiPath<(String, String)>,
+    ApiJson(body): ApiJson<PageWriteRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let (scope, slug) = page_path(path)?;
+    Ok(Json(
+        state
+            .services
+            .write_page(&caller, &scope, &slug, body)
+            .await?,
+    ))
+}
+
+async fn delete_page(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiPath(path): ApiPath<(String, String)>,
+) -> ApiResult<impl IntoResponse> {
+    let (scope, slug) = page_path(path)?;
+    state.services.delete_page(&caller, &scope, &slug).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn page_versions(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiPath(path): ApiPath<(String, String)>,
+) -> ApiResult<impl IntoResponse> {
+    let (scope, slug) = page_path(path)?;
+    let versions = state.services.page_versions(&caller, &scope, &slug).await?;
     Ok(Json(json!({"versions": versions})))
 }
 

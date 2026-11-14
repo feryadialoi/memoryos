@@ -32,10 +32,10 @@ mod types;
 pub use client::{MemoryOs, Options, RecallBuilder};
 pub use error::{Error, Result};
 pub use memoryos_core::{
-    Block, BlockVersion, Entity, Episode, Fact, FactStatus, GraphNeighborhood, PurgeReport, Scope,
-    ScoredFact, Trust,
+    Block, BlockVersion, Entity, Episode, Fact, FactStatus, GraphNeighborhood, Page, PageSummary,
+    PageVersion, PageVersionStatus, PendingPageVersion, PurgeReport, Scope, ScoredFact, Trust,
 };
 pub use types::{
-    date, Commit, CommitFact, CommitResponse, CommittedFact, EntityRef, PutBlock, RecallResponse,
-    RelatedFact,
+    date, Commit, CommitFact, CommitResponse, CommittedFact, EntityRef, PageHit, PageWrite,
+    PageWriteResponse, PutBlock, RecallResponse, RelatedFact,
 };
