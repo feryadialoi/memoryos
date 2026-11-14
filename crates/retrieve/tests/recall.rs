@@ -427,6 +427,19 @@ async fn finds_a_fact_only_by_vector() {
 }
 
 #[tokio::test]
+async fn pages_are_ranked_apart_and_only_current() {
+    let f = fixture().await;
+    common::Scenario::new(
+        f.store.clone(),
+        f.embedder.clone(),
+        f.ctx.clone(),
+        f.scope.clone(),
+    )
+    .pages_are_ranked_apart_and_only_current()
+    .await;
+}
+
+#[tokio::test]
 async fn finds_a_fact_only_by_text() {
     let f = fixture().await;
     f.add_fillers(50).await;
