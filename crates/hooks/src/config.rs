@@ -57,13 +57,17 @@ pub fn client(env: Env<'_>, options: Options) -> Result<MemoryOs, String> {
 
 /// For `memoryos quarantine` alone: the stored admin key, or `MEMORYOS_API_KEY` when it is set.
 pub fn admin_client(env: Env<'_>, options: Options) -> Result<MemoryOs, String> {
-    let key = match env("MEMORYOS_API_KEY") {
-        Some(key) => key,
+    MemoryOs::new(base_url(env)?, admin_key(env)?, options).map_err(|e| e.to_string())
+}
+
+/// The key of [`admin_client`], which `memoryos page write --approve` also uses.
+pub fn admin_key(env: Env<'_>) -> Result<String, String> {
+    match env("MEMORYOS_API_KEY") {
+        Some(key) => Ok(key),
         None => credentials::load(env)?
             .and_then(|stored| stored.admin_key)
-            .ok_or(NO_KEY)?,
-    };
-    MemoryOs::new(base_url(env)?, key, options).map_err(|e| e.to_string())
+            .ok_or_else(|| NO_KEY.to_owned()),
+    }
 }
 
 /// For `memoryos ui`: the stored admin key when there is one, so review works, else the agent key.
