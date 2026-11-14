@@ -179,6 +179,7 @@ button.stat:hover { border-color: var(--line-strong); }
   min-width: 18px; padding: 0 5px; border-radius: 9px; background: var(--amber-soft); color: var(--amber);
   font-size: 11px; font-weight: 650; text-align: center;
 }
+.tab-count { color: var(--ink-3); font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; }
 
 .body { flex: 1; min-height: 0; overflow-y: auto; padding: 18px 28px 40px; }
 .body.flush { padding: 0; overflow: hidden; position: relative; }
@@ -278,6 +279,49 @@ button.stat:hover { border-color: var(--line-strong); }
 .meter span { display: block; height: 100%; background: var(--accent); }
 .note-text { margin-top: 10px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13.5px; }
 
+/* Pages */
+.slug { font-family: var(--mono); font-size: 11.5px; }
+.page-layout { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 14px; align-items: start; }
+.page-card { margin-bottom: 0; min-width: 0; }
+.page-title { font-size: 18px; font-weight: 650; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.page-body {
+  margin: 14px 0 0; padding: 14px 16px; background: var(--panel-2); border-radius: 8px;
+  font: 12.5px/1.6 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4;
+}
+.notice {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-bottom: 12px; padding: 8px 12px;
+  background: var(--amber-soft); color: var(--amber); border-radius: 8px; font-size: 13px; font-weight: 500;
+}
+.versions { margin-bottom: 0; padding: 12px; position: sticky; top: 0; }
+.versions h3 { margin: 0 4px 8px; font-size: 11px; font-weight: 600; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; }
+.version-row { display: block; width: 100%; padding: 8px; border-radius: 8px; }
+button.version-row:hover { background: var(--panel-2); }
+.version-row[aria-current="true"] { background: var(--accent-soft); }
+.version-row.muted { opacity: 0.65; }
+.version-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; }
+.version-summary { margin-top: 3px; color: var(--ink-2); font-size: 12px; overflow-wrap: anywhere; }
+.alert { margin-top: 10px; padding: 8px 12px; background: var(--red-soft); color: var(--red); border-radius: 8px; font-size: 13px; font-weight: 550; }
+.diff-note { margin-top: 10px; }
+.diff-wrap { margin-top: 10px; }
+.diff-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; color: var(--ink-3); font-size: 12px; }
+.diff-count { font: 600 12px var(--mono); }
+.diff-count.add { color: var(--accent-ink); }
+.diff-count.del { color: var(--red); }
+.diff {
+  max-height: 420px; overflow: auto; border: 1px solid var(--line); border-radius: 8px;
+  font: 12.5px/1.55 var(--mono);
+}
+.diff-line { display: flex; min-width: 0; min-height: 1.55em; }
+.diff-line.add { background: var(--accent-soft); }
+.diff-line.del { background: var(--red-soft); }
+.diff-line.same { color: var(--ink-2); }
+.diff-sign { flex: none; width: 22px; text-align: center; color: var(--ink-3); user-select: none; }
+.diff-line.add .diff-sign { color: var(--accent-ink); }
+.diff-line.del .diff-sign { color: var(--red); }
+.diff-text { flex: 1; min-width: 0; padding-right: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff-line.del .diff-text { text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--red) 45%, transparent); }
+.diff-gap { padding: 2px 10px 2px 22px; background: var(--panel-2); color: var(--ink-3); font: 11.5px -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif; }
+
 /* Drawer */
 .drawer {
   position: fixed; top: 0; right: 0; bottom: 0; z-index: 20; display: flex; flex-direction: column;
@@ -340,4 +384,8 @@ button.stat:hover { border-color: var(--line-strong); }
   .lane-label { width: 104px; }
   .filter { min-width: 0; flex: 1 1 140px; }
   .toolbar-note { margin-left: 0; }
+  .page-layout { grid-template-columns: minmax(0, 1fr); }
+  .versions { position: static; }
+  .page-body { padding: 12px; font-size: 12px; }
+  .diff { font-size: 11.5px; max-height: 360px; }
 }
