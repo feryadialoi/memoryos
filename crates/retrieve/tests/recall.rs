@@ -383,6 +383,7 @@ impl Fixture {
             limit: 100,
             as_of: None,
             known_at: None,
+            page_limit: memoryos_retrieve::DEFAULT_PAGE_LIMIT,
         }
     }
 
