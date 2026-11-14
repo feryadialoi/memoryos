@@ -267,6 +267,9 @@ pub struct ScopeSummary {
     pub quarantined: i64,
     pub entities: i64,
     pub blocks: i64,
+    /// Pages with a current version.
+    #[serde(default)]
+    pub pages: i64,
     pub last_recorded_at: Option<DateTime<Utc>>,
 }
 
@@ -351,6 +354,171 @@ pub struct BlockVersion {
     pub edited_at: DateTime<Utc>,
 }
 
+/// Longest page slug, title, change summary and body, and most sections and pending versions.
+/// See docs/SPEC.md section 8.
+pub const PAGE_SLUG_MAX: usize = 128;
+pub const PAGE_TITLE_MAX: usize = 200;
+pub const PAGE_SUMMARY_MAX: usize = 500;
+pub const PAGE_BODY_MAX: usize = 100_000;
+pub const PAGE_SECTION_TEXT_MAX: usize = 1_000;
+pub const PAGE_SECTIONS_MAX: usize = 400;
+pub const PAGE_PENDING_MAX: usize = 20;
+/// Versions kept per page besides the current one and pending ones. Older ones are pruned.
+pub const PAGE_VERSIONS_KEPT: usize = 100;
+
+/// A page slug: 1 to 128 of lowercase ASCII letters, digits, `-`, `_` and `.`, starting with a
+/// letter or digit. No `/`, so a slug is always one path segment.
+pub fn validate_slug(slug: &str) -> Result<()> {
+    let valid = !slug.is_empty()
+        && slug.len() <= PAGE_SLUG_MAX
+        && slug
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!("invalid page slug: {slug}")))
+    }
+}
+
+/// Review state of one page version. Only the page's current version is `Active`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PageVersionStatus {
+    /// The current version: what readers, recall and hooks see.
+    Active,
+    /// Waiting for an admin. Readers keep the current version meanwhile.
+    Quarantined,
+    Rejected,
+    /// Was current, and a later version replaced it.
+    Superseded,
+}
+
+impl PageVersionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Quarantined => "quarantined",
+            Self::Rejected => "rejected",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+impl FromStr for PageVersionStatus {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "active" => Ok(Self::Active),
+            "quarantined" => Ok(Self::Quarantined),
+            "rejected" => Ok(Self::Rejected),
+            "superseded" => Ok(Self::Superseded),
+            _ => Err(Error::InvalidInput(format!(
+                "invalid page version status: {s}"
+            ))),
+        }
+    }
+}
+
+/// One version of a page, read in full.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Page {
+    pub id: Uuid,
+    pub scope: Scope,
+    pub slug: String,
+    pub title: String,
+    /// Markdown.
+    pub body: String,
+    pub summary: Option<String>,
+    pub version: i64,
+    pub trust: Trust,
+    pub status: PageVersionStatus,
+    pub edited_by: String,
+    pub edited_at: DateTime<Utc>,
+}
+
+/// A page in a listing: its current version without the body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageSummary {
+    pub id: Uuid,
+    pub scope: Scope,
+    pub slug: String,
+    pub title: String,
+    pub version: i64,
+    pub edited_at: DateTime<Utc>,
+}
+
+/// A version's metadata without its body, as history and write results return it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageVersion {
+    pub page_id: Uuid,
+    pub scope: Scope,
+    pub slug: String,
+    pub version: i64,
+    /// The version the writer edited. `None` for a page's first version.
+    pub base_version: Option<i64>,
+    pub title: String,
+    pub summary: Option<String>,
+    pub trust: Trust,
+    pub status: PageVersionStatus,
+    pub edited_by: String,
+    pub edited_at: DateTime<Utc>,
+}
+
+/// A quarantined version with what a reviewer needs to diff it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPageVersion {
+    #[serde(flatten)]
+    pub version: PageVersion,
+    pub body: String,
+    /// Body of `base_version`, or `None` when there is no base or it was pruned.
+    pub base_body: Option<String>,
+}
+
+/// One searchable section of a version, already split and embedded by the caller.
+#[derive(Debug, Clone)]
+pub struct NewPageSection {
+    pub ordinal: i32,
+    /// Title path, such as `Upgrade MemoryOS > Native install`.
+    pub heading: String,
+    pub text: String,
+    pub embedding: Vec<f32>,
+}
+
+/// A page write. The store decides the version's status atomically, see `MemoryStore::put_page`.
+#[derive(Debug, Clone)]
+pub struct NewPageVersion {
+    pub scope: Scope,
+    pub slug: String,
+    pub title: String,
+    pub body: String,
+    pub summary: Option<String>,
+    pub trust: Trust,
+    /// `None` creates the page. `Some(v)` edits current version `v`.
+    pub expected_version: Option<i64>,
+    /// Set for an admin write that approves itself: the caller's `max_trust`.
+    pub approve_up_to: Option<Trust>,
+    pub sections: Vec<NewPageSection>,
+}
+
+/// A section of a page's current version found by search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageSectionHit {
+    pub section_id: Uuid,
+    pub page_id: Uuid,
+    pub scope: Scope,
+    pub slug: String,
+    pub title: String,
+    pub version: i64,
+    pub heading: String,
+    pub text: String,
+    pub score: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     pub id: Uuid,
@@ -367,6 +535,8 @@ pub struct PurgeReport {
     pub facts_deleted: u64,
     pub episodes_deleted: u64,
     pub entities_deleted: u64,
+    #[serde(default)]
+    pub pages_deleted: u64,
 }
 
 #[cfg(test)]
@@ -404,6 +574,43 @@ mod tests {
             &Scope::agent("a"),
             Trust::Agent
         ));
+    }
+
+    #[test]
+    fn slugs_are_one_lowercase_path_segment() {
+        for good in ["memoryos-upgrade", "a", "0.1_notes", &"a".repeat(128)] {
+            assert!(validate_slug(good).is_ok(), "{good} should be accepted");
+        }
+        for bad in [
+            "",
+            "Upgrade",
+            "a/b",
+            "-a",
+            ".a",
+            "a b",
+            "a:b",
+            &"a".repeat(129),
+        ] {
+            assert!(validate_slug(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn page_version_status_round_trips() {
+        for s in [
+            PageVersionStatus::Active,
+            PageVersionStatus::Quarantined,
+            PageVersionStatus::Rejected,
+            PageVersionStatus::Superseded,
+        ] {
+            assert_eq!(
+                s.as_str()
+                    .parse::<PageVersionStatus>()
+                    .expect("known status"),
+                s
+            );
+        }
+        assert!("pending".parse::<PageVersionStatus>().is_err());
     }
 
     #[test]

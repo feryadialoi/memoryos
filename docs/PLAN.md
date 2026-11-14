@@ -31,6 +31,16 @@ Goal: production-grade and ready to use. `docs/SPEC.md` section 12 defines done.
 | 4 | T9 Integration and gates | Lead | Whole repo | T7, T8 |
 | 4 | T10 Independent review | Fresh agent | Read-only | T7, T8 |
 | 5 | T15 Host mode only: remove every LLM path | Agent | Whole repo | T9 |
+| 6 | T20 Pages contracts: SPEC, core, migrations, OpenAPI, ADR 0007 | Lead | `docs/`, `crates/core`, `migrations/` | |
+| 7 | T21 Pages store, Postgres and SQLite | Agent | `crates/store` | T20 |
+| 7 | T22 Page section splitter and redaction | Agent | `crates/ingest` | T20 |
+| 8 | T23 Page search inside recall | Agent | `crates/retrieve` | T21 |
+| 9 | T24 Pages REST, MCP tools, SDK | Agent | `crates/server`, `crates/sdk` | T22, T23 |
+| 9b | T25 Pages in hooks and CLI | Agent | `crates/hooks` | T24 |
+| 9b | T26 Pages on the review page | Agent | `crates/server/src/ui` | T24 |
+| 10 | T27 Pages eval suite, latency numbers, README | Agent | `crates/eval`, `README.md`, `docs/` | T24 |
+
+Waves 6 to 10 build knowledge pages (`docs/pages-design.md`) on branch `feat/knowledge-pages`.
 
 The lead merges each wave into `develop` and runs the workspace gates before the next wave starts.
 `main` holds only the approved baseline until the user confirms a merge.

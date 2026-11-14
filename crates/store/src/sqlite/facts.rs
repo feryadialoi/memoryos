@@ -660,6 +660,7 @@ pub(super) async fn purge_episode(
             facts_deleted,
             episodes_deleted,
             entities_deleted,
+            pages_deleted: 0,
         },
         facts_requarantined: requarantined.len() as u64,
     })
@@ -1034,6 +1035,7 @@ pub(super) async fn purge_scope(
         facts_deleted,
         episodes_deleted,
         entities_deleted,
+        pages_deleted: 0,
     })
 }
 

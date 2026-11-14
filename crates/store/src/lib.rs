@@ -118,6 +118,7 @@ impl PgStore {
                 quarantined: 0,
                 entities: 0,
                 blocks: 0,
+                pages: 0,
                 last_recorded_at: None,
             }))
         }

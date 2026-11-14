@@ -682,6 +682,7 @@ pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<P
             facts_deleted,
             episodes_deleted,
             entities_deleted,
+            pages_deleted: 0,
         },
         facts_requarantined: requarantined.len() as u64,
     })
@@ -976,6 +977,7 @@ pub(crate) async fn purge_scope(conn: &mut PgConnection, scope: &Scope) -> Resul
         facts_deleted,
         episodes_deleted,
         entities_deleted,
+        pages_deleted: 0,
     })
 }
 

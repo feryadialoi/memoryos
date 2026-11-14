@@ -50,7 +50,7 @@ paths:
         default: { $ref: "#/components/responses/Error" }
   /v1/recall:
     post:
-      summary: Hybrid search over facts
+      summary: Hybrid search over facts, and over sections of current pages
       requestBody:
         required: true
         content:
@@ -419,6 +419,145 @@ paths:
                         edited_by: { type: string }
                         edited_at: { type: string, format: date-time }
         default: { $ref: "#/components/responses/Error" }
+  /v1/pages:
+    get:
+      summary: List the pages of one scope that have a current version, by slug
+      parameters:
+        - name: scope
+          in: query
+          required: true
+          schema: { type: string }
+        - name: prefix
+          in: query
+          description: Only slugs starting with this
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        "200":
+          description: Pages
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pages]
+                properties:
+                  pages: { type: array, items: { $ref: "#/components/schemas/PageSummary" } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/pages/quarantine:
+    get:
+      summary: List quarantined page versions, oldest first. Admin only
+      parameters:
+        - name: scopes
+          in: query
+          required: true
+          description: Comma-separated scopes or patterns, with the rules of GET /v1/quarantine
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: Pending versions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [versions]
+                properties:
+                  versions: { type: array, items: { $ref: "#/components/schemas/PendingPageVersion" } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/pages/quarantine/{page_id}/{version}/approve:
+    post:
+      summary: >-
+        Make a quarantined version current. Admin only, with max_trust at least the version's trust
+        and the current version's trust. 409 version_conflict when its base is no longer current
+      parameters:
+        - { $ref: "#/components/parameters/PageId" }
+        - { $ref: "#/components/parameters/Version" }
+      responses:
+        "200":
+          description: The page at its new current version
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Page" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/pages/quarantine/{page_id}/{version}/reject:
+    post:
+      summary: Reject a quarantined version. Admin only, with max_trust at least the version's trust
+      parameters:
+        - { $ref: "#/components/parameters/PageId" }
+        - { $ref: "#/components/parameters/Version" }
+      responses:
+        "200":
+          description: The rejected version
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PageVersion" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/pages/{scope}/{slug}:
+    get:
+      summary: Read a page's current version, or an older active or superseded version
+      parameters:
+        - { $ref: "#/components/parameters/PageScope" }
+        - { $ref: "#/components/parameters/Slug" }
+        - name: version
+          in: query
+          schema: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          description: Page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Page" }
+        default: { $ref: "#/components/responses/Error" }
+    put:
+      summary: >-
+        Write a new version. Omit expected_version to create the page. A version that SPEC section 8
+        quarantines waits for review and the current version stays what readers see
+      parameters:
+        - { $ref: "#/components/parameters/PageScope" }
+        - { $ref: "#/components/parameters/Slug" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PageWriteRequest" }
+      responses:
+        "200":
+          description: The version written, with its status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PageWriteResponse" }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      summary: >-
+        Hard-delete the page with all versions. Needs max_trust of at least user for user:* and
+        shared:* pages, and agent for agent:* pages
+      parameters:
+        - { $ref: "#/components/parameters/PageScope" }
+        - { $ref: "#/components/parameters/Slug" }
+      responses:
+        "204": { description: Deleted }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/pages/{scope}/{slug}/versions:
+    get:
+      summary: Kept versions in any status, newest first, without bodies
+      parameters:
+        - { $ref: "#/components/parameters/PageScope" }
+        - { $ref: "#/components/parameters/Slug" }
+      responses:
+        "200":
+          description: Versions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [versions]
+                properties:
+                  versions: { type: array, items: { $ref: "#/components/schemas/PageVersion" } }
+        default: { $ref: "#/components/responses/Error" }
   /v1/users/{user_id}/memory:
     delete:
       summary: Hard-delete everything under scope user:{user_id}. Admin only
@@ -436,7 +575,7 @@ paths:
         default: { $ref: "#/components/responses/Error" }
   /mcp:
     post:
-      summary: MCP Streamable HTTP endpoint. Tools recall_candidates, commit_facts, recall, block_read, block_replace, graph_neighbors
+      summary: MCP Streamable HTTP endpoint. Tools recall_candidates, commit_facts, recall, block_read, block_replace, graph_neighbors, page_read, page_write, page_list
       responses:
         "200": { description: JSON-RPC response }
 components:
@@ -458,6 +597,27 @@ components:
       in: path
       required: true
       schema: { type: string }
+    PageScope:
+      name: scope
+      in: path
+      required: true
+      description: user:<id>, agent:<id> or shared:<id>
+      schema: { type: string }
+    Slug:
+      name: slug
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[a-z0-9][a-z0-9._-]{0,127}$" }
+    PageId:
+      name: page_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Version:
+      name: version
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
   responses:
     Error:
       description: Error
@@ -567,7 +727,7 @@ components:
             object_kind: { type: [string, "null"] }
     ScopeSummary:
       type: object
-      required: [scope, current, past, quarantined, entities, blocks]
+      required: [scope, current, past, quarantined, entities, blocks, pages]
       properties:
         scope: { type: string }
         current: { type: integer }
@@ -575,6 +735,7 @@ components:
         quarantined: { type: integer }
         entities: { type: integer }
         blocks: { type: integer }
+        pages: { type: integer, description: Pages with a current version }
         last_recorded_at: { type: [string, "null"], format: date-time }
     RecallRequest:
       type: object
@@ -585,6 +746,12 @@ components:
         limit: { type: integer, minimum: 1, maximum: 100, default: 10 }
         as_of: { type: [string, "null"], format: date-time }
         known_at: { type: [string, "null"], format: date-time }
+        page_limit:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 3
+          description: Most page hits to return. 0 turns page search off
     RecallResponse:
       type: object
       required: [facts]
@@ -597,6 +764,14 @@ components:
             properties:
               fact: { $ref: "#/components/schemas/Fact" }
               score: { type: number }
+        pages:
+          type: array
+          description: Best section per page, of current versions only. Ranked apart from facts
+          items: { $ref: "#/components/schemas/PageHit" }
+        pages_skipped:
+          type: [string, "null"]
+          enum: [time_travel, null]
+          description: time_travel when as_of or known_at was set, since pages are searched at the present only
     GraphNeighborhood:
       type: object
       required: [root, entities, edges]
@@ -622,3 +797,87 @@ components:
         facts_deleted: { type: integer }
         episodes_deleted: { type: integer }
         entities_deleted: { type: integer }
+        pages_deleted: { type: integer }
+    Page:
+      type: object
+      required: [id, scope, slug, title, body, summary, version, trust, status, edited_by, edited_at]
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string }
+        slug: { type: string }
+        title: { type: string }
+        body: { type: string, description: Markdown }
+        summary: { type: [string, "null"] }
+        version: { type: integer }
+        trust: { type: string, enum: [external, agent, user, system] }
+        status: { type: string, enum: [active, superseded] }
+        edited_by: { type: string }
+        edited_at: { type: string, format: date-time }
+    PageSummary:
+      type: object
+      required: [id, scope, slug, title, version, edited_at]
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string }
+        slug: { type: string }
+        title: { type: string }
+        version: { type: integer }
+        edited_at: { type: string, format: date-time }
+    PageVersion:
+      type: object
+      required: [page_id, scope, slug, version, base_version, title, summary, trust, status, edited_by, edited_at]
+      properties:
+        page_id: { type: string, format: uuid }
+        scope: { type: string }
+        slug: { type: string }
+        version: { type: integer }
+        base_version: { type: [integer, "null"], description: The version the writer edited }
+        title: { type: string }
+        summary: { type: [string, "null"] }
+        trust: { type: string, enum: [external, agent, user, system] }
+        status: { type: string, enum: [active, quarantined, rejected, superseded] }
+        edited_by: { type: string }
+        edited_at: { type: string, format: date-time }
+    PendingPageVersion:
+      allOf:
+        - { $ref: "#/components/schemas/PageVersion" }
+        - type: object
+          required: [body, base_body]
+          properties:
+            body: { type: string }
+            base_body: { type: [string, "null"], description: Body of base_version, null when none or pruned }
+    PageWriteRequest:
+      type: object
+      required: [title, body]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        body: { type: string, maxLength: 100000, description: Markdown }
+        summary: { type: [string, "null"], maxLength: 500, description: What changed }
+        expected_version:
+          type: [integer, "null"]
+          description: Omit or null to create. Otherwise the current version being edited
+        approve:
+          type: boolean
+          default: false
+          description: >-
+            Admin keys only: write and approve in one step. 403 when the current version's trust is
+            above the key's max_trust
+    PageWriteResponse:
+      allOf:
+        - { $ref: "#/components/schemas/PageVersion" }
+        - type: object
+          required: [redacted]
+          properties:
+            redacted: { type: boolean, description: A secret in the title, body or summary was masked }
+    PageHit:
+      type: object
+      required: [page_id, scope, slug, title, version, section, snippet, score]
+      properties:
+        page_id: { type: string, format: uuid }
+        scope: { type: string }
+        slug: { type: string }
+        title: { type: string }
+        version: { type: integer }
+        section: { type: string, description: "Heading path, such as Upgrade MemoryOS > Native install" }
+        snippet: { type: string, description: The section's first 300 characters }
+        score: { type: number }

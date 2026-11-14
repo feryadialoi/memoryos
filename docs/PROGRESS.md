@@ -25,6 +25,7 @@ actually run. States: `todo`, `doing`, `done`, `blocked`, `removed`.
 | T17 One-command setup | done | Merged at 1cc275a. Real OpenCode 2.2.5 and Pi 1.4.0 connect with 6 tools. Full first run through `setup` completed on commit e21543e in a temp home: image build, model download of about 29 minutes at 220 to 470 KB/s, ready and healthy |
 | T18 Eval without a model | done | Merged at 6467518. Lead run against a real server; see `docs/eval-results.md` |
 | T19 Memory page | done | `memoryos ui`, `GET /v1/scopes`, `GET /v1/facts`. Lead on e21543e: 548 tests pass, fmt and clippy clean. Real browser with sample data: all views, approve, phone width, light and dark. Real `setup` and model: Ask and Review work, no console errors. For "what database do we use?" over 5 facts, the Postgres fact ranked 3rd |
+| T20 Pages contracts | done | Lead on `feat/knowledge-pages`: fmt and clippy (all targets, all features) clean, 463 workspace tests pass, store integration 77 on Postgres 0004 and 36 on SQLite 0002 pass, SQLite cascade check removes versions, sections, vectors and FTS rows. `MemoryStore` page methods have default bodies returning `internal` until T21 removes them. Expected failure until T24: the two server contract tests list exactly the 8 page operations as documented but not served. axum 0.8 accepts the route set |
 
 ## Production gates (SPEC section 12)
 
