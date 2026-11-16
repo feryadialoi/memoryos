@@ -356,7 +356,7 @@ When a save is due, `memoryos hook stop` prints:
 ```json
 {
   "decision": "block",
-  "reason": "Before stopping, call commit_facts for durable facts learned in this session. If there are none, stop."
+  "reason": "Before stopping, call commit_facts for durable facts learned in this session. If you worked out a procedure or found a knowledge page wrong, save or fix it with page_write. If there is nothing to save, stop."
 }
 ```
 
