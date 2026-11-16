@@ -246,12 +246,31 @@ fn scored_text(facts: &[ScoredFact], when_empty: &str) -> String {
         .join("\n")
 }
 
+/// Facts first, then one line per page hit, as `score  page scope/slug vN  section`.
 fn recall_text(response: &RecallResponse) -> String {
-    scored_text(&response.facts, "no memories found")
+    if response.facts.is_empty() && response.pages.is_empty() {
+        return "no memories found".to_owned();
+    }
+    let mut lines = Vec::new();
+    if !response.facts.is_empty() {
+        lines.push(scored_text(&response.facts, ""));
+    }
+    for hit in &response.pages {
+        lines.push(format!(
+            "{:.3}  page {}/{} v{}  {}",
+            hit.score, hit.scope, hit.slug, hit.version, hit.section
+        ));
+    }
+    lines.join("\n")
 }
 
 fn recall_json(response: &RecallResponse) -> String {
-    json!({"facts": response.facts}).to_string()
+    json!({
+        "facts": response.facts,
+        "pages": response.pages,
+        "pages_skipped": response.pages_skipped,
+    })
+    .to_string()
 }
 
 fn commit_text(response: &CommitResponse) -> String {
@@ -288,7 +307,7 @@ fn review_output(action: &str, fact: &Fact, json: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use memoryos_sdk::{CommittedFact, FactStatus};
+    use memoryos_sdk::{CommittedFact, FactStatus, PageHit};
     use serde_json::Value;
 
     use super::*;
@@ -367,7 +386,35 @@ mod tests {
         };
         assert_eq!(recall_text(&response), "no memories found");
         let value: Value = serde_json::from_str(&recall_json(&response)).expect("json");
-        assert_eq!(value, json!({"facts": []}));
+        assert_eq!(
+            value,
+            json!({"facts": [], "pages": [], "pages_skipped": null})
+        );
+    }
+
+    #[test]
+    fn recall_output_lists_page_hits() {
+        let hit = PageHit {
+            page_id: Uuid::nil(),
+            scope: "shared:team".parse().expect("scope"),
+            slug: "deploy-runbook".to_owned(),
+            title: "Deploy runbook".to_owned(),
+            version: 2,
+            section: "Deploy runbook > Rollback".to_owned(),
+            snippet: "Redeploy the previous tag.".to_owned(),
+            score: 0.5,
+        };
+        let response = RecallResponse {
+            facts: vec![],
+            pages: vec![hit],
+            pages_skipped: None,
+        };
+        assert_eq!(
+            recall_text(&response),
+            "0.500  page shared:team/deploy-runbook v2  Deploy runbook > Rollback"
+        );
+        let value: Value = serde_json::from_str(&recall_json(&response)).expect("json");
+        assert_eq!(value["pages"][0]["slug"], "deploy-runbook");
     }
 
     #[test]
