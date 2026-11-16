@@ -271,10 +271,21 @@ async fn the_page_serves_itself_locked_down() {
     let policy = response.headers()[header::CONTENT_SECURITY_POLICY]
         .to_str()
         .expect("policy");
-    assert!(policy.contains("script-src 'self'"), "{policy}");
-    assert!(!policy.contains("unsafe-inline"), "{policy}");
+    // Scripts come only from this listener. Inline styles are allowed for the SVG Mermaid draws.
+    let scripts = policy
+        .split(';')
+        .map(str::trim)
+        .find(|directive| directive.starts_with("script-src"))
+        .expect("script-src");
+    assert_eq!(scripts, "script-src 'self'", "{policy}");
+    assert!(!policy.contains("unsafe-eval"), "{policy}");
     assert!(response.text().await.expect("body").contains("/app.js"));
-    for asset in ["app.js", "style.css"] {
+    for asset in [
+        "app.js",
+        "markdown.js",
+        "vendor/mermaid.min.js",
+        "style.css",
+    ] {
         let response = page
             .http
             .get(format!("{}/{asset}", page.url))
