@@ -136,7 +136,11 @@ CLI, using `MEMORYOS_URL` and `MEMORYOS_API_KEY` (any agent without MCP can use 
 `memoryos recall`, `candidates`, `commit`, `quarantine list|approve|reject`, and
 `memoryos hook session-start|prompt|stop|session-end|pre-compact|install --agent
 claude-code|opencode|pi`, as shown in
-`README.md`. The hooks recall from `MEMORYOS_HOOK_SCOPES` (default `agent:coding-agent`).
+`README.md`. The hooks recall from `MEMORYOS_HOOK_SCOPES` (default `agent:coding-agent`), then
+  from the shared spaces named in the nearest `.memoryos.toml` at or above the working folder
+  (`spaces = ["ops", "shared:team"]`; a bare name means `shared:<name>`, and entries that are not
+  shared spaces are ignored). `memoryos mcp` uses the same list for its defaults. The first hook
+  scope stays first, so saves still default to it.
 - `hook session-start` recalls with the working folder's name and with a fixed query about the user,
   merges both by fact id, and adds the memory blocks of each `agent:<id>` hook scope. All of it is
   printed inside one data-labelled block with stored text escaped, under 9,000 characters. With a

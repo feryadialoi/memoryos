@@ -206,7 +206,7 @@ fn session_start(
         .map(PathBuf::from)
         .or_else(|| process_cwd.map(Path::to_owned));
     let query = query_for(cwd.as_deref());
-    let scopes = config::hook_scopes(env)?;
+    let scopes = config::project_scopes(env, cwd.as_deref())?;
     let agents = agent_ids(&scopes);
     let (project, about_user, blocks) = with_server(env, |client, api| {
         let (query, scopes) = (query.clone(), scopes.clone());
@@ -267,7 +267,13 @@ fn prompt(input: &str, env: Env<'_>) -> Result<Option<String>, String> {
     let text = host.prompt.as_deref().unwrap_or_default();
     let mut out = String::new();
     if text.split_whitespace().count() >= MIN_PROMPT_WORDS {
-        let scopes = config::hook_scopes(env)?;
+        let cwd = host
+            .cwd
+            .as_deref()
+            .filter(|cwd| !cwd.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+        let scopes = config::project_scopes(env, cwd.as_deref())?;
         let query: String = text.trim().chars().take(MAX_QUERY_CHARS).collect();
         let recall = with_server(env, |_, api| async move {
             api.recall(&scopes, &query, PROMPT_RECALL_LIMIT, PROMPT_PAGE_LIMIT)

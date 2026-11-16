@@ -310,6 +310,16 @@ in `commit_facts`, the proxy fills in every hook scope, or the first one for `co
 `tools/list` marks those fields optional and names the defaults. A value the model sends is never
 changed.
 
+A project picks the shared knowledge its agents read with a `.memoryos.toml` at its root:
+
+```toml
+spaces = ["ops"]   # same as "shared:ops"
+```
+
+The hooks and `memoryos mcp` add those spaces after the hook scopes when the agent works anywhere
+under that folder. Only `shared:` spaces count. Without the file, agents read only the hook scopes,
+so one project's runbooks never fill another project's context.
+
 Without hooks, memory still works, but saving depends on the agent choosing to do it. A hook may
 not run if the agent crashes or is killed, so agents should also save during work.
 

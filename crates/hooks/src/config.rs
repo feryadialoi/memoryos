@@ -1,7 +1,7 @@
 //! Reading the environment and `credentials.json`. Every function takes a lookup, so tests never
 //! read or change the real environment. `MEMORYOS_URL` and `MEMORYOS_API_KEY` override the file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use memoryos_sdk::{MemoryOs, Options, Scope};
 use url::Url;
@@ -97,6 +97,65 @@ pub fn hook_scopes(env: Env<'_>) -> Result<Vec<Scope>, String> {
         return Err("MEMORYOS_HOOK_SCOPES names no scope".to_owned());
     }
     Ok(scopes)
+}
+
+/// The project file naming the shared spaces a project's agents read.
+pub const PROJECT_FILE: &str = ".memoryos.toml";
+
+/// [`hook_scopes`], then the shared spaces named in the nearest [`PROJECT_FILE`] at or above `cwd`.
+/// Only `shared:` spaces count, so a repository can never point an agent at a user's or another
+/// agent's memory. The first scope stays the first hook scope, where saves go by default.
+pub fn project_scopes(env: Env<'_>, cwd: Option<&Path>) -> Result<Vec<Scope>, String> {
+    let mut scopes = hook_scopes(env)?;
+    for space in cwd.and_then(project_spaces).unwrap_or_default() {
+        if !scopes.contains(&space) {
+            scopes.push(space);
+        }
+    }
+    Ok(scopes)
+}
+
+/// The spaces of the nearest project file, or `None` when there is none.
+pub fn project_spaces(cwd: &Path) -> Option<Vec<Scope>> {
+    let text = cwd
+        .ancestors()
+        .find_map(|dir| std::fs::read_to_string(dir.join(PROJECT_FILE)).ok())?;
+    Some(parse_spaces(&text))
+}
+
+/// Reads `spaces = ["ops", "shared:team"]`, on one line or several. A bare name means `shared:name`.
+/// Anything else in the file is ignored, and so is an entry that is not a valid shared space.
+fn parse_spaces(text: &str) -> Vec<Scope> {
+    let text: String = text
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Some(start) = text.find("spaces") else {
+        return Vec::new();
+    };
+    let rest = text[start + "spaces".len()..].trim_start();
+    let Some(rest) = rest.strip_prefix('=') else {
+        return Vec::new();
+    };
+    let Some(list) = rest.trim_start().strip_prefix('[') else {
+        return Vec::new();
+    };
+    let list = list.split(']').next().unwrap_or_default();
+    list.split(',')
+        .map(|item| item.trim().trim_matches('"').trim_matches('\'').trim())
+        .filter(|item| !item.is_empty())
+        .filter_map(|item| {
+            let full = if item.contains(':') {
+                item.to_owned()
+            } else {
+                format!("shared:{item}")
+            };
+            full.parse::<Scope>()
+                .ok()
+                .filter(|scope| matches!(scope, Scope::Shared(_)))
+        })
+        .collect()
 }
 
 pub fn stop_every(env: Env<'_>) -> Result<u64, String> {
@@ -230,6 +289,46 @@ mod tests {
         );
         assert!(hook_scopes(&with(&[("MEMORYOS_HOOK_SCOPES", "bad")])).is_err());
         assert!(hook_scopes(&with(&[("MEMORYOS_HOOK_SCOPES", ",")])).is_err());
+    }
+
+    #[test]
+    fn project_files_add_shared_spaces_only() {
+        let spaces = parse_spaces(
+            "# knowledge for this repo\nname = \"x\"\nspaces = [\n  \"ops\",  # runbooks\n  'shared:team',\n  \"user:alice\", \"agent:other\", \"bad name\",\n]\n",
+        );
+        assert_eq!(spaces, [Scope::shared("ops"), Scope::shared("team")]);
+        assert!(parse_spaces("spaces = []").is_empty());
+        assert!(parse_spaces("other = 1").is_empty());
+    }
+
+    #[test]
+    fn project_scopes_come_from_the_nearest_file_up_the_tree() {
+        let dir = tempfile::tempdir().expect("dir");
+        let nested = dir.path().join("crates/server");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(
+            dir.path().join(PROJECT_FILE),
+            "spaces = [\"ops\", \"coding-agent\"]",
+        )
+        .expect("write");
+        let scopes = project_scopes(&with(&[]), Some(&nested)).expect("scopes");
+        assert_eq!(
+            scopes,
+            [
+                Scope::agent("coding-agent"),
+                Scope::shared("ops"),
+                Scope::shared("coding-agent")
+            ]
+        );
+        let elsewhere = tempfile::tempdir().expect("dir");
+        assert_eq!(
+            project_scopes(&with(&[]), Some(elsewhere.path())).expect("scopes"),
+            [Scope::agent("coding-agent")]
+        );
+        assert_eq!(
+            project_scopes(&with(&[]), None).expect("scopes"),
+            [Scope::agent("coding-agent")]
+        );
     }
 
     #[test]

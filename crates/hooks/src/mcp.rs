@@ -48,7 +48,9 @@ pub fn run() -> Result<(), String> {
     start_local_server(&base);
     let endpoint = format!("{base}/mcp");
     // A bad value must not take the tools away: the model then has to name scopes itself.
-    let defaults: Vec<String> = match config::hook_scopes(&process_env) {
+    // Claude Code starts this in the project directory, so its project file applies.
+    let cwd = std::env::current_dir().ok();
+    let defaults: Vec<String> = match config::project_scopes(&process_env, cwd.as_deref()) {
         Ok(scopes) => scopes.iter().map(ToString::to_string).collect(),
         Err(message) => {
             eprintln!("memoryos mcp: {message}. Scopes are not filled in.");
