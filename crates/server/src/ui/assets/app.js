@@ -162,7 +162,6 @@ const current = () => S.scopes.find((item) => item.scope === S.scope) || null;
 // Page versions waiting for review, which the server counts apart from facts.
 const pendingPagesIn = (scope) => S.pendingPages.get(scope) || 0;
 const waitingIn = (summary) => summary.quarantined + pendingPagesIn(summary.scope);
-const hasPages = (summary) => Boolean(summary) && ((summary.pages || 0) > 0 || pendingPagesIn(summary.scope) > 0);
 const pagePath = (slug) => `pages/${encodeURIComponent(S.scope)}/${encodeURIComponent(slug)}`;
 
 // ---- API --------------------------------------------------------------------------------------
@@ -345,7 +344,6 @@ function selectScope(scope) {
   S.pageFilter = "";
   const summary = current();
   if (S.tab === "notes" && !summary?.blocks) S.tab = "facts";
-  if (S.tab === "pages" && !hasPages(summary)) S.tab = "facts";
   render();
   return guarded(async () => { await loadTab(); S.offline = null; render(); });
 }
@@ -567,9 +565,7 @@ function renderHead() {
   }
   const { name, kind } = scopeParts(summary.scope);
   const waiting = waitingIn(summary);
-  const tabs = [["facts", "Facts"], ["map", "Map"], ["timeline", "Timeline"]];
-  if (hasPages(summary)) tabs.push(["pages", "Knowledge"]);
-  tabs.push(["review", "Review"]);
+  const tabs = [["facts", "Facts"], ["map", "Map"], ["timeline", "Timeline"], ["pages", "Knowledge"], ["review", "Review"]];
   if (summary.blocks > 0) tabs.push(["notes", "Agent notes"]);
   return h("header", { class: "head" },
     h("select", {
@@ -1193,7 +1189,7 @@ function renderPages() {
     `${pending} edit${pending === 1 ? "" : "s"} waiting for review`);
   if (!S.pages.length) {
     return h("div", { class: "empty" }, h("h2", {}, "No pages yet"),
-      h("p", {}, "Pages your agent writes here, such as runbooks and guides, will show up in this list."),
+      h("p", {}, "Runbooks, guides and other pages for this space show up here. Start one with New page, or let your agent write one."),
       h("p", { css: { "margin-top": "10px" } }, renderNewPage()),
       waiting && h("p", { css: { "margin-top": "10px" } }, waiting));
   }
