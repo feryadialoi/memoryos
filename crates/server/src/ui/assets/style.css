@@ -270,7 +270,8 @@ button.stat:hover { border-color: var(--line-strong); }
 .btn { padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line); font-weight: 550; background: var(--panel); }
 .btn:hover { border-color: var(--line-strong); }
 .btn.primary { background: var(--accent); border-color: transparent; color: var(--panel); }
-.btn.primary:hover { filter: brightness(1.08); }
+/* A shade, not a filter: a CSS filter puts the button on its own layer and blurs its text. */
+.btn.primary:hover { box-shadow: inset 0 0 0 999px rgba(255, 255, 255, 0.1); }
 .btn.danger { color: var(--red); }
 .btn[disabled] { opacity: 0.5; cursor: default; }
 .link-btn { color: var(--accent-ink); font-size: 13px; font-weight: 500; }
@@ -420,6 +421,7 @@ button.version-row:hover { background: var(--panel-2); }
 .new-page .btn { white-space: nowrap; }
 .new-space .space-name, .new-space .space-avatar { color: var(--ink-3); }
 .new-space-form { display: flex; flex-direction: column; gap: 6px; padding: 6px 4px; }
-.new-space-form .filter { width: 100%; font-family: var(--mono); font-size: 12.5px; }
+/* .filter grows along a row; in this column that growth would become its height. */
+.new-space-form .filter { flex: none; width: 100%; min-width: 0; font-family: var(--mono); font-size: 12.5px; }
 .new-space-actions { display: flex; align-items: center; gap: 10px; }
 .new-space-actions .btn { white-space: nowrap; }
