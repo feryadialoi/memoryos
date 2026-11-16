@@ -1,4 +1,4 @@
-//! `memoryos page list|read|write|delete`: knowledge pages (SPEC section 8) through the REST routes,
+//! `memoryos page list|read|write|edit|sync|pull|delete`: knowledge pages (SPEC section 8) through the REST routes,
 //! with the agent key. The scope defaults to the first hook scope, where the hooks and the MCP proxy
 //! also read and write.
 
@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use crate::api::{Api, PageWrite};
 use crate::client::read_input;
 use crate::config::{self, process_env, Env};
+use crate::knowledge;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -67,6 +68,41 @@ pub enum PageCommand {
         /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
+    },
+    /// Open a page in your editor (`MEMORYOS_EDITOR`, `VISUAL` or `EDITOR`, such as `code --wait`)
+    /// and save it as a new version when the editor closes. A new slug starts an empty page.
+    Edit {
+        slug: String,
+        /// Default: the first of `MEMORYOS_HOOK_SCOPES`.
+        #[arg(long)]
+        scope: Option<Scope>,
+        /// Write and approve in one step. Needs an admin key.
+        #[arg(long)]
+        approve: bool,
+    },
+    /// Write changed `*.md` files of a folder to the scope, approved with the admin key. State is
+    /// kept in `.memoryos-sync.json` in the folder; commit it with the pages.
+    Sync {
+        dir: PathBuf,
+        /// Default: the first of `MEMORYOS_HOOK_SCOPES`.
+        #[arg(long)]
+        scope: Option<Scope>,
+        /// Let the file win over a page edited in MemoryOS since the last sync.
+        #[arg(long)]
+        force: bool,
+        /// Delete pages whose file was removed since the last sync.
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Write pages edited in MemoryOS since the last sync back to their files in the folder.
+    Pull {
+        dir: PathBuf,
+        /// Default: the first of `MEMORYOS_HOOK_SCOPES`.
+        #[arg(long)]
+        scope: Option<Scope>,
+        /// Overwrite files that have changes not synced.
+        #[arg(long)]
+        force: bool,
     },
     /// Delete a page with every version.
     Delete {
@@ -146,6 +182,40 @@ fn execute(command: PageCommand, env: Env<'_>) -> Result<String, String> {
             } else {
                 write_text(&value)
             })
+        }
+        PageCommand::Edit {
+            slug,
+            scope,
+            approve,
+        } => {
+            let scope = scope_or_default(scope, env)?;
+            let editor = knowledge::editor_command(env)?;
+            let api = api(env, approve)?;
+            let approve = if approve {
+                knowledge::Approve::Yes
+            } else {
+                knowledge::Approve::No
+            };
+            block_on(knowledge::edit(&api, &scope, &slug, approve, &editor))
+        }
+        PageCommand::Sync {
+            dir,
+            scope,
+            force,
+            prune,
+        } => {
+            let scope = scope_or_default(scope, env)?;
+            block_on(knowledge::sync(
+                &api(env, true)?,
+                &dir,
+                &scope,
+                force,
+                prune,
+            ))
+        }
+        PageCommand::Pull { dir, scope, force } => {
+            let scope = scope_or_default(scope, env)?;
+            block_on(knowledge::pull(&api(env, true)?, &dir, &scope, force))
         }
         PageCommand::Delete { slug, scope, json } => {
             let scope = scope_or_default(scope, env)?;

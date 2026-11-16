@@ -389,3 +389,4 @@ button.version-row:hover { background: var(--panel-2); }
   .page-body { padding: 12px; font-size: 12px; }
   .diff { font-size: 11.5px; max-height: 360px; }
 }
+.page-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }

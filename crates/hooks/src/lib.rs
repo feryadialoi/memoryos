@@ -13,6 +13,7 @@ mod doc;
 mod files;
 mod hook;
 mod install;
+mod knowledge;
 mod mcp;
 mod page;
 pub mod settings;
@@ -185,6 +186,24 @@ pub struct InstallArgs {
 /// Returns a message for the caller to print when a command fails. Hook commands always return
 /// `Ok`, having already logged any failure.
 /// The server URL and key `memoryos ui` forwards with.
+/// For the "Open in editor" button of `memoryos ui`: [`knowledge::edit`] with the UI's key. With
+/// `approve`, a key that may not approve is retried without it, so the edit waits for review.
+pub async fn edit_page_in_editor(
+    base_url: &str,
+    key: String,
+    scope: &Scope,
+    slug: &str,
+    editor: &str,
+) -> Result<String, String> {
+    let api = api::Api::new(base_url, key, std::time::Duration::from_secs(30))?;
+    knowledge::edit(&api, scope, slug, knowledge::Approve::IfAllowed, editor).await
+}
+
+/// The editor command for `memoryos ui`, from its environment.
+pub fn editor_command() -> Result<String, String> {
+    knowledge::editor_command(&config::process_env)
+}
+
 pub fn ui_connection() -> Result<(String, String), String> {
     let env: config::Env<'_> = &config::process_env;
     Ok((config::base_url(env)?, config::ui_key(env)?))

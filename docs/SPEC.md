@@ -374,6 +374,16 @@ searched at the present only; older versions are read by version.
   `pages_deleted`. Purging an episode never touches pages.
 - `GET /v1/scopes` lists every scope that holds a page, with `pages` counting those that have a current
   version, so a scope whose only page waits for its first review is listed with `pages` 0.
+- Editing outside MemoryOS (`docs/knowledge-editing-design.md`) is client side and uses the write
+  above unchanged. `memoryos page edit` opens the current version in `MEMORYOS_EDITOR`, `VISUAL` or
+  `EDITOR` and writes the result with `expected_version` set to the version opened; on failure the
+  file is kept. `memoryos page sync <dir>` writes changed top-level `*.md` files of a folder to one
+  scope, approved with the admin key, and `memoryos page pull <dir>` writes pages edited in MemoryOS
+  back to their files. Both keep `.memoryos-sync.json` (slug to synced version and file SHA-256) in
+  the folder. `sync` refuses a page whose current version moved past the synced one unless
+  `--force`; `pull` refuses a file changed since the last sync unless `--force`. `memoryos ui` runs
+  the same edit for its "Open in editor" button through a local route (`/local/edit`), never the
+  proxy, which still cannot write pages.
 
 ## 9. API
 

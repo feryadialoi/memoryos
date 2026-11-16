@@ -32,6 +32,7 @@ const S = {
   pageReview: null,
   pageConflicts: new Set(),
   pendingPages: new Map(),
+  editing: null,
   pages: null,
   pageFilter: "",
   page: null,
@@ -399,6 +400,41 @@ function openPage(slug, version) {
   });
 }
 
+// "Open in editor": the local UI server opens the page in the editor `memoryos ui` was started
+// with, and saves a new version when it closes. This polls until then.
+async function editInEditor(slug) {
+  const scope = S.scope;
+  const query = new URLSearchParams({ scope, slug });
+  const local = async (method) => {
+    const response = await fetch(method === "POST" ? "/local/edit" : `/local/edit?${query}`, {
+      method,
+      headers: { "X-MemoryOS-UI": S.token, "Content-Type": "application/json" },
+      body: method === "POST" ? JSON.stringify({ scope, slug }) : undefined,
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(body?.error?.message || `Request failed with status ${response.status}`);
+    return body;
+  };
+  try {
+    const started = await local("POST");
+    S.editing = slug;
+    render();
+    toast(`Opened in ${started.editor}. Save and close it to make a new version.`);
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      const status = await local("GET");
+      if (status.editing) continue;
+      if (status.error) toast(status.error, true);
+      else if (status.saved) toast(status.saved);
+      break;
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+  if (S.editing === slug) S.editing = null;
+  await guarded(async () => { S.pendingPages = await loadPendingPages(); await loadPages(); render(); });
+}
+
 function closePage() {
   S.page = null;
   render();
@@ -530,7 +566,7 @@ function renderHead() {
   const { name, kind } = scopeParts(summary.scope);
   const waiting = waitingIn(summary);
   const tabs = [["facts", "Facts"], ["map", "Map"], ["timeline", "Timeline"]];
-  if (hasPages(summary)) tabs.push(["pages", "Pages"]);
+  if (hasPages(summary)) tabs.push(["pages", "Knowledge"]);
   tabs.push(["review", "Review"]);
   if (summary.blocks > 0) tabs.push(["notes", "Agent notes"]);
   return h("header", { class: "head" },
@@ -1173,7 +1209,13 @@ function renderPage() {
         older && h("div", { class: "notice" },
           h("span", {}, `You are reading version ${data.version}, which was replaced.`),
           latest && h("button", { class: "link-btn", onclick: () => openPage(slug) }, `Read version ${latest.version}, the current one`)),
-        h("h2", { class: "page-title" }, data.title),
+        h("div", { class: "page-head" },
+          h("h2", { class: "page-title" }, data.title),
+          !older && h("button", {
+            class: "btn",
+            disabled: S.editing === slug,
+            onclick: () => editInEditor(slug),
+          }, S.editing === slug ? "Open in your editor" : "Open in editor")),
         h("div", { class: "meta" },
           h("span", { class: `pill ${older ? "past" : "current"}` }, older ? "Older version" : "Current"),
           h("span", {}, `version ${data.version}`),

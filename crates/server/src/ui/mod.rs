@@ -13,15 +13,17 @@
 //! Fact and page text is untrusted: agents write it, and it can quote hostile pages. `app.js` only ever sets it
 //! as text, and the content security policy below refuses inline scripts as a second layer.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use memoryos_core::{validate_slug, Scope};
 use serde_json::json;
@@ -43,6 +45,9 @@ const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_JS: &str = include_str!("assets/app.js");
 const STYLE_CSS: &str = include_str!("assets/style.css");
 
+/// Page edits by `scope/slug`: `None` while the editor is open, then the outcome.
+type Edits = Arc<Mutex<HashMap<String, Option<Result<String, String>>>>>;
+
 #[derive(Clone)]
 pub struct UiState {
     upstream_url: String,
@@ -50,6 +55,9 @@ pub struct UiState {
     token_hash: [u8; 32],
     allowed_hosts: [String; 2],
     client: reqwest::Client,
+    /// The command "Open in editor" runs, from this process's environment.
+    editor: Option<String>,
+    edits: Edits,
 }
 
 impl UiState {
@@ -70,6 +78,8 @@ impl UiState {
             token_hash: digest(token),
             allowed_hosts: [format!("127.0.0.1:{port}"), format!("localhost:{port}")],
             client,
+            editor: memoryos_hooks::editor_command().ok(),
+            edits: Arc::default(),
         })
     }
 }
@@ -90,6 +100,7 @@ pub fn router(state: UiState) -> Router {
             get(|| asset(STYLE_CSS, "text/css; charset=utf-8")),
         )
         .route("/api/{*target}", any(forward))
+        .route("/local/edit", post(start_edit).get(edit_status))
         .layer(middleware::from_fn_with_state(state.clone(), check_host))
         .with_state(state)
 }
@@ -187,6 +198,106 @@ fn failure(status: StatusCode, code: &str, message: &str) -> Response {
         Json(json!({"error": {"code": code, "message": message}})),
     )
         .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct EditTarget {
+    scope: String,
+    slug: String,
+}
+
+fn edit_key(target: &EditTarget) -> Result<(Scope, String), Box<Response>> {
+    let bad = |message: &str| Box::new(failure(StatusCode::BAD_REQUEST, "invalid_input", message));
+    let scope: Scope = target.scope.parse().map_err(|_| bad("invalid scope"))?;
+    validate_slug(&target.slug).map_err(|_| bad("invalid slug"))?;
+    Ok((scope, target.slug.clone()))
+}
+
+/// "Open in editor": runs `memoryos page edit` on this machine with the UI's key. The request names
+/// only the page; the command comes from this process's environment. Returns at once.
+async fn start_edit(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Json(target): Json<EditTarget>,
+) -> Response {
+    if !token_matches(&state, &headers) {
+        return failure(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "this page's token is missing or old",
+        );
+    }
+    let (scope, slug) = match edit_key(&target) {
+        Ok(found) => found,
+        Err(response) => return *response,
+    };
+    let Some(editor) = state.editor.clone() else {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "no_editor",
+            "no editor: start `memoryos ui` with MEMORYOS_EDITOR set, such as `code --wait` or `idea --wait`",
+        );
+    };
+    let key = format!("{scope}/{slug}");
+    {
+        let mut edits = state.edits.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(edits.get(&key), Some(None)) {
+            return failure(
+                StatusCode::CONFLICT,
+                "editing",
+                "this page is already open in your editor",
+            );
+        }
+        edits.insert(key.clone(), None);
+    }
+    let (url, api_key, edits) = (
+        state.upstream_url.clone(),
+        state.upstream_key.clone(),
+        state.edits.clone(),
+    );
+    tokio::spawn(async move {
+        let outcome =
+            memoryos_hooks::edit_page_in_editor(&url, api_key, &scope, &slug, &editor).await;
+        edits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Some(outcome));
+    });
+    Json(json!({"editing": true, "editor": state.editor})).into_response()
+}
+
+/// Whether the editor is still open, and once it closed, what was saved. The outcome is reported once.
+async fn edit_status(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Query(target): Query<EditTarget>,
+) -> Response {
+    if !token_matches(&state, &headers) {
+        return failure(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "this page's token is missing or old",
+        );
+    }
+    let (scope, slug) = match edit_key(&target) {
+        Ok(found) => found,
+        Err(response) => return *response,
+    };
+    let key = format!("{scope}/{slug}");
+    let mut edits = state.edits.lock().unwrap_or_else(|e| e.into_inner());
+    match edits.get(&key) {
+        Some(None) => Json(json!({"editing": true})).into_response(),
+        Some(Some(_)) => match edits.remove(&key) {
+            Some(Some(Ok(message))) => {
+                Json(json!({"editing": false, "saved": message})).into_response()
+            }
+            Some(Some(Err(message))) => {
+                Json(json!({"editing": false, "error": message})).into_response()
+            }
+            _ => Json(json!({"editing": false})).into_response(),
+        },
+        None => Json(json!({"editing": false})).into_response(),
+    }
 }
 
 fn token_matches(state: &UiState, headers: &HeaderMap) -> bool {
@@ -499,6 +610,83 @@ mod tests {
         assert!(!token_matches(&state, &headers));
         headers.insert(TOKEN_HEADER, HeaderValue::from_static("right"));
         assert!(token_matches(&state, &headers));
+    }
+
+    fn edit_request(scope: &str, slug: &str) -> EditTarget {
+        EditTarget {
+            scope: scope.into(),
+            slug: slug.into(),
+        }
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.expect("body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    #[tokio::test]
+    async fn open_in_editor_needs_the_token_a_valid_page_and_an_editor() {
+        let mut state =
+            UiState::new("http://127.0.0.1:9".into(), "k".into(), "right", 1).expect("state");
+        state.editor = None;
+        let mut headers = HeaderMap::new();
+        let refused = start_edit(
+            State(state.clone()),
+            headers.clone(),
+            Json(edit_request("shared:t", "a")),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        headers.insert(TOKEN_HEADER, HeaderValue::from_static("right"));
+        let bad = start_edit(
+            State(state.clone()),
+            headers.clone(),
+            Json(edit_request("shared:t", "../x")),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let none = start_edit(State(state), headers, Json(edit_request("shared:t", "a"))).await;
+        assert_eq!(none.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(none).await["error"]["code"], "no_editor");
+    }
+
+    #[tokio::test]
+    async fn an_edit_reports_its_outcome_once() {
+        let mut state =
+            UiState::new("http://127.0.0.1:9".into(), "k".into(), "right", 1).expect("state");
+        state.editor = Some("true".into());
+        let mut headers = HeaderMap::new();
+        headers.insert(TOKEN_HEADER, HeaderValue::from_static("right"));
+        let started = start_edit(
+            State(state.clone()),
+            headers.clone(),
+            Json(edit_request("shared:t", "a")),
+        )
+        .await;
+        assert_eq!(started.status(), StatusCode::OK);
+        let mut outcome = serde_json::Value::Null;
+        for _ in 0..100 {
+            let status = edit_status(
+                State(state.clone()),
+                headers.clone(),
+                Query(edit_request("shared:t", "a")),
+            )
+            .await;
+            outcome = body_json(status).await;
+            if outcome["editing"] == false {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Nothing listens on port 9, so reading the page fails before any editor runs.
+        assert!(
+            outcome["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("cannot reach")),
+            "{outcome}"
+        );
+        let again = edit_status(State(state), headers, Query(edit_request("shared:t", "a"))).await;
+        assert_eq!(body_json(again).await, json!({"editing": false}));
     }
 
     #[test]

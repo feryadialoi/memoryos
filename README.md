@@ -59,7 +59,8 @@ a reboot, the `memoryos mcp` that Claude Code launches starts the server again.
 | Update to the latest release | `memoryos update` (migrates and restarts the server too) |
 | Start, stop, restart the server | `memoryos start`, `memoryos stop`, `memoryos restart` |
 | Remove it | `memoryos setup --uninstall --global`, add `--delete-data` to delete the database |
-| Read and write knowledge pages | `memoryos page list`, `read`, `write` (markdown from a file or stdin), `delete` |
+| Read and write knowledge pages | `memoryos page list`, `read`, `write` (markdown from a file or stdin), `edit` (opens your editor, such as `MEMORYOS_EDITOR="code --wait"`), `delete` |
+| Keep knowledge in git | `memoryos page sync docs/knowledge --scope shared:team` writes changed `.md` files, `memoryos page pull` writes MemoryOS edits back. Commit `.memoryos-sync.json` with the pages |
 
 ### With Docker and Postgres
 
