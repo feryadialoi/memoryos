@@ -38,11 +38,17 @@ const DEFAULT_PORT: u16 = 7878;
 const TOKEN_HEADER: &str = "x-memoryos-ui";
 const MAX_BODY: usize = 1024 * 1024;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+/// `style-src 'unsafe-inline'` is for Mermaid, which styles the SVG it draws inline. Scripts stay
+/// `'self'` only, so page text still cannot run code.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; \
+    style-src 'self' 'unsafe-inline'; \
     connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_JS: &str = include_str!("assets/app.js");
+const MARKDOWN_JS: &str = include_str!("assets/markdown.js");
+/// Mermaid 11.4.1 (MIT, `assets/vendor/mermaid.LICENSE`), loaded only when a page has a diagram.
+const MERMAID_JS: &str = include_str!("assets/vendor/mermaid.min.js");
 const STYLE_CSS: &str = include_str!("assets/style.css");
 
 /// Page edits by `scope/slug`: `None` while the editor is open, then the outcome.
@@ -94,6 +100,14 @@ pub fn router(state: UiState) -> Router {
         .route(
             "/app.js",
             get(|| asset(APP_JS, "text/javascript; charset=utf-8")),
+        )
+        .route(
+            "/markdown.js",
+            get(|| asset(MARKDOWN_JS, "text/javascript; charset=utf-8")),
+        )
+        .route(
+            "/vendor/mermaid.min.js",
+            get(|| asset(MERMAID_JS, "text/javascript; charset=utf-8")),
         )
         .route(
             "/style.css",
@@ -691,7 +705,7 @@ mod tests {
 
     #[test]
     fn page_assets_load_nothing_from_outside_and_set_no_inline_code() {
-        for asset in [INDEX_HTML, APP_JS, STYLE_CSS] {
+        for asset in [INDEX_HTML, APP_JS, MARKDOWN_JS, STYLE_CSS] {
             assert!(!asset.contains("https://"), "external URL in an asset");
             assert!(!asset.contains("innerHTML"), "innerHTML in an asset");
         }

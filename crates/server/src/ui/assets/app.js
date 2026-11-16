@@ -33,6 +33,8 @@ const S = {
   pageConflicts: new Set(),
   pendingPages: new Map(),
   editing: null,
+  pageView: "rendered",
+  newPage: null,
   pages: null,
   pageFilter: "",
   page: null,
@@ -1159,6 +1161,30 @@ const VERSION_STATUS = {
   rejected: ["Rejected", "bad"],
 };
 
+// "New page": a slug, then the editor opens on an empty page; saving creates it.
+function renderNewPage() {
+  if (S.newPage === null) {
+    return h("button", { class: "btn", onclick: () => { S.newPage = ""; render(); document.getElementById("new-slug")?.focus(); } }, "New page");
+  }
+  const start = () => {
+    const slug = S.newPage.trim();
+    if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(slug)) {
+      toast("Use lowercase letters, digits, '.', '_' and '-', such as deploy-guide", true);
+      return;
+    }
+    S.newPage = null;
+    editInEditor(slug);
+  };
+  return h("span", { class: "new-page" },
+    h("input", {
+      id: "new-slug", class: "filter", placeholder: "new-page-name", "aria-label": "New page name", value: S.newPage,
+      oninput: (event) => { S.newPage = event.target.value; },
+      onkeydown: (event) => { if (event.key === "Enter") start(); if (event.key === "Escape") { S.newPage = null; render(); } },
+    }),
+    h("button", { class: "btn primary", onclick: start }, "Open in editor"),
+    h("button", { class: "link-btn", onclick: () => { S.newPage = null; render(); } }, "Cancel"));
+}
+
 function renderPages() {
   if (S.page) return renderPage();
   if (S.pages === null) return loading();
@@ -1168,6 +1194,7 @@ function renderPages() {
   if (!S.pages.length) {
     return h("div", { class: "empty" }, h("h2", {}, "No pages yet"),
       h("p", {}, "Pages your agent writes here, such as runbooks and guides, will show up in this list."),
+      h("p", { css: { "margin-top": "10px" } }, renderNewPage()),
       waiting && h("p", { css: { "margin-top": "10px" } }, waiting));
   }
   const toolbar = h("div", { class: "toolbar" },
@@ -1179,6 +1206,7 @@ function renderPages() {
       },
     }),
     waiting,
+    renderNewPage(),
     h("span", { class: "toolbar-note" }, S.pages.length >= PAGE_LIST_LIMIT ? `First ${PAGE_LIST_LIMIT} pages by name` : `${S.pages.length} page${S.pages.length === 1 ? "" : "s"}`));
   return h("div", {}, toolbar, h("div", { id: "page-results" }, renderPageRows()));
 
@@ -1223,10 +1251,33 @@ function renderPage() {
           h("span", {}, `by ${data.edited_by}`),
           h("span", { title: data.edited_at }, `edited ${ago(data.edited_at)}`)),
         data.summary && h("div", { class: "quote" }, h("span", { class: "quote-label" }, "What changed"), data.summary),
-        h("pre", { class: "page-body", "aria-label": "Page text" }, data.body)),
+        renderPageBody(data.body)),
       h("aside", { class: "card versions" },
         h("h3", {}, "Versions"),
         versions.map((item) => renderVersionRow(item, data.version)))));
+}
+
+function isDark() {
+  const theme = document.documentElement.dataset.theme;
+  return theme === "dark" || (!theme && matchMedia("(prefers-color-scheme: dark)").matches);
+}
+
+// Rendered markdown with diagrams, or the raw text. The choice is remembered.
+function renderPageBody(body) {
+  const view = S.pageView;
+  const pick = (value, label) => h("button", {
+    class: `seg${view === value ? " on" : ""}`, "aria-pressed": view === value ? "true" : "false",
+    onclick: () => { S.pageView = value; storageSet(localStorage, "memoryos-page-view", value); render(); },
+  }, label);
+  const switcher = h("div", { class: "segmented", role: "group", "aria-label": "Page view" },
+    pick("rendered", "Rendered"), pick("markdown", "Markdown"));
+  if (view === "markdown") {
+    return h("div", {}, switcher, h("pre", { class: "page-body", "aria-label": "Page text" }, body));
+  }
+  const rendered = Markdown.render(body);
+  rendered.classList.add("page-rendered");
+  Markdown.renderMermaid(rendered, isDark());
+  return h("div", {}, switcher, rendered);
 }
 
 function renderVersionRow(item, shown) {
@@ -1333,6 +1384,7 @@ document.addEventListener("keydown", (event) => {
 addEventListener("hashchange", () => { if (/t=/.test(location.hash)) location.reload(); });
 
 async function start() {
+  S.pageView = storageGet(localStorage, "memoryos-page-view") === "markdown" ? "markdown" : "rendered";
   const theme = storageGet(localStorage, "memoryos-theme");
   if (theme) document.documentElement.dataset.theme = theme;
   const match = location.hash.match(/t=([^&]+)/);
