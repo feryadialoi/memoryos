@@ -34,8 +34,6 @@ const S = {
   pendingPages: new Map(),
   editing: null,
   pageView: "rendered",
-  newPage: null,
-  newSpace: null,
   pages: null,
   pageFilter: "",
   page: null,
@@ -549,37 +547,62 @@ function renderRail() {
   ]);
 }
 
+const PAGE_NAME = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+const SPACE_NAME = /^[A-Za-z0-9_.-]{1,128}$/;
+
+// A modal form on the native <dialog>: a backdrop, focus kept inside, Esc closes it. Each field has
+// a label, a hint and a check; `onSubmit` gets the trimmed values once every check passes.
+function openDialog({ title, intro, fields, submit, onSubmit }) {
+  const inputs = fields.map((field) => h("input", {
+    class: "dialog-input", id: `dialog-${field.name}`, placeholder: field.placeholder, autocomplete: "off", spellcheck: "false",
+  }));
+  const error = h("p", { class: "dialog-error", role: "alert" });
+  const close = () => dialog.close();
+  const send = () => {
+    const values = inputs.map((input) => input.value.trim());
+    for (const [i, field] of fields.entries()) {
+      if (!field.check.test(values[i])) {
+        error.textContent = field.problem;
+        inputs[i].focus();
+        return;
+      }
+    }
+    close();
+    onSubmit(...values);
+  };
+  const dialog = h("dialog", { class: "dialog", "aria-labelledby": "dialog-title" },
+    h("h2", { id: "dialog-title", class: "dialog-title" }, title),
+    intro && h("p", { class: "dialog-intro" }, intro),
+    fields.map((field, i) => h("label", { class: "dialog-field", for: `dialog-${field.name}` },
+      h("span", { class: "dialog-label" }, field.label), inputs[i],
+      h("span", { class: "dialog-hint" }, field.hint))),
+    error,
+    h("div", { class: "dialog-actions" },
+      h("button", { class: "btn", onclick: close }, "Cancel"),
+      h("button", { class: "btn primary", onclick: send }, submit)));
+  dialog.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); send(); } });
+  dialog.addEventListener("close", () => dialog.remove());
+  document.body.append(dialog);
+  dialog.showModal();
+  inputs[0].focus();
+}
+
 // "+ New space": a shared space and its first page. The space exists once that page is saved.
 function renderNewSpace() {
-  if (S.newSpace === null) {
-    return h("button", { class: "space new-space", onclick: () => { S.newSpace = { name: "", page: "" }; renderRail(); document.getElementById("new-space-name")?.focus(); } },
-      h("span", { class: "space-avatar" }, "+"), h("span", { class: "space-name" }, "New space"));
-  }
-  const create = () => {
-    const name = S.newSpace.name.trim();
-    const page = S.newSpace.page.trim();
-    if (!/^[A-Za-z0-9_.-]{1,128}$/.test(name)) {
-      toast("Name the space with letters, digits, '.', '_' and '-', such as ops", true);
-      return;
-    }
-    if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(page)) {
-      toast("Name the first page with lowercase letters, digits, '.', '_' and '-', such as overview", true);
-      return;
-    }
-    S.newSpace = null;
-    renderRail();
-    editInEditor(page, `shared:${name}`);
-  };
-  const cancel = () => { S.newSpace = null; renderRail(); };
-  const keys = (event) => { if (event.key === "Enter") create(); if (event.key === "Escape") cancel(); };
-  return h("div", { class: "new-space-form" },
-    h("input", { id: "new-space-name", class: "filter", placeholder: "space name, e.g. ops", "aria-label": "Space name", value: S.newSpace.name,
-      oninput: (event) => { S.newSpace.name = event.target.value; }, onkeydown: keys }),
-    h("input", { class: "filter", placeholder: "first page, e.g. overview", "aria-label": "First page name", value: S.newSpace.page,
-      oninput: (event) => { S.newSpace.page = event.target.value; }, onkeydown: keys }),
-    h("div", { class: "new-space-actions" },
-      h("button", { class: "btn primary", onclick: create }, "Write first page"),
-      h("button", { class: "link-btn", onclick: cancel }, "Cancel")));
+  const start = () => openDialog({
+    title: "New space",
+    intro: "A shared space holds knowledge pages, like a team space. It is created when you save its first page.",
+    fields: [
+      { name: "space", label: "Space name", placeholder: "ops", hint: "Letters, digits, '.', '_' and '-'.", check: SPACE_NAME,
+        problem: "Name the space with letters, digits, '.', '_' and '-', such as ops." },
+      { name: "page", label: "First page", placeholder: "overview", hint: "Lowercase letters, digits, '.', '_' and '-'.", check: PAGE_NAME,
+        problem: "Name the first page with lowercase letters, digits, '.', '_' and '-', such as overview." },
+    ],
+    submit: "Write first page",
+    onSubmit: (space, page) => editInEditor(page, `shared:${space}`),
+  });
+  return h("button", { class: "space new-space", onclick: start },
+    h("span", { class: "space-avatar" }, "+"), h("span", { class: "space-name" }, "New space"));
 }
 
 function renderSpace(item) {
@@ -1205,28 +1228,20 @@ const VERSION_STATUS = {
   rejected: ["Rejected", "bad"],
 };
 
-// "New page": a slug, then the editor opens on an empty page; saving creates it.
+// "New page": a name, then the editor opens on an empty page; saving creates it.
 function renderNewPage() {
-  if (S.newPage === null) {
-    return h("button", { class: "btn", onclick: () => { S.newPage = ""; render(); document.getElementById("new-slug")?.focus(); } }, "New page");
-  }
-  const start = () => {
-    const slug = S.newPage.trim();
-    if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(slug)) {
-      toast("Use lowercase letters, digits, '.', '_' and '-', such as deploy-guide", true);
-      return;
-    }
-    S.newPage = null;
-    editInEditor(slug);
-  };
-  return h("span", { class: "new-page" },
-    h("input", {
-      id: "new-slug", class: "filter", placeholder: "new-page-name", "aria-label": "New page name", value: S.newPage,
-      oninput: (event) => { S.newPage = event.target.value; },
-      onkeydown: (event) => { if (event.key === "Enter") start(); if (event.key === "Escape") { S.newPage = null; render(); } },
-    }),
-    h("button", { class: "btn primary", onclick: start }, "Open in editor"),
-    h("button", { class: "link-btn", onclick: () => { S.newPage = null; render(); } }, "Cancel"));
+  const scope = S.scope;
+  const start = () => openDialog({
+    title: "New page",
+    intro: `In ${scope}. Your editor opens on an empty page; save and close it to create the page.`,
+    fields: [
+      { name: "page", label: "Page name", placeholder: "deploy-guide", hint: "Lowercase letters, digits, '.', '_' and '-'. The title goes at the top of the page.",
+        check: PAGE_NAME, problem: "Use lowercase letters, digits, '.', '_' and '-', such as deploy-guide." },
+    ],
+    submit: "Open in editor",
+    onSubmit: (slug) => editInEditor(slug, scope),
+  });
+  return h("button", { class: "btn", onclick: start }, "New page");
 }
 
 function renderPages() {
