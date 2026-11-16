@@ -418,3 +418,8 @@ button.version-row:hover { background: var(--panel-2); }
 .md .md-error { margin-top: 6px; color: var(--red); font-size: 12.5px; }
 .md li.md-task > ul, .md li.md-task > ol { margin-left: 22px; }
 .new-page .btn { white-space: nowrap; }
+.new-space .space-name, .new-space .space-avatar { color: var(--ink-3); }
+.new-space-form { display: flex; flex-direction: column; gap: 6px; padding: 6px 4px; }
+.new-space-form .filter { width: 100%; font-family: var(--mono); font-size: 12.5px; }
+.new-space-actions { display: flex; align-items: center; gap: 10px; }
+.new-space-actions .btn { white-space: nowrap; }

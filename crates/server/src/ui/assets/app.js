@@ -35,6 +35,7 @@ const S = {
   editing: null,
   pageView: "rendered",
   newPage: null,
+  newSpace: null,
   pages: null,
   pageFilter: "",
   page: null,
@@ -402,8 +403,7 @@ function openPage(slug, version) {
 
 // "Open in editor": the local UI server opens the page in the editor `memoryos ui` was started
 // with, and saves a new version when it closes. This polls until then.
-async function editInEditor(slug) {
-  const scope = S.scope;
+async function editInEditor(slug, scope = S.scope) {
   const query = new URLSearchParams({ scope, slug });
   const local = async (method) => {
     const response = await fetch(method === "POST" ? "/local/edit" : `/local/edit?${query}`, {
@@ -432,6 +432,20 @@ async function editInEditor(slug) {
     toast(error.message, true);
   }
   if (S.editing === slug) S.editing = null;
+  if (scope !== S.scope) {
+    // A new space exists once its first page is saved. Show it, or say why it is not there.
+    await guarded(async () => {
+      await loadScopes();
+      if (S.scopes.some((item) => item.scope === scope)) {
+        S.tab = "pages";
+        await selectScope(scope);
+      } else {
+        toast(`${scope} was not created: nothing was saved`, true);
+        render();
+      }
+    });
+    return;
+  }
   await guarded(async () => { S.pendingPages = await loadPendingPages(); await loadPages(); render(); });
 }
 
@@ -524,6 +538,7 @@ function renderRail() {
       h("img", { class: "brand-mark", alt: "", src: document.querySelector("link[rel=icon]").href }), "MemoryOS"),
     groups.map(([kind, title]) => {
       const items = S.scopes.filter((item) => scopeParts(item.scope).kind === kind);
+      if (kind === "shared") return h("div", { class: "rail-group" }, h("h2", {}, title), items.map(renderSpace), renderNewSpace());
       if (!items.length) return null;
       return h("div", { class: "rail-group" }, h("h2", {}, title), items.map(renderSpace));
     }),
@@ -532,6 +547,39 @@ function renderRail() {
       h("button", { class: "icon-btn", title: "Refresh", "aria-label": "Refresh", onclick: () => refresh(false) }, icon(ICONS.refresh)),
       h("button", { class: "icon-btn", title: "Switch light and dark", "aria-label": "Switch light and dark", onclick: toggleTheme }, icon(ICONS.theme))),
   ]);
+}
+
+// "+ New space": a shared space and its first page. The space exists once that page is saved.
+function renderNewSpace() {
+  if (S.newSpace === null) {
+    return h("button", { class: "space new-space", onclick: () => { S.newSpace = { name: "", page: "" }; renderRail(); document.getElementById("new-space-name")?.focus(); } },
+      h("span", { class: "space-avatar" }, "+"), h("span", { class: "space-name" }, "New space"));
+  }
+  const create = () => {
+    const name = S.newSpace.name.trim();
+    const page = S.newSpace.page.trim();
+    if (!/^[A-Za-z0-9_.-]{1,128}$/.test(name)) {
+      toast("Name the space with letters, digits, '.', '_' and '-', such as ops", true);
+      return;
+    }
+    if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(page)) {
+      toast("Name the first page with lowercase letters, digits, '.', '_' and '-', such as overview", true);
+      return;
+    }
+    S.newSpace = null;
+    renderRail();
+    editInEditor(page, `shared:${name}`);
+  };
+  const cancel = () => { S.newSpace = null; renderRail(); };
+  const keys = (event) => { if (event.key === "Enter") create(); if (event.key === "Escape") cancel(); };
+  return h("div", { class: "new-space-form" },
+    h("input", { id: "new-space-name", class: "filter", placeholder: "space name, e.g. ops", "aria-label": "Space name", value: S.newSpace.name,
+      oninput: (event) => { S.newSpace.name = event.target.value; }, onkeydown: keys }),
+    h("input", { class: "filter", placeholder: "first page, e.g. overview", "aria-label": "First page name", value: S.newSpace.page,
+      oninput: (event) => { S.newSpace.page = event.target.value; }, onkeydown: keys }),
+    h("div", { class: "new-space-actions" },
+      h("button", { class: "btn primary", onclick: create }, "Write first page"),
+      h("button", { class: "link-btn", onclick: cancel }, "Cancel")));
 }
 
 function renderSpace(item) {
