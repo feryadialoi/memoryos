@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use memoryos_core::{
     ApiKey, Block, BlockVersion, Entity, Episode, Fact, FactFilter, FactListState, FactOp,
-    FactView, GraphNeighborhood, MemoryStore, NewEntity, NewEpisode, PurgeReport, RequestContext,
+    FactView, GraphNeighborhood, MemoryStore, NewEntity, NewEpisode, NewPageVersion, Page,
+    PageSectionHit, PageSummary, PageVersion, PendingPageVersion, PurgeReport, RequestContext,
     Result, Scope, ScopeSummary, ScoredFact, Trust,
 };
 use uuid::Uuid;
@@ -62,6 +63,10 @@ impl Store {
 
     pub async fn migrate(&self) -> Result<()> {
         dispatch!(self, migrate())
+    }
+
+    pub async fn page_scopes(&self, ctx: &RequestContext) -> Result<Vec<Scope>> {
+        dispatch!(self, page_scopes(ctx))
     }
 
     pub async fn scope_summaries(&self, ctx: &RequestContext) -> Result<Vec<ScopeSummary>> {
@@ -292,6 +297,102 @@ impl MemoryStore for Store {
         label: &str,
     ) -> Result<Vec<BlockVersion>> {
         dispatch!(self, block_versions(ctx, agent_id, label))
+    }
+
+    async fn list_pages(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        prefix: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<PageSummary>> {
+        dispatch!(self, list_pages(ctx, scope, prefix, limit))
+    }
+
+    async fn get_page(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        slug: &str,
+        version: Option<i64>,
+    ) -> Result<Page> {
+        dispatch!(self, get_page(ctx, scope, slug, version))
+    }
+
+    async fn get_page_version(
+        &self,
+        ctx: &RequestContext,
+        page_id: Uuid,
+        version: i64,
+    ) -> Result<PageVersion> {
+        dispatch!(self, get_page_version(ctx, page_id, version))
+    }
+
+    async fn put_page(&self, ctx: &RequestContext, page: NewPageVersion) -> Result<PageVersion> {
+        dispatch!(self, put_page(ctx, page))
+    }
+
+    async fn page_versions(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        slug: &str,
+    ) -> Result<Vec<PageVersion>> {
+        dispatch!(self, page_versions(ctx, scope, slug))
+    }
+
+    async fn delete_page(&self, ctx: &RequestContext, scope: &Scope, slug: &str) -> Result<()> {
+        dispatch!(self, delete_page(ctx, scope, slug))
+    }
+
+    async fn list_quarantined_pages(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        limit: i64,
+    ) -> Result<Vec<PendingPageVersion>> {
+        dispatch!(self, list_quarantined_pages(ctx, scopes, limit))
+    }
+
+    async fn approve_page_version(
+        &self,
+        ctx: &RequestContext,
+        page_id: Uuid,
+        version: i64,
+    ) -> Result<Page> {
+        dispatch!(self, approve_page_version(ctx, page_id, version))
+    }
+
+    async fn reject_page_version(
+        &self,
+        ctx: &RequestContext,
+        page_id: Uuid,
+        version: i64,
+    ) -> Result<PageVersion> {
+        dispatch!(self, reject_page_version(ctx, page_id, version))
+    }
+
+    async fn search_page_sections_vector(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<PageSectionHit>> {
+        dispatch!(
+            self,
+            search_page_sections_vector(ctx, scopes, embedding, limit)
+        )
+    }
+
+    async fn search_page_sections_text(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<PageSectionHit>> {
+        dispatch!(self, search_page_sections_text(ctx, scopes, query, limit))
     }
 
     async fn find_api_key(&self, key_hash: &str) -> Result<Option<ApiKey>> {

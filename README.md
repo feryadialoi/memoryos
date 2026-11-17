@@ -30,6 +30,7 @@ change and sources that lie.
 | 👤 **Personal memory** | Facts scoped per user, reconciled so new information adds to, replaces or repeats what is known |
 | 🕰️ **Memory over time** | A replaced fact is closed, not deleted, so you can ask what is true now or what was true then |
 | ✍️ **Self-editing agents** | Size-limited, versioned blocks that agents edit through tools, with conflict detection |
+| 📖 **Knowledge pages** | Agents write and read how-to and reference pages, such as runbooks. Pages are split into sections for recall, versioned, and reviewed before an agent's edit reaches a shared scope |
 | 🕸️ **Shared knowledge graph** | Every fact is also an edge between entities, shared across agents through scoped access |
 | 🛡️ **Poisoning defense** | Low-trust content is quarantined, and every fact traces back to its source |
 | 🔁 **One-call saving** | A repeated fact is matched on the server and counted as another source, and the response lists `related` facts, so the agent rarely needs a lookup before saving |
@@ -58,6 +59,8 @@ a reboot, the `memoryos mcp` that Claude Code launches starts the server again.
 | Update to the latest release | `memoryos update` (migrates and restarts the server too) |
 | Start, stop, restart the server | `memoryos start`, `memoryos stop`, `memoryos restart` |
 | Remove it | `memoryos setup --uninstall --global`, add `--delete-data` to delete the database |
+| Read and write knowledge pages | `memoryos page list`, `read`, `write` (markdown from a file or stdin), `edit` (opens your editor, such as `MEMORYOS_EDITOR="code --wait"`), `delete` |
+| Keep knowledge in git | `memoryos page sync docs/knowledge --scope shared:team` writes changed `.md` files, `memoryos page pull` writes MemoryOS edits back. Commit `.memoryos-sync.json` with the pages |
 
 ### With Docker and Postgres
 
@@ -237,6 +240,7 @@ disagree:
 - **Entities:** the people, places and things that facts connect.
 - **Facts:** statements with two timelines, when they were true and when we learned them.
 - **Blocks:** versioned working notes that an agent edits directly.
+- **Pages:** versioned markdown knowledge, such as runbooks, searched by section.
 
 ## 🛡️ Security
 
@@ -259,8 +263,11 @@ Research shows a poisoned memory survives across sessions, unlike ordinary promp
 
 ## 🪝 Agent hooks
 
-The agent reads and saves memories through MCP tools. Hooks only load memories and remind the agent to
-save, and they cannot bypass validation or quarantine. `memoryos setup` installs them for you.
+The agent reads and saves memories through MCP tools: `recall`, `recall_candidates`, `commit_facts`,
+`graph_neighbors`, `block_read`, `block_replace`, and for knowledge pages `page_read`, `page_write` and
+`page_list`. `recall` also returns the best matching page sections. Hooks only load memories and
+remind the agent to save, and they cannot bypass validation or quarantine. `memoryos setup` installs
+them for you.
 
 ```mermaid
 flowchart LR
@@ -302,6 +309,16 @@ defaults: when the model omits `scopes` in `recall`, `recall_candidates` or `gra
 in `commit_facts`, the proxy fills in every hook scope, or the first one for `commit_facts`. Its
 `tools/list` marks those fields optional and names the defaults. A value the model sends is never
 changed.
+
+A project picks the shared knowledge its agents read with a `.memoryos.toml` at its root:
+
+```toml
+spaces = ["ops"]   # same as "shared:ops"
+```
+
+The hooks and `memoryos mcp` add those spaces after the hook scopes when the agent works anywhere
+under that folder. Only `shared:` spaces count. Without the file, agents read only the hook scopes,
+so one project's runbooks never fill another project's context.
 
 Without hooks, memory still works, but saving depends on the agent choosing to do it. A hook may
 not run if the agent crashes or is killed, so agents should also save during work.
@@ -349,7 +366,7 @@ When a save is due, `memoryos hook stop` prints:
 ```json
 {
   "decision": "block",
-  "reason": "Before stopping, call commit_facts for durable facts learned in this session. If there are none, stop."
+  "reason": "Before stopping, call commit_facts for durable facts learned in this session. If you worked out a procedure or found a knowledge page wrong, save or fix it with page_write. If there is nothing to save, stop."
 }
 ```
 

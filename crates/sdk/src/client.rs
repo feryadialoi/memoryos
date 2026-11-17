@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use memoryos_core::{
-    Block, BlockVersion, Entity, Episode, Fact, GraphNeighborhood, PurgeReport, Scope, ScoredFact,
+    Block, BlockVersion, Entity, Episode, Fact, GraphNeighborhood, Page, PageSummary, PageVersion,
+    PendingPageVersion, PurgeReport, Scope, ScoredFact,
 };
 use reqwest::header::RETRY_AFTER;
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url};
@@ -15,7 +16,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::{from_response, Error, Result};
-use crate::types::{Commit, CommitResponse, PutBlock, RecallResponse};
+use crate::types::{
+    Commit, CommitResponse, PageWrite, PageWriteResponse, PutBlock, RecallResponse,
+};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -158,6 +161,7 @@ impl MemoryOs {
                 limit: DEFAULT_RECALL_LIMIT,
                 as_of: None,
                 known_at: None,
+                page_limit: None,
             },
         }
     }
@@ -299,6 +303,122 @@ impl MemoryOs {
         Ok(response.versions)
     }
 
+    // ---- Pages --------------------------------------------------------------------------------
+
+    /// Pages of `scope` that have a current version, by slug. `limit` is 1 to 500, default 100.
+    pub async fn list_pages(
+        &self,
+        scope: &Scope,
+        prefix: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<Vec<PageSummary>> {
+        let mut query = vec![("scope", scope.to_string())];
+        if let Some(prefix) = prefix {
+            query.push(("prefix", prefix.to_owned()));
+        }
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        let request = self.request(Method::GET, &["v1", "pages"]).query(&query);
+        let response: Pages = self.send(request, Retry::Yes).await?;
+        Ok(response.pages)
+    }
+
+    /// The current version, or with `version` an older active or superseded one.
+    pub async fn get_page(&self, scope: &Scope, slug: &str, version: Option<i64>) -> Result<Page> {
+        let mut request = self.request(Method::GET, &["v1", "pages", &scope.to_string(), slug]);
+        if let Some(version) = version {
+            request = request.query(&[("version", version)]);
+        }
+        self.send(request, Retry::Yes).await
+    }
+
+    /// Writes a new version. Check `status` in the response: a version that waits for review
+    /// leaves the current version in place. `Error::VersionConflict` means the page changed.
+    pub async fn put_page(
+        &self,
+        scope: &Scope,
+        slug: &str,
+        page: &PageWrite,
+    ) -> Result<PageWriteResponse> {
+        let request = self
+            .request(Method::PUT, &["v1", "pages", &scope.to_string(), slug])
+            .json(page);
+        self.send(request, Retry::No).await
+    }
+
+    /// Hard-deletes the page with every version.
+    pub async fn delete_page(&self, scope: &Scope, slug: &str) -> Result<()> {
+        let request = self.request(Method::DELETE, &["v1", "pages", &scope.to_string(), slug]);
+        self.send_empty(request, Retry::No).await
+    }
+
+    /// Kept versions in any status, newest first, without bodies.
+    pub async fn page_versions(&self, scope: &Scope, slug: &str) -> Result<Vec<PageVersion>> {
+        let request = self.request(
+            Method::GET,
+            &["v1", "pages", &scope.to_string(), slug, "versions"],
+        );
+        let response: PageVersions = self.send(request, Retry::Yes).await?;
+        Ok(response.versions)
+    }
+
+    /// Quarantined page versions, oldest first. Admin only. `scopes` holds exact scopes or
+    /// patterns such as `shared:*`, with the rules of `quarantine`.
+    pub async fn page_quarantine<S: ToString>(
+        &self,
+        scopes: &[S],
+        limit: Option<i64>,
+    ) -> Result<Vec<PendingPageVersion>> {
+        let scopes = scopes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut query = vec![("scopes", scopes)];
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        let request = self
+            .request(Method::GET, &["v1", "pages", "quarantine"])
+            .query(&query);
+        let response: PendingPageVersions = self.send(request, Retry::Yes).await?;
+        Ok(response.versions)
+    }
+
+    /// Makes a quarantined version current. Admin only. `Error::VersionConflict` means the version
+    /// it edited is no longer current: reject it so the writer can rewrite.
+    pub async fn approve_page(&self, page_id: Uuid, version: i64) -> Result<Page> {
+        let request = self.request(
+            Method::POST,
+            &[
+                "v1",
+                "pages",
+                "quarantine",
+                &page_id.to_string(),
+                &version.to_string(),
+                "approve",
+            ],
+        );
+        self.send(request, Retry::No).await
+    }
+
+    /// Admin only.
+    pub async fn reject_page(&self, page_id: Uuid, version: i64) -> Result<PageVersion> {
+        let request = self.request(
+            Method::POST,
+            &[
+                "v1",
+                "pages",
+                "quarantine",
+                &page_id.to_string(),
+                &version.to_string(),
+                "reject",
+            ],
+        );
+        self.send(request, Retry::No).await
+    }
+
     // ---- Users --------------------------------------------------------------------------------
 
     /// Hard-deletes everything under `user:{user_id}`. Admin only.
@@ -401,6 +521,8 @@ struct RecallBody {
     as_of: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     known_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_limit: Option<i64>,
 }
 
 /// A recall that has not been sent. Await it to send.
@@ -424,6 +546,12 @@ impl RecallBuilder<'_> {
 
     pub fn limit(mut self, limit: i64) -> Self {
         self.body.limit = limit;
+        self
+    }
+
+    /// Most page hits to return, 0 to 10, default 3. 0 turns page search off.
+    pub fn page_limit(mut self, page_limit: i64) -> Self {
+        self.body.page_limit = Some(page_limit);
         self
     }
 
@@ -470,6 +598,21 @@ struct Versions {
     versions: Vec<BlockVersion>,
 }
 
+#[derive(Deserialize)]
+struct Pages {
+    pages: Vec<PageSummary>,
+}
+
+#[derive(Deserialize)]
+struct PageVersions {
+    versions: Vec<PageVersion>,
+}
+
+#[derive(Deserialize)]
+struct PendingPageVersions {
+    versions: Vec<PendingPageVersion>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,10 +656,95 @@ mod tests {
             limit: 10,
             as_of: None,
             known_at: None,
+            page_limit: None,
         };
         assert_eq!(
             serde_json::to_value(&body).expect("serializes"),
             json!({"scopes": ["user:u"], "query": "q", "limit": 10})
+        );
+        let client = client("http://h:1");
+        let with_pages = client.recall(Scope::user("u"), "q").page_limit(0);
+        assert_eq!(
+            serde_json::to_value(&with_pages.body).expect("serializes")["page_limit"],
+            0
+        );
+    }
+
+    #[test]
+    fn page_urls_keep_the_scope_in_one_segment() {
+        let scope = Scope::shared("team").to_string();
+        assert_eq!(
+            client("http://h:1")
+                .url(&["v1", "pages", &scope, "runbook", "versions"])
+                .as_str(),
+            "http://h:1/v1/pages/shared:team/runbook/versions"
+        );
+        assert_eq!(
+            client("http://h:1")
+                .url(&["v1", "pages", "quarantine", "x", "2", "approve"])
+                .as_str(),
+            "http://h:1/v1/pages/quarantine/x/2/approve"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_calls_use_the_documented_paths_and_a_page_write_is_not_retried() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Records each request line and answers 503, which a read retries and a write does not.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0u8; 4096];
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&request[..read]).into_owned();
+                let line = text.lines().next().unwrap_or_default().to_owned();
+                record.lock().expect("lock").push(line);
+                let reply = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\
+                             connection: close\r\n\r\n";
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let options = Options {
+            read_retries: 0,
+            ..Options::default()
+        };
+        let mem = MemoryOs::new(format!("http://{address}"), "k", options).expect("client");
+        let scope = Scope::agent("a1");
+        let id = Uuid::nil();
+        assert!(mem.list_pages(&scope, Some("run"), Some(5)).await.is_err());
+        assert!(mem.get_page(&scope, "s", Some(2)).await.is_err());
+        assert!(mem
+            .put_page(&scope, "s", &PageWrite::create("T", "B"))
+            .await
+            .is_err());
+        assert!(mem.delete_page(&scope, "s").await.is_err());
+        assert!(mem.page_versions(&scope, "s").await.is_err());
+        assert!(mem.page_quarantine(&["shared:*"], None).await.is_err());
+        assert!(mem.approve_page(id, 2).await.is_err());
+        assert!(mem.reject_page(id, 2).await.is_err());
+        let nil = "00000000-0000-0000-0000-000000000000";
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            [
+                "GET /v1/pages?scope=agent%3Aa1&prefix=run&limit=5 HTTP/1.1".to_owned(),
+                "GET /v1/pages/agent:a1/s?version=2 HTTP/1.1".to_owned(),
+                "PUT /v1/pages/agent:a1/s HTTP/1.1".to_owned(),
+                "DELETE /v1/pages/agent:a1/s HTTP/1.1".to_owned(),
+                "GET /v1/pages/agent:a1/s/versions HTTP/1.1".to_owned(),
+                "GET /v1/pages/quarantine?scopes=shared%3A* HTTP/1.1".to_owned(),
+                format!("POST /v1/pages/quarantine/{nil}/2/approve HTTP/1.1"),
+                format!("POST /v1/pages/quarantine/{nil}/2/reject HTTP/1.1"),
+            ]
         );
     }
 

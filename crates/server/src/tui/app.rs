@@ -965,6 +965,7 @@ mod tests {
             quarantined: 0,
             entities: 1,
             blocks: 0,
+            pages: 0,
             last_recorded_at: None,
         }
     }

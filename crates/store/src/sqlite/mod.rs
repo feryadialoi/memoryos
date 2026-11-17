@@ -16,6 +16,7 @@ use sqlx::{AssertSqlSafe, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 mod facts;
+mod pages;
 mod rows;
 mod store_impl;
 
@@ -104,6 +105,20 @@ impl SqliteStore {
         Ok(result)
     }
 
+    /// Every scope holding a page in any state, including pages whose only versions wait for
+    /// review, which `scope_summaries` does not count. For expanding scope patterns.
+    pub async fn page_scopes(&self, ctx: &RequestContext) -> Result<Vec<Scope>> {
+        let mut tx = self.tenant_tx(ctx).await?;
+        let found: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT scope FROM pages WHERE tenant = ?1 ORDER BY scope")
+                .bind(&ctx.tenant)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        found.iter().map(|scope| scope.parse()).collect()
+    }
+
     /// Every scope of the tenant with its counts. This intentionally scans tenant-local rows and is
     /// not a hot-path query.
     pub async fn scope_summaries(&self, ctx: &RequestContext) -> Result<Vec<ScopeSummary>> {
@@ -137,6 +152,7 @@ impl SqliteStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(db)?;
+        let pages = pages::count_by_scope(&mut tx, ctx).await?;
         tx.commit().await.map_err(db)?;
 
         fn entry<'a>(
@@ -151,6 +167,7 @@ impl SqliteStore {
                 quarantined: 0,
                 entities: 0,
                 blocks: 0,
+                pages: 0,
                 last_recorded_at: None,
             }))
         }
@@ -177,6 +194,9 @@ impl SqliteStore {
         }
         for (scope, count) in blocks {
             entry(&mut all, &scope)?.blocks = count;
+        }
+        for (scope, count) in pages {
+            entry(&mut all, &scope)?.pages = count;
         }
         Ok(all.into_values().collect())
     }

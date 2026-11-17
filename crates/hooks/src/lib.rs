@@ -4,6 +4,7 @@
 //!
 //! The server binary flattens [`Command`] into its own command line and calls [`run`].
 
+mod api;
 mod capture;
 mod client;
 mod config;
@@ -12,7 +13,9 @@ mod doc;
 mod files;
 mod hook;
 mod install;
+mod knowledge;
 mod mcp;
+mod page;
 pub mod settings;
 mod setup;
 mod stats;
@@ -25,6 +28,7 @@ use memoryos_sdk::Scope;
 use uuid::Uuid;
 
 pub use install::Agent;
+pub use page::PageCommand;
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -61,6 +65,9 @@ pub enum Command {
     /// Review quarantined facts. Needs an admin key.
     #[command(subcommand)]
     Quarantine(QuarantineCommand),
+    /// List, read, write and delete knowledge pages. The scope defaults to the first hook scope.
+    #[command(subcommand)]
+    Page(PageCommand),
     /// Agent hooks and their installer.
     #[command(subcommand)]
     Hook(HookCommand),
@@ -142,10 +149,11 @@ pub enum QuarantineCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum HookCommand {
-    /// Print recalled memories for the host's context. Never fails the host.
+    /// Print recalled memories, and the titles and sections of pages related to the working
+    /// folder, for the host's context. Never fails the host.
     SessionStart,
-    /// Print memories related to the user's prompt that this session has not shown yet, and a
-    /// reminder to save when the prompt seems to state a fact. Never fails the host.
+    /// Print memories and page titles related to the user's prompt that this session has not shown
+    /// yet, and a reminder to save when the prompt seems to state a fact. Never fails the host.
     Prompt,
     /// Periodically ask the host to save durable facts. Never fails the host.
     Stop,
@@ -178,6 +186,24 @@ pub struct InstallArgs {
 /// Returns a message for the caller to print when a command fails. Hook commands always return
 /// `Ok`, having already logged any failure.
 /// The server URL and key `memoryos ui` forwards with.
+/// For the "Open in editor" button of `memoryos ui`: [`knowledge::edit`] with the UI's key. With
+/// `approve`, a key that may not approve is retried without it, so the edit waits for review.
+pub async fn edit_page_in_editor(
+    base_url: &str,
+    key: String,
+    scope: &Scope,
+    slug: &str,
+    editor: &str,
+) -> Result<String, String> {
+    let api = api::Api::new(base_url, key, std::time::Duration::from_secs(30))?;
+    knowledge::edit(&api, scope, slug, knowledge::Approve::IfAllowed, editor).await
+}
+
+/// The editor command for `memoryos ui`, from its environment.
+pub fn editor_command() -> Result<String, String> {
+    knowledge::editor_command(&config::process_env)
+}
+
 pub fn ui_connection() -> Result<(String, String), String> {
     let env: config::Env<'_> = &config::process_env;
     Ok((config::base_url(env)?, config::ui_key(env)?))
@@ -226,6 +252,7 @@ pub fn run(command: Command) -> Result<(), String> {
         }) => client::quarantine_list(&scopes.scopes, limit, json),
         Command::Quarantine(QuarantineCommand::Approve { id, json }) => client::approve(id, json),
         Command::Quarantine(QuarantineCommand::Reject { id, json }) => client::reject(id, json),
+        Command::Page(command) => page::run(command),
     }
 }
 
@@ -328,6 +355,26 @@ mod tests {
         assert_eq!((dir, days, json), (None, 14, false));
         assert!(parse(&["stats", "--days", "3", "--dir", "/x", "--json"]).is_ok());
         assert!(parse(&["stats", "--days", "-1"]).is_err());
+    }
+
+    #[test]
+    fn page_commands_are_reachable() {
+        assert!(matches!(
+            parse(&["page", "list"]),
+            Ok(Command::Page(PageCommand::List { .. }))
+        ));
+        assert!(matches!(
+            parse(&["page", "read", "deploy", "--version", "1"]),
+            Ok(Command::Page(PageCommand::Read { .. }))
+        ));
+        assert!(matches!(
+            parse(&["page", "write", "deploy", "--title", "Deploy"]),
+            Ok(Command::Page(PageCommand::Write { .. }))
+        ));
+        assert!(matches!(
+            parse(&["page", "delete", "deploy", "--scope", "shared:team"]),
+            Ok(Command::Page(PageCommand::Delete { .. }))
+        ));
     }
 
     #[test]

@@ -1817,6 +1817,7 @@ async fn recalled(w: &World, scope: &Scope, query: &str) -> Vec<Uuid> {
         limit: 20,
         as_of: None,
         known_at: None,
+        page_limit: memoryos_retrieve::DEFAULT_PAGE_LIMIT,
     };
     retriever
         .recall(&ctx(), request)

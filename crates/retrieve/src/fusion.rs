@@ -68,10 +68,7 @@ fn source_boost(fact: &Fact) -> f64 {
 /// were. The sort is stable, so equal scores keep the order they came in, which is the boosted
 /// fused order. Each moved fact takes the fused score of the position it lands on, so scores stay
 /// descending and on one scale for the whole list.
-pub(crate) fn reordered_by<'a>(
-    ranked: Vec<(&'a Fact, f64)>,
-    scores: &[f32],
-) -> Vec<(&'a Fact, f64)> {
+pub(crate) fn reordered_by<T: Copy>(ranked: Vec<(T, f64)>, scores: &[f32]) -> Vec<(T, f64)> {
     let window = scores.len().min(ranked.len());
     let slot_scores: Vec<f64> = ranked[..window].iter().map(|(_, score)| *score).collect();
     let mut order: Vec<usize> = (0..window).collect();

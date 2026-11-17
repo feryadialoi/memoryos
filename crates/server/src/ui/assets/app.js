@@ -1,12 +1,17 @@
 "use strict";
 
-// Fact text is untrusted. Everything reaches the page through h(), which only ever sets text nodes
-// and attributes, so a planted statement cannot become markup.
+// Fact and page text is untrusted. Everything reaches the page through h(), which only ever sets text
+// nodes and attributes, so a planted statement cannot become markup. Page bodies are markdown, and they
+// are shown as plain text, never rendered.
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const GRAPH_LIMIT = 300;
 const PAGE = 100;
 const REFRESH_MS = 30000;
+const PAGE_LIST_LIMIT = 500;
+const DIFF_CONTEXT = 3;
+const DIFF_MAX_CELLS = 4000000;
+const VERSION_CONFLICT = "The page changed since this edit; reject it and ask for a new edit.";
 
 const S = {
   token: "",
@@ -24,6 +29,14 @@ const S = {
   timeline: null,
   review: null,
   reviewDenied: false,
+  pageReview: null,
+  pageConflicts: new Set(),
+  pendingPages: new Map(),
+  editing: null,
+  pageView: "rendered",
+  pages: null,
+  pageFilter: "",
+  page: null,
   notes: null,
   ask: null,
   drawer: null,
@@ -145,6 +158,11 @@ function scopeParts(scope) {
 
 const current = () => S.scopes.find((item) => item.scope === S.scope) || null;
 
+// Page versions waiting for review, which the server counts apart from facts.
+const pendingPagesIn = (scope) => S.pendingPages.get(scope) || 0;
+const waitingIn = (summary) => summary.quarantined + pendingPagesIn(summary.scope);
+const pagePath = (slug) => `pages/${encodeURIComponent(S.scope)}/${encodeURIComponent(slug)}`;
+
 // ---- API --------------------------------------------------------------------------------------
 
 async function api(path, options) {
@@ -175,13 +193,35 @@ const scopeQuery = (extra) => new URLSearchParams({ scope: S.scope, ...extra }).
 
 // `memoryos setup` keeps an image it already built, so a newer command can meet an older server.
 async function loadScopes() {
-  const body = await api("scopes").catch((error) => {
-    if (error.status !== 404) throw error;
-    throw Object.assign(new Error("Your server is older than this page. Update it with: docker compose -f ~/.config/memoryos/docker-compose.yml up -d --build"), { status: 0 });
-  });
+  const [body, pending] = await Promise.all([
+    api("scopes").catch((error) => {
+      if (error.status !== 404) throw error;
+      throw Object.assign(new Error("Your server is older than this page. Update it with: docker compose -f ~/.config/memoryos/docker-compose.yml up -d --build"), { status: 0 });
+    }),
+    loadPendingPages(),
+  ]);
   S.scopes = body.scopes;
   S.truncated = body.truncated;
+  S.pendingPages = pending;
+  // A scope whose only page waits for its first review is not in the scope list. Show it anyway.
+  for (const scope of pending.keys()) {
+    if (!S.scopes.some((item) => item.scope === scope)) {
+      S.scopes.push({ scope, current: 0, past: 0, quarantined: 0, entities: 0, blocks: 0, pages: 0 });
+    }
+  }
   if (!S.scope || !current()) S.scope = S.scopes[0]?.scope ?? null;
+}
+
+// Counts per scope. Empty for a key that cannot review and for a server from before pages.
+async function loadPendingPages() {
+  const counts = new Map();
+  try {
+    const body = await api(`pages/quarantine?${new URLSearchParams({ scopes: "*", limit: 200 })}`);
+    for (const version of body.versions) counts.set(version.scope, (counts.get(version.scope) || 0) + 1);
+  } catch {
+    // The fact counts still show. The review list itself reports real failures.
+  }
+  return counts;
 }
 
 async function loadHealth() {
@@ -212,6 +252,7 @@ async function loadTab() {
     S.timeline = (await api(`facts?${scopeQuery({ state: "all", limit: GRAPH_LIMIT })}`)).facts;
   }
   if (S.tab === "review") await loadReview();
+  if (S.tab === "pages") await loadPages();
   if (S.tab === "notes") {
     S.notes = (await api(`agents/${encodeURIComponent(scopeParts(S.scope).name)}/blocks`)).blocks;
   }
@@ -219,9 +260,15 @@ async function loadTab() {
 
 async function loadReview() {
   S.reviewDenied = false;
+  const [facts, pages] = await Promise.all([reviewFacts(), reviewPages()]);
+  S.review = facts;
+  S.pageReview = pages;
+}
+
+async function reviewFacts() {
   try {
     const body = await api(`quarantine?${new URLSearchParams({ scopes: S.scope, limit: 200 })}`);
-    S.review = await Promise.all(body.facts.map(async (fact) => {
+    return await Promise.all(body.facts.map(async (fact) => {
       const [replaces, source] = await Promise.all([
         fact.pending_supersede_of ? api(`facts/${fact.pending_supersede_of}`).catch(() => null) : null,
         fact.source_episode_ids[0] ? api(`episodes/${fact.source_episode_ids[0]}`).catch(() => null) : null,
@@ -230,9 +277,45 @@ async function loadReview() {
     }));
   } catch (error) {
     if (error.status !== 403) throw error;
-    S.review = [];
     S.reviewDenied = true;
+    return [];
   }
+}
+
+// Each pending version with the page's current version number, so an edit made over an older
+// version is flagged before anyone presses Approve.
+async function reviewPages() {
+  let body;
+  try {
+    body = await api(`pages/quarantine?${new URLSearchParams({ scopes: S.scope, limit: 200 })}`);
+  } catch (error) {
+    // 403: a key that cannot review, reported with the facts. 404: a server from before pages.
+    if (error.status === 403 || error.status === 404) return [];
+    throw error;
+  }
+  const slugs = [...new Set(body.versions.map((version) => version.slug))];
+  const currents = new Map(await Promise.all(slugs.map(async (slug) => {
+    const page = await api(pagePath(slug)).catch(() => null);
+    return [slug, page ? page.version : null];
+  })));
+  return body.versions.map((version) => ({ version, current: currents.get(version.slug) ?? null }));
+}
+
+async function loadPages() {
+  const body = await api(`pages?${scopeQuery({ limit: PAGE_LIST_LIMIT })}`);
+  S.pages = body.pages;
+  if (S.page) await loadPage(S.page.slug, S.page.version);
+}
+
+async function loadPage(slug, version) {
+  const path = pagePath(slug);
+  const [page, versions] = await Promise.all([
+    api(version ? `${path}?${new URLSearchParams({ version })}` : path),
+    api(`${path}/versions`),
+  ]);
+  if (S.page?.slug !== slug || S.page.version !== version) return;
+  S.page.data = page;
+  S.page.versions = versions.versions;
 }
 
 // ---- Actions ----------------------------------------------------------------------------------
@@ -256,6 +339,8 @@ function selectScope(scope) {
   S.selectedNode = null;
   S.facts = [];
   S.graph = S.timeline = S.review = S.notes = null;
+  S.pageReview = S.pages = S.page = null;
+  S.pageFilter = "";
   const summary = current();
   if (S.tab === "notes" && !summary?.blocks) S.tab = "facts";
   render();
@@ -263,6 +348,7 @@ function selectScope(scope) {
 }
 
 function selectTab(tab) {
+  if (tab === "pages" && S.tab === "pages") S.page = null;
   S.tab = tab;
   S.ask = null;
   render();
@@ -300,6 +386,96 @@ function closeDrawer() {
   render();
 }
 
+function openPage(slug, version) {
+  S.page = { slug, version: version || null, data: null, versions: null };
+  S.tab = "pages";
+  S.ask = null;
+  render();
+  document.getElementById("body")?.scrollTo(0, 0);
+  return guarded(async () => {
+    if (S.pages === null) S.pages = (await api(`pages?${scopeQuery({ limit: PAGE_LIST_LIMIT })}`)).pages;
+    await loadPage(slug, version || null);
+    render();
+  });
+}
+
+// "Open in editor": the local UI server opens the page in the editor `memoryos ui` was started
+// with, and saves a new version when it closes. This polls until then.
+async function editInEditor(slug, scope = S.scope) {
+  const query = new URLSearchParams({ scope, slug });
+  const local = async (method) => {
+    const response = await fetch(method === "POST" ? "/local/edit" : `/local/edit?${query}`, {
+      method,
+      headers: { "X-MemoryOS-UI": S.token, "Content-Type": "application/json" },
+      body: method === "POST" ? JSON.stringify({ scope, slug }) : undefined,
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(body?.error?.message || `Request failed with status ${response.status}`);
+    return body;
+  };
+  try {
+    const started = await local("POST");
+    S.editing = slug;
+    render();
+    toast(`Opened in ${started.editor}. Save and close it to make a new version.`);
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      const status = await local("GET");
+      if (status.editing) continue;
+      if (status.error) toast(status.error, true);
+      else if (status.saved) toast(status.saved);
+      break;
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+  if (S.editing === slug) S.editing = null;
+  if (scope !== S.scope) {
+    // A new space exists once its first page is saved. Show it, or say why it is not there.
+    await guarded(async () => {
+      await loadScopes();
+      if (S.scopes.some((item) => item.scope === scope)) {
+        S.tab = "pages";
+        await selectScope(scope);
+      } else {
+        toast(`${scope} was not created: nothing was saved`, true);
+        render();
+      }
+    });
+    return;
+  }
+  await guarded(async () => { S.pendingPages = await loadPendingPages(); await loadPages(); render(); });
+}
+
+function closePage() {
+  S.page = null;
+  render();
+  return guarded(async () => { await loadPages(); render(); });
+}
+
+const pendingKey = (version) => `${version.page_id}/${version.version}`;
+
+async function decidePage(version, action) {
+  const key = pendingKey(version);
+  await guarded(async () => {
+    try {
+      await api(`pages/quarantine/${version.page_id}/${version.version}/${action}`, { method: "POST" });
+    } catch (error) {
+      if (error.code !== "version_conflict") throw error;
+      S.pageConflicts.add(key);
+      toast(VERSION_CONFLICT, true);
+      return;
+    }
+    S.pageConflicts.delete(key);
+    toast(action === "approve" ? "Approved. This is now the page your agent reads." : "Rejected. The page stays as it was.");
+    if (S.page?.slug === version.slug) S.page = null;
+    S.pages = null;
+    await Promise.all([loadScopes(), loadReview()]);
+  });
+  // Also after a failure, so the buttons are enabled again.
+  render();
+}
+
 async function decide(id, action) {
   await guarded(async () => {
     await api(`quarantine/${id}/${action}`, { method: "POST" });
@@ -316,7 +492,7 @@ async function refresh(quiet) {
     await Promise.all([loadScopes(), loadHealth()]);
     const recovered = Boolean(S.offline);
     S.offline = null;
-    const signature = JSON.stringify(S.scopes);
+    const signature = JSON.stringify([S.scopes, [...S.pendingPages]]);
     const changed = recovered || signature !== S.signature;
     S.signature = signature;
     if (!quiet || changed) {
@@ -360,6 +536,7 @@ function renderRail() {
       h("img", { class: "brand-mark", alt: "", src: document.querySelector("link[rel=icon]").href }), "MemoryOS"),
     groups.map(([kind, title]) => {
       const items = S.scopes.filter((item) => scopeParts(item.scope).kind === kind);
+      if (kind === "shared") return h("div", { class: "rail-group" }, h("h2", {}, title), items.map(renderSpace), renderNewSpace());
       if (!items.length) return null;
       return h("div", { class: "rail-group" }, h("h2", {}, title), items.map(renderSpace));
     }),
@@ -370,6 +547,64 @@ function renderRail() {
   ]);
 }
 
+const PAGE_NAME = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+const SPACE_NAME = /^[A-Za-z0-9_.-]{1,128}$/;
+
+// A modal form on the native <dialog>: a backdrop, focus kept inside, Esc closes it. Each field has
+// a label, a hint and a check; `onSubmit` gets the trimmed values once every check passes.
+function openDialog({ title, intro, fields, submit, onSubmit }) {
+  const inputs = fields.map((field) => h("input", {
+    class: "dialog-input", id: `dialog-${field.name}`, placeholder: field.placeholder, autocomplete: "off", spellcheck: "false",
+  }));
+  const error = h("p", { class: "dialog-error", role: "alert" });
+  const close = () => dialog.close();
+  const send = () => {
+    const values = inputs.map((input) => input.value.trim());
+    for (const [i, field] of fields.entries()) {
+      if (!field.check.test(values[i])) {
+        error.textContent = field.problem;
+        inputs[i].focus();
+        return;
+      }
+    }
+    close();
+    onSubmit(...values);
+  };
+  const dialog = h("dialog", { class: "dialog", "aria-labelledby": "dialog-title" },
+    h("h2", { id: "dialog-title", class: "dialog-title" }, title),
+    intro && h("p", { class: "dialog-intro" }, intro),
+    fields.map((field, i) => h("label", { class: "dialog-field", for: `dialog-${field.name}` },
+      h("span", { class: "dialog-label" }, field.label), inputs[i],
+      h("span", { class: "dialog-hint" }, field.hint))),
+    error,
+    h("div", { class: "dialog-actions" },
+      h("button", { class: "btn", onclick: close }, "Cancel"),
+      h("button", { class: "btn primary", onclick: send }, submit)));
+  dialog.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); send(); } });
+  dialog.addEventListener("close", () => dialog.remove());
+  document.body.append(dialog);
+  dialog.showModal();
+  inputs[0].focus();
+}
+
+// "+ New space": a shared space and its first page. The space exists once that page is saved.
+function renderNewSpace() {
+  const start = () => openDialog({
+    title: "New space",
+    intro: "A shared space holds knowledge pages, like a team space. It is created when you save its first page.",
+    fields: [
+      { name: "space", label: "Space name", placeholder: "ops", hint: "Letters, digits, '.', '_' and '-'.", check: SPACE_NAME,
+        problem: "Name the space with letters, digits, '.', '_' and '-', such as ops." },
+      { name: "page", label: "First page", placeholder: "overview", hint: "Lowercase letters, digits, '.', '_' and '-'.", check: PAGE_NAME,
+        problem: "Name the first page with lowercase letters, digits, '.', '_' and '-', such as overview." },
+    ],
+    submit: "Write first page",
+    onSubmit: (space, page) => editInEditor(page, `shared:${space}`),
+  });
+  return h("button", { class: "space new-space", onclick: start },
+    h("span", { class: "space-avatar" }, "+"), h("span", { class: "space-name" }, "New space"));
+}
+
 function renderSpace(item) {
   const { name } = scopeParts(item.scope);
   return h("button", {
@@ -378,7 +613,7 @@ function renderSpace(item) {
   },
     h("span", { class: "space-avatar" }, name.slice(0, 1)),
     h("span", { class: "space-name" }, name),
-    item.quarantined > 0 && h("span", { class: "review-dot", title: `${item.quarantined} waiting for review` }),
+    waitingIn(item) > 0 && h("span", { class: "review-dot", title: `${waitingIn(item)} waiting for review` }),
     h("span", { class: "space-count" }, item.current));
 }
 
@@ -400,7 +635,8 @@ function renderHead() {
     return h("header", { class: "head" }, h("div", { class: "head-top" }, h("h1", {}, "MemoryOS")));
   }
   const { name, kind } = scopeParts(summary.scope);
-  const tabs = [["facts", "Facts"], ["map", "Map"], ["timeline", "Timeline"], ["review", "Review"]];
+  const waiting = waitingIn(summary);
+  const tabs = [["facts", "Facts"], ["map", "Map"], ["timeline", "Timeline"], ["pages", "Knowledge"], ["review", "Review"]];
   if (summary.blocks > 0) tabs.push(["notes", "Agent notes"]);
   return h("header", { class: "head" },
     h("select", {
@@ -411,7 +647,7 @@ function renderHead() {
     h("div", { class: "stats" },
       stat(summary.current, "Known now", () => showFacts("current")),
       stat(summary.past, "Replaced or ended", () => showFacts("past")),
-      stat(summary.quarantined, "Waiting for review", () => selectTab("review"), summary.quarantined > 0),
+      stat(waiting, "Waiting for review", () => selectTab("review"), waiting > 0),
       stat(summary.entities, "People and things", () => selectTab("map"))),
     h("div", { class: "ask" }, icon(ICONS.search),
       h("input", {
@@ -426,7 +662,9 @@ function renderHead() {
     h("nav", { class: "tabs", role: "tablist" }, tabs.map(([key, label]) => h("button", {
       class: "tab", role: "tab", "aria-selected": !S.ask && S.tab === key ? "true" : "false",
       onclick: () => selectTab(key),
-    }, label, key === "review" && summary.quarantined > 0 && h("span", { class: "tab-badge" }, summary.quarantined)))));
+    }, label,
+    key === "pages" && summary.pages > 0 && h("span", { class: "tab-count" }, summary.pages),
+    key === "review" && waiting > 0 && h("span", { class: "tab-badge" }, waiting)))));
 }
 
 function stat(value, label, onclick, attention) {
@@ -448,7 +686,7 @@ function renderBody() {
   if (!body) return;
   if (!S.scope) { body.replaceChildren(welcome()); return; }
   if (S.ask) { body.replaceChildren(renderAsk()); return; }
-  const views = { facts: renderFacts, map: renderMap, timeline: renderTimeline, review: renderReview, notes: renderNotes };
+  const views = { facts: renderFacts, map: renderMap, timeline: renderTimeline, pages: renderPages, review: renderReview, notes: renderNotes };
   body.replaceChildren(views[S.tab]());
 }
 
@@ -836,13 +1074,25 @@ function renderTimeline() {
 // ---- Review -----------------------------------------------------------------------------------
 
 function renderReview() {
-  if (S.review === null) return loading();
+  if (S.review === null || S.pageReview === null) return loading();
   if (S.reviewDenied) return empty("Review needs the admin key", "This page is using a key that cannot review. Run memoryos setup to create the admin key.");
-  if (!S.review.length) return empty("All clear", "Nothing is waiting. Facts held back from your agent's memory will show up here for you to decide.");
+  if (!S.review.length && !S.pageReview.length) {
+    return empty("All clear", "Nothing is waiting. Facts and page edits held back from your agent's memory will show up here for you to decide.");
+  }
+  const both = S.review.length > 0 && S.pageReview.length > 0;
   return h("div", {},
     h("div", { class: "toolbar" }, h("span", { class: "toolbar-note", css: { "margin-left": "0" } },
       "Your agent cannot recall these until you approve them. Check the source: outside content can try to plant false facts.")),
-    S.review.map(({ fact, replaces, source }) => h("article", { class: "card" },
+    S.pageReview.length > 0 && h("section", { class: "group" },
+      both && h("div", { class: "group-title" }, "Page edits", h("span", { class: "kind-tag" }, S.pageReview.length)),
+      S.pageReview.map(renderPageEdit)),
+    S.review.length > 0 && h("section", { class: "group" },
+      both && h("div", { class: "group-title" }, "Facts", h("span", { class: "kind-tag" }, S.review.length)),
+      renderFactReview()));
+}
+
+function renderFactReview() {
+  return S.review.map(({ fact, replaces, source }) => h("article", { class: "card" },
       h("div", { class: "card-title" }, fact.statement),
       h("div", { class: "meta" }, h("span", {}, humanize(fact.predicate)), h("span", {}, TRUST[fact.trust][0]), h("span", {}, `added ${ago(fact.recorded_at)}`)),
       replaces && h("div", { class: "quote" }, h("span", { class: "quote-label" }, "Would replace"), replaces.statement),
@@ -850,7 +1100,261 @@ function renderReview() {
       h("div", { class: "actions" },
         h("button", { class: "btn primary", onclick: (event) => { event.target.disabled = true; decide(fact.id, "approve"); } }, "Approve"),
         h("button", { class: "btn danger", onclick: (event) => { event.target.disabled = true; decide(fact.id, "reject"); } }, "Reject"),
-        h("button", { class: "link-btn", css: { "margin-left": "auto" }, onclick: () => openFact(fact.id) }, "Details")))));
+        h("button", { class: "link-btn", css: { "margin-left": "auto" }, onclick: () => openFact(fact.id) }, "Details"))));
+}
+
+function renderPageEdit({ version, current }) {
+  const stale = version.base_version !== current;
+  const conflict = S.pageConflicts.has(pendingKey(version)) || stale;
+  const isNew = version.base_version === null;
+  const pruned = !isNew && version.base_body === null;
+  let base;
+  if (isNew) base = current === null ? "New page" : `New page, but version ${current} now exists`;
+  else base = `Edits version ${version.base_version}${stale ? `, current is ${current ?? "none"}` : ""}`;
+  return h("article", { class: "card" },
+    h("div", { class: "card-title" }, version.title),
+    h("div", { class: "meta" },
+      h("span", { class: "slug" }, version.slug),
+      h("span", {}, `version ${version.version}`),
+      h("span", {}, base),
+      h("span", {}, TRUST[version.trust]?.[0] || version.trust),
+      h("span", {}, `by ${version.edited_by}`),
+      h("span", {}, `added ${ago(version.edited_at)}`)),
+    version.summary && h("div", { class: "quote" }, h("span", { class: "quote-label" }, "What changed"), version.summary),
+    conflict && h("div", { class: "alert", role: "alert" }, VERSION_CONFLICT),
+    pruned && h("p", { class: "help diff-note" }, `Version ${version.base_version} is no longer kept, so the whole new text is shown.`),
+    renderDiff(isNew || pruned ? "" : version.base_body, version.body),
+    h("div", { class: "actions" },
+      h("button", { class: "btn primary", onclick: (event) => { event.target.disabled = true; decidePage(version, "approve"); } }, "Approve"),
+      h("button", { class: "btn danger", onclick: (event) => { event.target.disabled = true; decidePage(version, "reject"); } }, "Reject"),
+      current !== null && h("button", {
+        class: "link-btn", css: { "margin-left": "auto" },
+        onclick: () => openPage(version.slug),
+      }, "Read current page")));
+}
+
+// ---- Line diff --------------------------------------------------------------------------------
+
+// A final line end does not start another line.
+const splitLines = (text) => (text === "" ? [] : text.replace(/\r\n/g, "\n").replace(/\n$/, "").split("\n"));
+
+// A longest common subsequence over lines, after trimming what both ends share. A change too large
+// for the table is shown as every old line removed and every new line added.
+function lineDiff(before, after) {
+  const a = splitLines(before);
+  const b = splitLines(after);
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+  let endA = a.length;
+  let endB = b.length;
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA--; endB--; }
+  const head = a.slice(0, start).map((text) => ({ kind: "same", text }));
+  const tail = a.slice(endA).map((text) => ({ kind: "same", text }));
+  const x = a.slice(start, endA);
+  const y = b.slice(start, endB);
+  const n = x.length;
+  const m = y.length;
+  const middle = [];
+  if ((n + 1) * (m + 1) > DIFF_MAX_CELLS) {
+    for (const text of x) middle.push({ kind: "del", text });
+    for (const text of y) middle.push({ kind: "add", text });
+    return head.concat(middle, tail);
+  }
+  const width = m + 1;
+  const table = new Uint32Array((n + 1) * width);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      table[i * width + j] = x[i] === y[j]
+        ? table[(i + 1) * width + j + 1] + 1
+        : Math.max(table[(i + 1) * width + j], table[i * width + j + 1]);
+    }
+  }
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (x[i] === y[j]) { middle.push({ kind: "same", text: x[i] }); i++; j++; }
+    else if (table[(i + 1) * width + j] >= table[i * width + j + 1]) middle.push({ kind: "del", text: x[i++] });
+    else middle.push({ kind: "add", text: y[j++] });
+  }
+  while (i < n) middle.push({ kind: "del", text: x[i++] });
+  while (j < m) middle.push({ kind: "add", text: y[j++] });
+  return head.concat(middle, tail);
+}
+
+function renderDiff(before, after) {
+  const lines = lineDiff(before, after);
+  const added = lines.filter((line) => line.kind === "add").length;
+  const removed = lines.filter((line) => line.kind === "del").length;
+  const rows = [];
+  let at = 0;
+  while (at < lines.length) {
+    if (lines[at].kind !== "same") { rows.push(diffLine(lines[at])); at++; continue; }
+    let end = at;
+    while (end < lines.length && lines[end].kind === "same") end++;
+    const keepBefore = at === 0 ? 0 : DIFF_CONTEXT;
+    const keepAfter = end === lines.length ? 0 : DIFF_CONTEXT;
+    if (end - at > keepBefore + keepAfter + 1) {
+      for (let k = at; k < at + keepBefore; k++) rows.push(diffLine(lines[k]));
+      const hidden = end - at - keepBefore - keepAfter;
+      rows.push(h("div", { class: "diff-gap" }, `${hidden} unchanged line${hidden === 1 ? "" : "s"}`));
+      for (let k = end - keepAfter; k < end; k++) rows.push(diffLine(lines[k]));
+    } else {
+      for (let k = at; k < end; k++) rows.push(diffLine(lines[k]));
+    }
+    at = end;
+  }
+  return h("div", { class: "diff-wrap" },
+    h("div", { class: "diff-head" },
+      h("span", { class: "diff-count add" }, `+${added}`),
+      h("span", { class: "diff-count del" }, `-${removed}`),
+      h("span", {}, added || removed ? "lines changed" : "The text is unchanged")),
+    rows.length > 0 && h("div", { class: "diff", role: "table", "aria-label": "Changes to the page text" }, rows));
+}
+
+function diffLine({ kind, text }) {
+  const sign = { add: "+", del: "-", same: " " }[kind];
+  const label = { add: "Added", del: "Removed", same: "Unchanged" }[kind];
+  return h("div", { class: `diff-line ${kind}`, role: "row", "aria-label": label },
+    h("span", { class: "diff-sign", "aria-hidden": "true" }, sign),
+    h("span", { class: "diff-text" }, text));
+}
+
+// ---- Pages ------------------------------------------------------------------------------------
+
+const VERSION_STATUS = {
+  active: ["Current", "current"],
+  superseded: ["Older", "past"],
+  quarantined: ["Waiting for review", "waiting"],
+  rejected: ["Rejected", "bad"],
+};
+
+// "New page": a name, then the editor opens on an empty page; saving creates it.
+function renderNewPage() {
+  const scope = S.scope;
+  const start = () => openDialog({
+    title: "New page",
+    intro: `In ${scope}. Your editor opens on an empty page; save and close it to create the page.`,
+    fields: [
+      { name: "page", label: "Page name", placeholder: "deploy-guide", hint: "Lowercase letters, digits, '.', '_' and '-'. The title goes at the top of the page.",
+        check: PAGE_NAME, problem: "Use lowercase letters, digits, '.', '_' and '-', such as deploy-guide." },
+    ],
+    submit: "Open in editor",
+    onSubmit: (slug) => editInEditor(slug, scope),
+  });
+  return h("button", { class: "btn", onclick: start }, "New page");
+}
+
+function renderPages() {
+  if (S.page) return renderPage();
+  if (S.pages === null) return loading();
+  const pending = pendingPagesIn(S.scope);
+  const waiting = pending > 0 && h("button", { class: "link-btn", onclick: () => selectTab("review") },
+    `${pending} edit${pending === 1 ? "" : "s"} waiting for review`);
+  if (!S.pages.length) {
+    return h("div", { class: "empty" }, h("h2", {}, "No pages yet"),
+      h("p", {}, "Runbooks, guides and other pages for this space show up here. Start one with New page, or let your agent write one."),
+      h("p", { css: { "margin-top": "10px" } }, renderNewPage()),
+      waiting && h("p", { css: { "margin-top": "10px" } }, waiting));
+  }
+  const toolbar = h("div", { class: "toolbar" },
+    h("input", {
+      class: "filter", type: "search", placeholder: "Filter pages", "aria-label": "Filter pages", value: S.pageFilter,
+      oninput: (event) => {
+        S.pageFilter = event.target.value;
+        document.getElementById("page-results")?.replaceChildren(renderPageRows());
+      },
+    }),
+    waiting,
+    renderNewPage(),
+    h("span", { class: "toolbar-note" }, S.pages.length >= PAGE_LIST_LIMIT ? `First ${PAGE_LIST_LIMIT} pages by name` : `${S.pages.length} page${S.pages.length === 1 ? "" : "s"}`));
+  return h("div", {}, toolbar, h("div", { id: "page-results" }, renderPageRows()));
+
+  function renderPageRows() {
+    const needle = S.pageFilter.toLowerCase();
+    const list = S.pages.filter((page) => !needle || page.title.toLowerCase().includes(needle) || page.slug.includes(needle));
+    if (!list.length) return empty("No match", "No page title or name matches this filter.");
+    return h("div", { class: "list" }, list.map((page) => h("button", { class: "row", onclick: () => openPage(page.slug) },
+      h("div", { class: "row-text" }, page.title),
+      h("div", { class: "meta" },
+        h("span", { class: "slug" }, page.slug),
+        h("span", {}, `version ${page.version}`),
+        h("span", {}, `edited ${ago(page.edited_at)}`)))));
+  }
+}
+
+function renderPage() {
+  const { slug, version, data, versions } = S.page;
+  const back = h("div", { class: "toolbar" },
+    h("button", { class: "link-btn", onclick: closePage }, "All pages"),
+    h("span", { class: "toolbar-note slug" }, slug));
+  if (!data || !versions) return h("div", {}, back, loading());
+  const latest = versions.find((item) => item.status === "active");
+  const older = version !== null && data.status !== "active";
+  return h("div", {}, back,
+    h("div", { class: "page-layout" },
+      h("article", { class: "card page-card" },
+        older && h("div", { class: "notice" },
+          h("span", {}, `You are reading version ${data.version}, which was replaced.`),
+          latest && h("button", { class: "link-btn", onclick: () => openPage(slug) }, `Read version ${latest.version}, the current one`)),
+        h("div", { class: "page-head" },
+          h("h2", { class: "page-title" }, data.title),
+          !older && h("button", {
+            class: "btn",
+            disabled: S.editing === slug,
+            onclick: () => editInEditor(slug),
+          }, S.editing === slug ? "Open in your editor" : "Open in editor")),
+        h("div", { class: "meta" },
+          h("span", { class: `pill ${older ? "past" : "current"}` }, older ? "Older version" : "Current"),
+          h("span", {}, `version ${data.version}`),
+          h("span", {}, TRUST[data.trust]?.[0] || data.trust),
+          h("span", {}, `by ${data.edited_by}`),
+          h("span", { title: data.edited_at }, `edited ${ago(data.edited_at)}`)),
+        data.summary && h("div", { class: "quote" }, h("span", { class: "quote-label" }, "What changed"), data.summary),
+        renderPageBody(data.body)),
+      h("aside", { class: "card versions" },
+        h("h3", {}, "Versions"),
+        versions.map((item) => renderVersionRow(item, data.version)))));
+}
+
+function isDark() {
+  const theme = document.documentElement.dataset.theme;
+  return theme === "dark" || (!theme && matchMedia("(prefers-color-scheme: dark)").matches);
+}
+
+// Rendered markdown with diagrams, or the raw text. The choice is remembered.
+function renderPageBody(body) {
+  const view = S.pageView;
+  const pick = (value, label) => h("button", {
+    class: `seg${view === value ? " on" : ""}`, "aria-pressed": view === value ? "true" : "false",
+    onclick: () => { S.pageView = value; storageSet(localStorage, "memoryos-page-view", value); render(); },
+  }, label);
+  const switcher = h("div", { class: "segmented", role: "group", "aria-label": "Page view" },
+    pick("rendered", "Rendered"), pick("markdown", "Markdown"));
+  if (view === "markdown") {
+    return h("div", {}, switcher, h("pre", { class: "page-body", "aria-label": "Page text" }, body));
+  }
+  const rendered = Markdown.render(body);
+  rendered.classList.add("page-rendered");
+  Markdown.renderMermaid(rendered, isDark());
+  return h("div", {}, switcher, rendered);
+}
+
+function renderVersionRow(item, shown) {
+  const [label, kind] = VERSION_STATUS[item.status] || [item.status, "past"];
+  const readable = item.status === "active" || item.status === "superseded";
+  const content = [
+    h("div", { class: "version-top" }, h("strong", {}, `Version ${item.version}`), h("span", { class: `pill ${kind}` }, label)),
+    h("div", { class: "meta" }, h("span", {}, `by ${item.edited_by}`), h("span", {}, ago(item.edited_at))),
+    item.summary && h("div", { class: "version-summary" }, item.summary),
+  ];
+  if (item.status === "quarantined") {
+    return h("button", { class: "version-row", title: "Open Review to decide", onclick: () => selectTab("review") }, content);
+  }
+  if (!readable) return h("div", { class: "version-row muted" }, content);
+  return h("button", {
+    class: "version-row", "aria-current": item.version === shown ? "true" : null,
+    onclick: () => openPage(S.page.slug, item.status === "active" ? null : item.version),
+  }, content);
 }
 
 function renderNotes() {
@@ -939,6 +1443,7 @@ document.addEventListener("keydown", (event) => {
 addEventListener("hashchange", () => { if (/t=/.test(location.hash)) location.reload(); });
 
 async function start() {
+  S.pageView = storageGet(localStorage, "memoryos-page-view") === "markdown" ? "markdown" : "rendered";
   const theme = storageGet(localStorage, "memoryos-theme");
   if (theme) document.documentElement.dataset.theme = theme;
   const match = location.hash.match(/t=([^&]+)/);
@@ -953,7 +1458,7 @@ async function start() {
   if (!S.token) return;
   await guarded(async () => {
     await Promise.all([loadScopes(), loadHealth()]);
-    S.signature = JSON.stringify(S.scopes);
+    S.signature = JSON.stringify([S.scopes, [...S.pendingPages]]);
     render();
     await loadTab();
     render();

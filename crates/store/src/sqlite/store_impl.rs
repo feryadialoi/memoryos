@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use memoryos_core::{
     normalize_name, ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, FactFilter, FactOp,
-    FactStatus, GraphNeighborhood, MemoryStore, NewEntity, NewEpisode, PurgeReport, RequestContext,
+    FactStatus, GraphNeighborhood, MemoryStore, NewEntity, NewEpisode, NewPageVersion, Page,
+    PageSectionHit, PageSummary, PageVersion, PendingPageVersion, PurgeReport, RequestContext,
     Result, Scope, ScoredFact, Trust,
 };
 use serde_json::{json, Value};
@@ -16,7 +17,7 @@ use sqlx::{AssertSqlSafe, Row, SqliteConnection};
 use uuid::Uuid;
 
 use super::rows::{self, API_KEY_COLS, BLOCK_COLS, ENTITY_COLS, EPISODE_COLS, FACT_COLS};
-use super::{db, embedding, facts, json_array, storable, uuid_strings, SqliteStore};
+use super::{db, embedding, facts, json_array, pages, storable, uuid_strings, SqliteStore};
 
 const MAX_GRAPH_EDGES: i64 = 5000;
 const MAX_SUBJECT_FACTS: i64 = 200;
@@ -1121,6 +1122,99 @@ impl MemoryStore for SqliteStore {
         Ok(result)
     }
 
+    async fn list_pages(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        prefix: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<PageSummary>> {
+        pages::list_pages(self, ctx, scope, prefix, limit).await
+    }
+
+    async fn get_page(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        slug: &str,
+        version: Option<i64>,
+    ) -> Result<Page> {
+        pages::get_page(self, ctx, scope, slug, version).await
+    }
+
+    async fn get_page_version(
+        &self,
+        ctx: &RequestContext,
+        page_id: Uuid,
+        version: i64,
+    ) -> Result<PageVersion> {
+        pages::get_page_version(self, ctx, page_id, version).await
+    }
+
+    async fn put_page(&self, ctx: &RequestContext, page: NewPageVersion) -> Result<PageVersion> {
+        pages::put_page(self, ctx, page).await
+    }
+
+    async fn page_versions(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        slug: &str,
+    ) -> Result<Vec<PageVersion>> {
+        pages::page_versions(self, ctx, scope, slug).await
+    }
+
+    async fn delete_page(&self, ctx: &RequestContext, scope: &Scope, slug: &str) -> Result<()> {
+        pages::delete_page(self, ctx, scope, slug).await
+    }
+
+    async fn list_quarantined_pages(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        limit: i64,
+    ) -> Result<Vec<PendingPageVersion>> {
+        pages::list_quarantined_pages(self, ctx, scopes, limit).await
+    }
+
+    async fn approve_page_version(
+        &self,
+        ctx: &RequestContext,
+        page_id: Uuid,
+        version: i64,
+    ) -> Result<Page> {
+        pages::approve_page_version(self, ctx, page_id, version).await
+    }
+
+    async fn reject_page_version(
+        &self,
+        ctx: &RequestContext,
+        page_id: Uuid,
+        version: i64,
+    ) -> Result<PageVersion> {
+        pages::reject_page_version(self, ctx, page_id, version).await
+    }
+
+    async fn search_page_sections_vector(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<PageSectionHit>> {
+        pages::search_page_sections_vector(self, ctx, scopes, embedding, limit).await
+    }
+
+    async fn search_page_sections_text(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<PageSectionHit>> {
+        pages::search_page_sections_text(self, ctx, scopes, query, limit).await
+    }
+
     async fn find_api_key(&self, key_hash: &str) -> Result<Option<ApiKey>> {
         let sql = format!(
             "SELECT {API_KEY_COLS} FROM api_keys WHERE key_hash = ?1 AND revoked_at IS NULL"
@@ -1246,7 +1340,7 @@ fn decode_json<T: serde::de::DeserializeOwned>(row: &SqliteRow, column: &str) ->
 /// them, because FTS5 would read them as a phrase that matches no row. FTS5 has no standalone NOT,
 /// so an OR group made only of negated terms is dropped; a query of only such groups matches
 /// nothing.
-fn safe_match_query(input: &str) -> Option<String> {
+pub(super) fn safe_match_query(input: &str) -> Option<String> {
     struct Term {
         negated: bool,
         quoted: bool,

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 mod backend;
 mod facts;
+mod pages;
 mod rows;
 mod sqlite;
 mod store_impl;
@@ -77,6 +78,19 @@ impl PgStore {
         Ok(result)
     }
 
+    /// Every scope holding a page in any state, including pages whose only versions wait for
+    /// review, which `scope_summaries` does not count. For expanding scope patterns.
+    pub async fn page_scopes(&self, ctx: &RequestContext) -> Result<Vec<Scope>> {
+        let mut tx = self.tenant_tx(ctx).await?;
+        let found: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT scope FROM pages ORDER BY scope")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        found.iter().map(|scope| scope.parse()).collect()
+    }
+
     /// Every scope of the tenant with its counts. Scans the tenant's facts, so it is for occasional
     /// reads and not a hot path.
     pub async fn scope_summaries(&self, ctx: &RequestContext) -> Result<Vec<ScopeSummary>> {
@@ -104,6 +118,7 @@ impl PgStore {
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(db)?;
+        let pages = pages::count_by_scope(&mut tx).await?;
         tx.commit().await.map_err(db)?;
 
         fn entry<'a>(
@@ -118,6 +133,7 @@ impl PgStore {
                 quarantined: 0,
                 entities: 0,
                 blocks: 0,
+                pages: 0,
                 last_recorded_at: None,
             }))
         }
@@ -137,6 +153,9 @@ impl PgStore {
         }
         for (scope, count) in blocks {
             entry(&mut all, &scope)?.blocks = count;
+        }
+        for (scope, count) in pages {
+            entry(&mut all, &scope)?.pages = count;
         }
         Ok(all.into_values().collect())
     }

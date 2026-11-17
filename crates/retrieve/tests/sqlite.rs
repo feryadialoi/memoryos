@@ -93,3 +93,12 @@ async fn sqlite_other_tenant_is_absent() {
     let fixture = fixture().await;
     fixture.scenario().other_tenant_is_absent().await;
 }
+
+#[tokio::test]
+async fn sqlite_pages_are_ranked_apart_and_only_current() {
+    let fixture = fixture().await;
+    fixture
+        .scenario()
+        .pages_are_ranked_apart_and_only_current()
+        .await;
+}

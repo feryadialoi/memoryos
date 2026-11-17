@@ -217,6 +217,9 @@ async fn tools_list_differs_by_mode() {
             "block_replace",
             "commit_facts",
             "graph_neighbors",
+            "page_list",
+            "page_read",
+            "page_write",
             "recall",
             "recall_candidates"
         ]

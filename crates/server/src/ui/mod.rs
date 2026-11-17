@@ -10,19 +10,22 @@
 //!   fragment, which is never sent over the network, and another site can neither read it nor send
 //!   that header without a CORS preflight, which this never approves.
 //!
-//! Fact text is untrusted: agents write it, and it can quote hostile pages. `app.js` only ever sets it
+//! Fact and page text is untrusted: agents write it, and it can quote hostile pages. `app.js` only ever sets it
 //! as text, and the content security policy below refuses inline scripts as a second layer.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use memoryos_core::{validate_slug, Scope};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -35,12 +38,21 @@ const DEFAULT_PORT: u16 = 7878;
 const TOKEN_HEADER: &str = "x-memoryos-ui";
 const MAX_BODY: usize = 1024 * 1024;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+/// `style-src 'unsafe-inline'` is for Mermaid, which styles the SVG it draws inline. Scripts stay
+/// `'self'` only, so page text still cannot run code.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; \
+    style-src 'self' 'unsafe-inline'; \
     connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_JS: &str = include_str!("assets/app.js");
+const MARKDOWN_JS: &str = include_str!("assets/markdown.js");
+/// Mermaid 11.4.1 (MIT, `assets/vendor/mermaid.LICENSE`), loaded only when a page has a diagram.
+const MERMAID_JS: &str = include_str!("assets/vendor/mermaid.min.js");
 const STYLE_CSS: &str = include_str!("assets/style.css");
+
+/// Page edits by `scope/slug`: `None` while the editor is open, then the outcome.
+type Edits = Arc<Mutex<HashMap<String, Option<Result<String, String>>>>>;
 
 #[derive(Clone)]
 pub struct UiState {
@@ -49,6 +61,9 @@ pub struct UiState {
     token_hash: [u8; 32],
     allowed_hosts: [String; 2],
     client: reqwest::Client,
+    /// The command "Open in editor" runs, from this process's environment.
+    editor: Option<String>,
+    edits: Edits,
 }
 
 impl UiState {
@@ -69,6 +84,8 @@ impl UiState {
             token_hash: digest(token),
             allowed_hosts: [format!("127.0.0.1:{port}"), format!("localhost:{port}")],
             client,
+            editor: memoryos_hooks::editor_command().ok(),
+            edits: Arc::default(),
         })
     }
 }
@@ -85,10 +102,19 @@ pub fn router(state: UiState) -> Router {
             get(|| asset(APP_JS, "text/javascript; charset=utf-8")),
         )
         .route(
+            "/markdown.js",
+            get(|| asset(MARKDOWN_JS, "text/javascript; charset=utf-8")),
+        )
+        .route(
+            "/vendor/mermaid.min.js",
+            get(|| asset(MERMAID_JS, "text/javascript; charset=utf-8")),
+        )
+        .route(
             "/style.css",
             get(|| asset(STYLE_CSS, "text/css; charset=utf-8")),
         )
         .route("/api/{*target}", any(forward))
+        .route("/local/edit", post(start_edit).get(edit_status))
         .layer(middleware::from_fn_with_state(state.clone(), check_host))
         .with_state(state)
 }
@@ -188,6 +214,106 @@ fn failure(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
+#[derive(serde::Deserialize)]
+struct EditTarget {
+    scope: String,
+    slug: String,
+}
+
+fn edit_key(target: &EditTarget) -> Result<(Scope, String), Box<Response>> {
+    let bad = |message: &str| Box::new(failure(StatusCode::BAD_REQUEST, "invalid_input", message));
+    let scope: Scope = target.scope.parse().map_err(|_| bad("invalid scope"))?;
+    validate_slug(&target.slug).map_err(|_| bad("invalid slug"))?;
+    Ok((scope, target.slug.clone()))
+}
+
+/// "Open in editor": runs `memoryos page edit` on this machine with the UI's key. The request names
+/// only the page; the command comes from this process's environment. Returns at once.
+async fn start_edit(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Json(target): Json<EditTarget>,
+) -> Response {
+    if !token_matches(&state, &headers) {
+        return failure(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "this page's token is missing or old",
+        );
+    }
+    let (scope, slug) = match edit_key(&target) {
+        Ok(found) => found,
+        Err(response) => return *response,
+    };
+    let Some(editor) = state.editor.clone() else {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "no_editor",
+            "no editor: start `memoryos ui` with MEMORYOS_EDITOR set, such as `code --wait` or `idea --wait`",
+        );
+    };
+    let key = format!("{scope}/{slug}");
+    {
+        let mut edits = state.edits.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(edits.get(&key), Some(None)) {
+            return failure(
+                StatusCode::CONFLICT,
+                "editing",
+                "this page is already open in your editor",
+            );
+        }
+        edits.insert(key.clone(), None);
+    }
+    let (url, api_key, edits) = (
+        state.upstream_url.clone(),
+        state.upstream_key.clone(),
+        state.edits.clone(),
+    );
+    tokio::spawn(async move {
+        let outcome =
+            memoryos_hooks::edit_page_in_editor(&url, api_key, &scope, &slug, &editor).await;
+        edits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Some(outcome));
+    });
+    Json(json!({"editing": true, "editor": state.editor})).into_response()
+}
+
+/// Whether the editor is still open, and once it closed, what was saved. The outcome is reported once.
+async fn edit_status(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Query(target): Query<EditTarget>,
+) -> Response {
+    if !token_matches(&state, &headers) {
+        return failure(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "this page's token is missing or old",
+        );
+    }
+    let (scope, slug) = match edit_key(&target) {
+        Ok(found) => found,
+        Err(response) => return *response,
+    };
+    let key = format!("{scope}/{slug}");
+    let mut edits = state.edits.lock().unwrap_or_else(|e| e.into_inner());
+    match edits.get(&key) {
+        Some(None) => Json(json!({"editing": true})).into_response(),
+        Some(Some(_)) => match edits.remove(&key) {
+            Some(Some(Ok(message))) => {
+                Json(json!({"editing": false, "saved": message})).into_response()
+            }
+            Some(Some(Err(message))) => {
+                Json(json!({"editing": false, "error": message})).into_response()
+            }
+            _ => Json(json!({"editing": false})).into_response(),
+        },
+        None => Json(json!({"editing": false})).into_response(),
+    }
+}
+
 fn token_matches(state: &UiState, headers: &HeaderMap) -> bool {
     headers
         .get(TOKEN_HEADER)
@@ -196,7 +322,8 @@ fn token_matches(state: &UiState, headers: &HeaderMap) -> bool {
 }
 
 /// The server path for a page request, or `None` when the page has no business making it. Purge,
-/// user deletion, retraction, commits and block edits are not here on purpose. `target` is already
+/// user deletion, retraction, commits, block edits and page writes or deletes are not here on
+/// purpose. Knowledge pages are read and reviewed only. `target` is already
 /// percent-decoded, so every variable segment is checked before it goes into a URL.
 pub(crate) fn upstream_path(method: &Method, target: &str) -> Option<String> {
     let segments: Vec<&str> = target.split('/').collect();
@@ -218,8 +345,35 @@ pub(crate) fn upstream_path(method: &Method, target: &str) -> Option<String> {
         ("GET", ["agents", agent, "blocks"]) if safe_agent_id(agent) => {
             Some(format!("/v1/agents/{agent}/blocks"))
         }
+        ("GET", ["pages"]) => Some("/v1/pages".to_owned()),
+        ("GET", ["pages", "quarantine"]) => Some("/v1/pages/quarantine".to_owned()),
+        ("POST", ["pages", "quarantine", page, version, action @ ("approve" | "reject")])
+            if id(page) && page_version(version) =>
+        {
+            Some(format!("/v1/pages/quarantine/{page}/{version}/{action}"))
+        }
+        ("GET", ["pages", scope, slug]) if page_address(scope, slug) => {
+            Some(format!("/v1/pages/{scope}/{slug}"))
+        }
+        ("GET", ["pages", scope, slug, "versions"]) if page_address(scope, slug) => {
+            Some(format!("/v1/pages/{scope}/{slug}/versions"))
+        }
         _ => None,
     }
+}
+
+/// A scope such as `shared:team` and a slug, both in the forms the server accepts, so neither can
+/// carry a separator or a dot segment into the server path.
+fn page_address(scope: &str, slug: &str) -> bool {
+    scope.parse::<Scope>().is_ok() && validate_slug(slug).is_ok()
+}
+
+/// A version number as the server takes it: digits only, at least 1.
+fn page_version(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 18
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && text.parse::<i64>().is_ok_and(|n| n >= 1)
 }
 
 fn safe_agent_id(text: &str) -> bool {
@@ -365,6 +519,92 @@ mod tests {
     }
 
     #[test]
+    fn the_page_reads_and_reviews_knowledge_pages() {
+        assert_eq!(
+            upstream_path(&Method::GET, "pages").as_deref(),
+            Some("/v1/pages")
+        );
+        assert_eq!(
+            upstream_path(&Method::GET, "pages/quarantine").as_deref(),
+            Some("/v1/pages/quarantine")
+        );
+        assert_eq!(
+            upstream_path(&Method::GET, "pages/shared:team/run-book.v2").as_deref(),
+            Some("/v1/pages/shared:team/run-book.v2")
+        );
+        assert_eq!(
+            upstream_path(&Method::GET, "pages/agent:claude-code/guide/versions").as_deref(),
+            Some("/v1/pages/agent:claude-code/guide/versions")
+        );
+        for action in ["approve", "reject"] {
+            assert_eq!(
+                upstream_path(&Method::POST, &format!("pages/quarantine/{ID}/2/{action}")),
+                Some(format!("/v1/pages/quarantine/{ID}/2/{action}"))
+            );
+        }
+    }
+
+    #[test]
+    fn pages_are_never_written_or_deleted_through_the_page() {
+        for method in [Method::PUT, Method::POST, Method::DELETE, Method::PATCH] {
+            assert!(
+                !allowed(method.clone(), "pages/shared:team/guide"),
+                "{method}"
+            );
+            assert!(!allowed(method.clone(), "pages"), "{method}");
+        }
+        assert!(!allowed(Method::POST, "pages/quarantine"));
+        assert!(!allowed(
+            Method::DELETE,
+            &format!("pages/quarantine/{ID}/2/reject")
+        ));
+        assert!(!allowed(
+            Method::GET,
+            &format!("pages/quarantine/{ID}/2/approve")
+        ));
+        assert!(!allowed(
+            Method::POST,
+            &format!("pages/quarantine/{ID}/2/delete")
+        ));
+        assert!(!allowed(Method::POST, &format!("pages/quarantine/{ID}/2")));
+        assert!(!allowed(Method::POST, "pages/shared:team/guide/versions"));
+        assert!(!allowed(Method::GET, "pages/shared:team/guide/sections"));
+    }
+
+    #[test]
+    fn page_segments_cannot_change_the_path() {
+        // Scopes and slugs in forms the server would refuse never reach it.
+        assert!(!allowed(Method::GET, "pages/../guide"));
+        assert!(!allowed(Method::GET, "pages/shared:team/.."));
+        assert!(!allowed(Method::GET, "pages/shared:team/.hidden"));
+        assert!(!allowed(Method::GET, "pages/shared:team/Guide"));
+        assert!(!allowed(Method::GET, "pages/team/guide"));
+        assert!(!allowed(Method::GET, "pages/other:team/guide"));
+        assert!(!allowed(Method::GET, "pages/shared:/guide"));
+        assert!(!allowed(Method::GET, "pages/shared:te?am/guide"));
+        assert!(!allowed(Method::GET, "pages/shared:team/gu?ide"));
+        assert!(!allowed(Method::GET, "pages/shared:team/guide/../../facts"));
+        let decoded =
+            percent_decoded("pages/shared:team/guide%2f..%2f..%2fversions").expect("decodes");
+        assert!(!allowed(Method::GET, &decoded));
+        let decoded = percent_decoded("pages/shared%3Ateam/guide").expect("decodes");
+        assert!(allowed(Method::GET, &decoded));
+        for version in ["0", "-1", "+2", "1.5", "x", "", "99999999999999999999"] {
+            assert!(
+                !allowed(
+                    Method::POST,
+                    &format!("pages/quarantine/{ID}/{version}/approve")
+                ),
+                "{version}"
+            );
+        }
+        assert!(!allowed(
+            Method::POST,
+            "pages/quarantine/not-a-uuid/2/approve"
+        ));
+    }
+
+    #[test]
     fn a_variable_segment_cannot_change_the_path() {
         assert!(!allowed(Method::GET, "facts/../users"));
         assert!(!allowed(Method::GET, "agents/../blocks"));
@@ -386,9 +626,86 @@ mod tests {
         assert!(token_matches(&state, &headers));
     }
 
+    fn edit_request(scope: &str, slug: &str) -> EditTarget {
+        EditTarget {
+            scope: scope.into(),
+            slug: slug.into(),
+        }
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.expect("body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    #[tokio::test]
+    async fn open_in_editor_needs_the_token_a_valid_page_and_an_editor() {
+        let mut state =
+            UiState::new("http://127.0.0.1:9".into(), "k".into(), "right", 1).expect("state");
+        state.editor = None;
+        let mut headers = HeaderMap::new();
+        let refused = start_edit(
+            State(state.clone()),
+            headers.clone(),
+            Json(edit_request("shared:t", "a")),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        headers.insert(TOKEN_HEADER, HeaderValue::from_static("right"));
+        let bad = start_edit(
+            State(state.clone()),
+            headers.clone(),
+            Json(edit_request("shared:t", "../x")),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let none = start_edit(State(state), headers, Json(edit_request("shared:t", "a"))).await;
+        assert_eq!(none.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(none).await["error"]["code"], "no_editor");
+    }
+
+    #[tokio::test]
+    async fn an_edit_reports_its_outcome_once() {
+        let mut state =
+            UiState::new("http://127.0.0.1:9".into(), "k".into(), "right", 1).expect("state");
+        state.editor = Some("true".into());
+        let mut headers = HeaderMap::new();
+        headers.insert(TOKEN_HEADER, HeaderValue::from_static("right"));
+        let started = start_edit(
+            State(state.clone()),
+            headers.clone(),
+            Json(edit_request("shared:t", "a")),
+        )
+        .await;
+        assert_eq!(started.status(), StatusCode::OK);
+        let mut outcome = serde_json::Value::Null;
+        for _ in 0..100 {
+            let status = edit_status(
+                State(state.clone()),
+                headers.clone(),
+                Query(edit_request("shared:t", "a")),
+            )
+            .await;
+            outcome = body_json(status).await;
+            if outcome["editing"] == false {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Nothing listens on port 9, so reading the page fails before any editor runs.
+        assert!(
+            outcome["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("cannot reach")),
+            "{outcome}"
+        );
+        let again = edit_status(State(state), headers, Query(edit_request("shared:t", "a"))).await;
+        assert_eq!(body_json(again).await, json!({"editing": false}));
+    }
+
     #[test]
     fn page_assets_load_nothing_from_outside_and_set_no_inline_code() {
-        for asset in [INDEX_HTML, APP_JS, STYLE_CSS] {
+        for asset in [INDEX_HTML, APP_JS, MARKDOWN_JS, STYLE_CSS] {
             assert!(!asset.contains("https://"), "external URL in an asset");
             assert!(!asset.contains("innerHTML"), "innerHTML in an asset");
         }

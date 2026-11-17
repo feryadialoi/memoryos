@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, TimeZone, Utc};
 use memoryos_core::{
-    FactFilter, FactOp, FactStatus, MemoryStore, NewEntity, NewEpisode, NewFact, RequestContext,
-    Scope, ScoredFact, Trust, EMBEDDING_DIMS,
+    FactFilter, FactOp, FactStatus, MemoryStore, NewEntity, NewEpisode, NewFact, NewPageSection,
+    NewPageVersion, PageVersionStatus, RequestContext, Scope, ScoredFact, Trust, EMBEDDING_DIMS,
 };
 use memoryos_embed::TestEmbedder;
 use memoryos_retrieve::{RecallRequest, RecallResponse, Retriever};
@@ -89,6 +89,7 @@ impl Scenario {
             limit: 100,
             as_of: None,
             known_at: None,
+            page_limit: memoryos_retrieve::DEFAULT_PAGE_LIMIT,
         }
     }
 
@@ -192,6 +193,87 @@ impl Scenario {
             .await
             .expect("recall");
         assert_eq!(ids(&response.facts), BTreeSet::from([theirs]));
+    }
+}
+
+impl Scenario {
+    /// Writes a one-section page at `degrees` from the query vector.
+    async fn page(&self, slug: &str, text: &str, degrees: f32, trust: Trust) -> PageVersionStatus {
+        self.store
+            .put_page(
+                &self.ctx,
+                NewPageVersion {
+                    scope: self.scope.clone(),
+                    slug: slug.into(),
+                    title: slug.into(),
+                    body: text.into(),
+                    summary: None,
+                    trust,
+                    expected_version: None,
+                    approve_up_to: None,
+                    sections: vec![NewPageSection {
+                        ordinal: 0,
+                        heading: format!("{slug} > Notes"),
+                        text: text.into(),
+                        embedding: at_angle(degrees),
+                    }],
+                },
+            )
+            .await
+            .expect("write page")
+            .status
+    }
+
+    /// Pages come back as their own list, only current versions, and leave facts unchanged.
+    pub async fn pages_are_ranked_apart_and_only_current(&self) {
+        let fact = self
+            .add(self.entity("a").await, "a zebra was seen", 1.0)
+            .await;
+        // The user writes at user trust, so these are current at once.
+        assert_eq!(
+            self.page("zebra-care", "feed the zebra twice a day", 0.0, Trust::User)
+                .await,
+            PageVersionStatus::Active
+        );
+        assert_eq!(
+            self.page("far-away", "nothing in common", 85.0, Trust::User)
+                .await,
+            PageVersionStatus::Active
+        );
+        // An agent writing to a user scope is held for review, so recall never shows it.
+        assert_eq!(
+            self.page("held", "zebra zebra zebra", 0.0, Trust::Agent)
+                .await,
+            PageVersionStatus::Quarantined
+        );
+
+        let response = self.recall(QUERY).await;
+        let slugs: Vec<&str> = response.pages.iter().map(|hit| hit.slug.as_str()).collect();
+        assert_eq!(slugs.first(), Some(&"zebra-care"));
+        assert!(!slugs.contains(&"held"));
+        assert!(response.pages.len() <= 3);
+        assert_eq!(response.pages[0].section, "zebra-care > Notes");
+        assert_eq!(response.pages[0].snippet, "feed the zebra twice a day");
+        assert_eq!(response.pages_skipped, None);
+
+        let mut without = self.request(QUERY);
+        without.page_limit = 0;
+        let without = Retriever::new(self.store.clone(), self.embedder.clone())
+            .recall(&self.ctx, without)
+            .await
+            .expect("recall without pages");
+        assert!(without.pages.is_empty());
+        assert_eq!(ids(&without.facts), ids(&response.facts));
+        assert!(ids(&response.facts).contains(&fact));
+
+        let mut then = self.request(QUERY);
+        then.as_of = Some(Utc::now());
+        let then = Retriever::new(self.store.clone(), self.embedder.clone())
+            .recall(&self.ctx, then)
+            .await
+            .expect("recall as of now");
+        assert!(then.pages.is_empty());
+        assert_eq!(then.pages_skipped, Some("time_travel"));
     }
 }
 

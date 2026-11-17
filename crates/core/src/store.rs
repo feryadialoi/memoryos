@@ -29,7 +29,8 @@ pub trait MemoryStore: Send + Sync {
     /// surviving active fact whose new trust falls under a source quarantine rule of SPEC section 5
     /// becomes quarantined. Entities left with no facts are deleted.
     async fn purge_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<PurgeReport>;
-    /// Hard-deletes everything stored under `scope`, including blocks when it is an agent scope.
+    /// Hard-deletes everything stored under `scope`, including its pages, and blocks when it is an
+    /// agent scope.
     async fn purge_scope(&self, ctx: &RequestContext, scope: &Scope) -> Result<PurgeReport>;
 
     // Commits
@@ -165,6 +166,96 @@ pub trait MemoryStore: Send + Sync {
         agent_id: &str,
         label: &str,
     ) -> Result<Vec<BlockVersion>>;
+
+    // Pages (docs/SPEC.md section 8).
+    /// Pages in `scope` that have a current version, by slug, at most `limit` (1..=500), optionally
+    /// only slugs starting with `prefix`.
+    async fn list_pages(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        prefix: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<PageSummary>>;
+    /// The current version, or with `version` that version if it is active or superseded. A page
+    /// with no current version, or a quarantined or rejected version, is `NotFound`.
+    async fn get_page(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        slug: &str,
+        version: Option<i64>,
+    ) -> Result<Page>;
+    /// One version's metadata in any status, for scope and trust checks before review.
+    async fn get_page_version(
+        &self,
+        ctx: &RequestContext,
+        page_id: Uuid,
+        version: i64,
+    ) -> Result<PageVersion>;
+    /// Writes a new version atomically:
+    /// - `expected_version = None` creates the page, or adds a version with no base to a page with
+    ///   no current version, and fails with `VersionConflict` when the page has a current version.
+    ///   `Some(v)` fails with `NotFound` if the page does not exist, and with `VersionConflict`
+    ///   unless `v` is the current version. A page with no current version reports current 0.
+    /// - With `approve_up_to = Some(t)`, the version is active, unless the current version's trust
+    ///   is above `t`, which is `Forbidden`. Otherwise it is quarantined when
+    ///   `source_requires_quarantine(scope, trust)` holds or the current version's trust is above
+    ///   `trust`, and active in every other case.
+    /// - An active version becomes current: the previous current one becomes superseded and its
+    ///   sections are deleted. A quarantined one keeps its sections for approval.
+    /// - `InvalidInput` when the page already has `PAGE_PENDING_MAX` quarantined versions.
+    /// - Prunes superseded and rejected versions past the newest `PAGE_VERSIONS_KEPT`, and writes a
+    ///   `page.write` audit event, with `approved: true` when `approve_up_to` was used.
+    async fn put_page(&self, ctx: &RequestContext, page: NewPageVersion) -> Result<PageVersion>;
+    /// Kept versions of the page in any status, newest first, without bodies.
+    async fn page_versions(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        slug: &str,
+    ) -> Result<Vec<PageVersion>>;
+    /// Hard-deletes the page with every version and section. Writes a `page.delete` audit event.
+    async fn delete_page(&self, ctx: &RequestContext, scope: &Scope, slug: &str) -> Result<()>;
+    /// Quarantined versions in `scopes`, oldest first.
+    async fn list_quarantined_pages(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        limit: i64,
+    ) -> Result<Vec<PendingPageVersion>>;
+    /// Makes a quarantined version current, as an active write would. `InvalidInput` if it is not
+    /// quarantined, `VersionConflict` if its `base_version` is no longer the current version.
+    /// Writes a `page.approve` audit event.
+    async fn approve_page_version(
+        &self,
+        ctx: &RequestContext,
+        page_id: Uuid,
+        version: i64,
+    ) -> Result<Page>;
+    /// Rejects a quarantined version and deletes its sections. Writes a `page.reject` audit event.
+    async fn reject_page_version(
+        &self,
+        ctx: &RequestContext,
+        page_id: Uuid,
+        version: i64,
+    ) -> Result<PageVersion>;
+    /// Vector search over sections of current versions in `scopes`, nearest first.
+    async fn search_page_sections_vector(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<PageSectionHit>>;
+    /// Full-text search over headings and text of sections of current versions in `scopes`.
+    async fn search_page_sections_text(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<PageSectionHit>>;
 
     // API keys: cross-tenant, looked up before the tenant is known
     /// `key_hash` is the hex SHA-256 of the presented token. Revoked keys return `None`.

@@ -660,6 +660,7 @@ pub(super) async fn purge_episode(
             facts_deleted,
             episodes_deleted,
             entities_deleted,
+            pages_deleted: 0,
         },
         facts_requarantined: requarantined.len() as u64,
     })
@@ -1030,10 +1031,20 @@ pub(super) async fn purge_scope(
             .await
             .map_err(db)?;
     }
+    // Versions and sections go by cascade, and the section triggers remove their vector and
+    // full-text rows.
+    let pages_deleted = sqlx::query("DELETE FROM pages WHERE tenant = ?1 AND scope = ?2")
+        .bind(&ctx.tenant)
+        .bind(&scope_text)
+        .execute(&mut *conn)
+        .await
+        .map_err(db)?
+        .rows_affected();
     Ok(PurgeReport {
         facts_deleted,
         episodes_deleted,
         entities_deleted,
+        pages_deleted,
     })
 }
 
@@ -1042,6 +1053,7 @@ pub(super) fn purge_detail(report: &PurgeReport) -> Value {
         "facts_deleted": report.facts_deleted,
         "episodes_deleted": report.episodes_deleted,
         "entities_deleted": report.entities_deleted,
+        "pages_deleted": report.pages_deleted,
     })
 }
 

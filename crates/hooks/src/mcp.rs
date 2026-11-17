@@ -31,6 +31,9 @@ const SCOPED_TOOLS: &[(&str, &str, Takes)] = &[
     ("recall_candidates", "scopes", Takes::All),
     ("graph_neighbors", "scopes", Takes::All),
     ("commit_facts", "scope", Takes::First),
+    ("page_read", "scope", Takes::First),
+    ("page_write", "scope", Takes::First),
+    ("page_list", "scope", Takes::First),
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -45,7 +48,9 @@ pub fn run() -> Result<(), String> {
     start_local_server(&base);
     let endpoint = format!("{base}/mcp");
     // A bad value must not take the tools away: the model then has to name scopes itself.
-    let defaults: Vec<String> = match config::hook_scopes(&process_env) {
+    // Claude Code starts this in the project directory, so its project file applies.
+    let cwd = std::env::current_dir().ok();
+    let defaults: Vec<String> = match config::project_scopes(&process_env, cwd.as_deref()) {
         Ok(scopes) => scopes.iter().map(ToString::to_string).collect(),
         Err(message) => {
             eprintln!("memoryos mcp: {message}. Scopes are not filled in.");
@@ -419,6 +424,78 @@ mod tests {
             message["params"]["arguments"],
             json!({"source": "chat", "scope": "agent:coding-agent"})
         );
+    }
+
+    #[test]
+    fn a_missing_page_scope_takes_the_first_default() {
+        for (name, arguments) in [
+            ("page_read", json!({"slug": "deploy"})),
+            (
+                "page_write",
+                json!({"slug": "deploy", "title": "T", "body": "b"}),
+            ),
+            ("page_list", json!({})),
+            ("page_list", json!({"scope": null, "prefix": "d"})),
+        ] {
+            let mut message = call(name, arguments.clone());
+            assert!(fill_scopes(&mut message, &defaults()), "{name}");
+            let mut expected = arguments;
+            expected["scope"] = json!("agent:coding-agent");
+            assert_eq!(message["params"]["arguments"], expected, "{name}");
+        }
+        let mut absent = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "page_list"}});
+        assert!(fill_scopes(&mut absent, &defaults()));
+        assert_eq!(
+            absent["params"]["arguments"],
+            json!({"scope": "agent:coding-agent"})
+        );
+    }
+
+    #[test]
+    fn a_page_scope_the_model_sent_is_kept() {
+        for name in ["page_read", "page_write", "page_list"] {
+            let arguments = json!({"scope": "shared:team", "slug": "deploy"});
+            let mut message = call(name, arguments.clone());
+            assert!(!fill_scopes(&mut message, &defaults()), "{name}");
+            assert_eq!(message["params"]["arguments"], arguments, "{name}");
+        }
+    }
+
+    #[test]
+    fn tools_list_makes_the_page_scopes_optional() {
+        let reply = json!({"jsonrpc": "2.0", "id": 3, "result": {"tools": [
+            {"name": "page_read", "inputSchema": {"type": "object",
+                "properties": {"scope": {"type": "string", "description": "Page scope."},
+                               "slug": {"type": "string"}},
+                "required": ["scope", "slug"]}},
+            {"name": "page_write", "inputSchema": {"type": "object",
+                "properties": {"scope": {"type": "string"}, "slug": {"type": "string"},
+                               "title": {"type": "string"}, "body": {"type": "string"}},
+                "required": ["scope", "slug", "title", "body"]}},
+            {"name": "page_list", "inputSchema": {"type": "object",
+                "properties": {"scope": {"type": "string"}, "prefix": {"type": "string"}},
+                "required": ["scope"]}},
+        ]}});
+        let after = describe_defaults(reply.to_string(), &defaults());
+        let tools = serde_json::from_str::<Value>(&after).expect("JSON")["result"]["tools"].clone();
+        let note = "Optional: omit to use your default scopes (agent:coding-agent, user:ada).";
+        assert_eq!(tools[0]["inputSchema"]["required"], json!(["slug"]));
+        assert_eq!(
+            tools[0]["inputSchema"]["properties"]["scope"]["description"],
+            format!("Page scope. {note}")
+        );
+        assert_eq!(
+            tools[1]["inputSchema"]["required"],
+            json!(["slug", "title", "body"])
+        );
+        assert_eq!(tools[2]["inputSchema"]["required"], json!([]));
+        for tool in [&tools[1], &tools[2]] {
+            assert_eq!(
+                tool["inputSchema"]["properties"]["scope"]["description"],
+                note
+            );
+        }
     }
 
     #[test]

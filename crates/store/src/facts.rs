@@ -682,6 +682,7 @@ pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<P
             facts_deleted,
             episodes_deleted,
             entities_deleted,
+            pages_deleted: 0,
         },
         facts_requarantined: requarantined.len() as u64,
     })
@@ -971,11 +972,19 @@ pub(crate) async fn purge_scope(conn: &mut PgConnection, scope: &Scope) -> Resul
             .await
             .map_err(db)?;
     }
+    // Versions and sections go by cascade.
+    let pages_deleted = sqlx::query("DELETE FROM pages WHERE scope = $1")
+        .bind(&scope_text)
+        .execute(&mut *conn)
+        .await
+        .map_err(db)?
+        .rows_affected();
     let [facts_deleted, episodes_deleted, entities_deleted] = deleted;
     Ok(PurgeReport {
         facts_deleted,
         episodes_deleted,
         entities_deleted,
+        pages_deleted,
     })
 }
 
@@ -985,5 +994,6 @@ pub(crate) fn purge_detail(report: &PurgeReport) -> Value {
         "facts_deleted": report.facts_deleted,
         "episodes_deleted": report.episodes_deleted,
         "entities_deleted": report.entities_deleted,
+        "pages_deleted": report.pages_deleted,
     })
 }

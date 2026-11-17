@@ -18,14 +18,21 @@ use crate::score::contains_ci;
 pub const RECALL_DATASET: &str = "recall.v2";
 pub const STALENESS_DATASET: &str = "staleness.v2";
 pub const POISONING_DATASET: &str = "poisoning.v2";
+pub const PAGES_DATASET: &str = "pages.v1";
 
 pub const MIN_RECALL_CASES: usize = 30;
 pub const MIN_STALENESS_CASES: usize = 30;
 pub const MIN_POISONING_CASES: usize = 25;
+pub const MIN_PAGES: usize = 20;
+pub const MIN_PAGE_QUESTIONS: usize = 40;
 
 const RECALL_DATA: &str = include_str!("../data/recall.v2.jsonl");
 const STALENESS_DATA: &str = include_str!("../data/staleness.v2.jsonl");
 const POISONING_DATA: &str = include_str!("../data/poisoning.v2.jsonl");
+const PAGES_DATA: &str = include_str!("../data/pages.v1.jsonl");
+
+/// Separates the levels of a section's title path, as the server writes it (SPEC section 8).
+pub const SECTION_PATH_SEPARATOR: &str = " > ";
 
 #[derive(Debug, Error)]
 pub enum DatasetError {
@@ -181,6 +188,73 @@ pub struct PoisonCase {
     pub as_of_probes: Vec<DateTime<Utc>>,
 }
 
+/// A page the suite writes. Its sections come from `## ` headings in `body`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageSpec {
+    pub slug: String,
+    pub lang: String,
+    pub title: String,
+    pub body: String,
+}
+
+/// A question whose answer is on one page, and when `section` is set, in that `## ` section.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageQuestion {
+    pub id: String,
+    pub lang: String,
+    pub slug: String,
+    pub query: String,
+    #[serde(default)]
+    pub section: Option<String>,
+}
+
+impl PageQuestion {
+    /// The section's heading path as the server reports it: the page title, then the heading.
+    pub fn expected_section(&self, title: &str) -> Option<String> {
+        self.section
+            .as_ref()
+            .map(|heading| format!("{title}{SECTION_PATH_SEPARATOR}{heading}"))
+    }
+}
+
+/// A page with a reviewed version, and an edit to it that must wait in quarantine.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineProbe {
+    pub id: String,
+    pub lang: String,
+    pub slug: String,
+    pub title: String,
+    pub base_body: String,
+    pub edit_body: String,
+    pub query: String,
+    /// Text only the edit has. It must not reach recall until the edit is approved.
+    pub planted: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum PageLine {
+    Page(PageSpec),
+    Question(PageQuestion),
+    Quarantine(QuarantineProbe),
+}
+
+#[derive(Debug, Clone)]
+pub struct PagesData {
+    pub pages: Vec<PageSpec>,
+    pub questions: Vec<PageQuestion>,
+    pub quarantine: Vec<QuarantineProbe>,
+}
+
+impl PagesData {
+    pub fn page(&self, slug: &str) -> Option<&PageSpec> {
+        self.pages.iter().find(|page| page.slug == slug)
+    }
+}
+
 pub fn load_recall() -> Result<Vec<RecallCase>, DatasetError> {
     parse_recall(RECALL_DATA)
 }
@@ -191,6 +265,151 @@ pub fn load_staleness() -> Result<Vec<StalenessCase>, DatasetError> {
 
 pub fn load_poisoning() -> Result<Vec<PoisonCase>, DatasetError> {
     parse_poisoning(POISONING_DATA)
+}
+
+pub fn load_pages() -> Result<PagesData, DatasetError> {
+    parse_pages(PAGES_DATA)
+}
+
+fn parse_pages(data: &str) -> Result<PagesData, DatasetError> {
+    let lines: Vec<PageLine> = parse_lines(PAGES_DATASET, data)?;
+    let mut pages = Vec::new();
+    let mut questions = Vec::new();
+    let mut quarantine = Vec::new();
+    for line in lines {
+        match line {
+            PageLine::Page(page) => pages.push(page),
+            PageLine::Question(question) => questions.push(question),
+            PageLine::Quarantine(probe) => quarantine.push(probe),
+        }
+    }
+    check_slugs(pages.iter().map(|p| p.slug.as_str()))?;
+    for page in &pages {
+        check_page(page).map_err(|p| invalid(PAGES_DATASET, &page.slug, p))?;
+    }
+    check_ids(
+        PAGES_DATASET,
+        questions
+            .iter()
+            .map(|q| q.id.as_str())
+            .chain(quarantine.iter().map(|q| q.id.as_str())),
+    )?;
+    for question in &questions {
+        let page = pages.iter().find(|page| page.slug == question.slug);
+        check_page_question(question, page).map_err(|p| invalid(PAGES_DATASET, &question.id, p))?;
+    }
+    if quarantine.is_empty() {
+        return Err(invalid(
+            PAGES_DATASET,
+            "*",
+            "needs a quarantine probe".to_owned(),
+        ));
+    }
+    for probe in &quarantine {
+        check_quarantine_probe(probe).map_err(|p| invalid(PAGES_DATASET, &probe.id, p))?;
+    }
+    require_count(PAGES_DATASET, pages.len(), MIN_PAGES)?;
+    require_count(PAGES_DATASET, questions.len(), MIN_PAGE_QUESTIONS)?;
+    Ok(PagesData {
+        pages,
+        questions,
+        quarantine,
+    })
+}
+
+/// Slugs follow SPEC section 8: 1 to 128 of `a-z`, `0-9`, `-`, `_`, `.`, starting with a letter
+/// or digit.
+fn valid_slug(slug: &str) -> bool {
+    let mut chars = slug.chars();
+    let starts_well = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    starts_well
+        && slug.len() <= 128
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.".contains(c))
+}
+
+fn check_slugs<'a>(slugs: impl Iterator<Item = &'a str>) -> Result<(), DatasetError> {
+    let mut seen = HashSet::new();
+    for slug in slugs {
+        if !valid_slug(slug) {
+            return Err(invalid(PAGES_DATASET, slug, "invalid slug".to_owned()));
+        }
+        if !seen.insert(slug) {
+            return Err(invalid(PAGES_DATASET, slug, "duplicate slug".to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn check_page_lang(lang: &str) -> Result<(), String> {
+    if matches!(lang, "en" | "id" | "zh") {
+        Ok(())
+    } else {
+        Err(format!("unknown lang {lang:?}"))
+    }
+}
+
+/// The `## ` headings of a body, which become its sections.
+fn level_two_headings(body: &str) -> Vec<&str> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("## "))
+        .map(str::trim)
+        .collect()
+}
+
+fn check_page(page: &PageSpec) -> Result<(), String> {
+    check_page_lang(&page.lang)?;
+    if page.title.trim().is_empty() || page.title.chars().count() > 200 {
+        return Err("title must be 1 to 200 characters".to_owned());
+    }
+    let headings = level_two_headings(&page.body);
+    if headings.len() < 2 {
+        return Err("needs at least two ## sections".to_owned());
+    }
+    if page.body.contains("```") || page.body.lines().any(|l| l.starts_with("# ")) {
+        // Keeps every section path at `title > heading`, which the questions rely on.
+        return Err("no code fences or # headings".to_owned());
+    }
+    Ok(())
+}
+
+fn check_page_question(question: &PageQuestion, page: Option<&PageSpec>) -> Result<(), String> {
+    check_page_lang(&question.lang)?;
+    if question.query.trim().is_empty() {
+        return Err("empty query".to_owned());
+    }
+    let Some(page) = page else {
+        return Err(format!("no page has slug {:?}", question.slug));
+    };
+    if let Some(section) = &question.section {
+        if !level_two_headings(&page.body).contains(&section.as_str()) {
+            return Err(format!("page has no section {section:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn check_quarantine_probe(probe: &QuarantineProbe) -> Result<(), String> {
+    check_page_lang(&probe.lang)?;
+    if !valid_slug(&probe.slug) {
+        return Err("invalid slug".to_owned());
+    }
+    if probe.planted.is_empty() {
+        return Err("needs planted values".to_owned());
+    }
+    for planted in &probe.planted {
+        if !contains_ci(&probe.edit_body, planted) {
+            return Err(format!("edit does not state {planted:?}"));
+        }
+        if contains_ci(&probe.base_body, planted) {
+            return Err(format!("base already states {planted:?}"));
+        }
+        if contains_ci(&probe.query, planted) {
+            return Err(format!("query names {planted:?}"));
+        }
+    }
+    Ok(())
 }
 
 fn parse_recall(data: &str) -> Result<Vec<RecallCase>, DatasetError> {
@@ -581,6 +800,82 @@ mod tests {
         assert!(check_ids("x", ["a1", "a1"].into_iter()).is_err());
         assert!(check_ids("x", ["A b"].into_iter()).is_err());
         assert!(check_ids("x", ["a1", "b2"].into_iter()).is_ok());
+    }
+
+    #[test]
+    fn pages_data_parses_and_keeps_its_counts() {
+        let data = load_pages().expect("pages data is valid");
+        assert_eq!(data.pages.len(), 21);
+        assert_eq!(data.questions.len(), 45);
+        assert_eq!(data.quarantine.len(), 1);
+        assert!(data.pages.iter().filter(|p| p.lang == "zh").count() >= 3);
+        assert!(data.questions.iter().any(|q| q.section.is_none()));
+        // A question in one language about a page in another.
+        assert!(data.questions.iter().any(|q| {
+            let page = data.page(&q.slug).expect("page");
+            q.lang != page.lang
+        }));
+    }
+
+    #[test]
+    fn expected_section_is_the_title_path() {
+        let data = load_pages().expect("valid");
+        let question = data
+            .questions
+            .iter()
+            .find(|q| q.id == "pgfail1")
+            .expect("case");
+        let title = &data.page(&question.slug).expect("page").title;
+        assert_eq!(
+            question.expected_section(title).as_deref(),
+            Some("PostgreSQL failover runbook > Promote the replica")
+        );
+    }
+
+    const PAGE_LINE: &str = r###"{"kind":"page","slug":"runbook","lang":"en","title":"Runbook","body":"## Start\n\nrun it\n\n## Stop\n\nkill it\n"}"###;
+
+    #[test]
+    fn a_question_naming_a_missing_section_is_rejected() {
+        let page: PageSpec = serde_json::from_str(&PAGE_LINE.replace(r#""kind":"page","#, ""))
+            .expect("fixture parses");
+        check_page(&page).expect("fixture is valid");
+        let question = PageQuestion {
+            id: "q1".to_owned(),
+            lang: "en".to_owned(),
+            slug: "runbook".to_owned(),
+            query: "how to restart".to_owned(),
+            section: Some("Restart".to_owned()),
+        };
+        let problem = check_page_question(&question, Some(&page)).expect_err("rejected");
+        assert!(problem.contains("no section"), "{problem}");
+        assert!(check_page_question(&question, None)
+            .expect_err("rejected")
+            .contains("no page"));
+    }
+
+    #[test]
+    fn a_probe_whose_base_already_has_the_planted_text_is_rejected() {
+        let probe = QuarantineProbe {
+            id: "p".to_owned(),
+            lang: "en".to_owned(),
+            slug: "policy".to_owned(),
+            title: "Policy".to_owned(),
+            base_body: "## A\n\nrelay-1".to_owned(),
+            edit_body: "## A\n\nrelay-1".to_owned(),
+            query: "where".to_owned(),
+            planted: vec!["relay-1".to_owned()],
+        };
+        assert!(check_quarantine_probe(&probe)
+            .expect_err("rejected")
+            .contains("base already"));
+    }
+
+    #[test]
+    fn slugs_follow_the_spec() {
+        assert!(valid_slug("redis-memory.v2_x"));
+        assert!(!valid_slug("-lead"));
+        assert!(!valid_slug("Upper"));
+        assert!(!valid_slug(""));
     }
 
     #[test]

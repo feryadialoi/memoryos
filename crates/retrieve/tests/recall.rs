@@ -383,6 +383,7 @@ impl Fixture {
             limit: 100,
             as_of: None,
             known_at: None,
+            page_limit: memoryos_retrieve::DEFAULT_PAGE_LIMIT,
         }
     }
 
@@ -422,6 +423,19 @@ async fn finds_a_fact_only_by_vector() {
         f.scope.clone(),
     )
     .finds_a_fact_only_by_vector()
+    .await;
+}
+
+#[tokio::test]
+async fn pages_are_ranked_apart_and_only_current() {
+    let f = fixture().await;
+    common::Scenario::new(
+        f.store.clone(),
+        f.embedder.clone(),
+        f.ctx.clone(),
+        f.scope.clone(),
+    )
+    .pages_are_ranked_apart_and_only_current()
     .await;
 }
 

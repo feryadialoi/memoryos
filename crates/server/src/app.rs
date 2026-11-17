@@ -9,7 +9,7 @@ use axum::http::Response;
 use axum::Router;
 use memoryos_core::{Embedder, MemoryStore, Reranker};
 use memoryos_embed::{LocalEmbedder, LocalReranker, RerankModel};
-use memoryos_ingest::HostCommitter;
+use memoryos_ingest::{HostCommitter, PageWriter};
 use memoryos_retrieve::Retriever;
 use memoryos_store::Store;
 use tokio::net::TcpListener;
@@ -104,8 +104,9 @@ pub async fn serve(
     let services = Services {
         store,
         retriever: Arc::new(retriever),
-        committer: HostCommitter::new(memory_store, embedder.clone())
+        committer: HostCommitter::new(memory_store.clone(), embedder.clone())
             .with_single_valued(config.single_valued.clone()),
+        pages: PageWriter::new(memory_store, embedder.clone()),
         metrics: metrics.clone(),
     };
 

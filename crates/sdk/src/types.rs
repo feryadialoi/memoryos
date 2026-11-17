@@ -2,7 +2,7 @@
 //! depends on nothing server-side.
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use memoryos_core::{FactStatus, Scope, ScoredFact};
+use memoryos_core::{FactStatus, PageVersion, Scope, ScoredFact};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -166,6 +166,88 @@ pub struct RelatedFact {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecallResponse {
     pub facts: Vec<ScoredFact>,
+    /// Best section per page, of current versions only, ranked apart from facts. Empty when
+    /// absent, as from an older server.
+    #[serde(default)]
+    pub pages: Vec<PageHit>,
+    /// `time_travel` when `as_of` or `known_at` was set, since pages are searched at the present
+    /// only.
+    #[serde(default)]
+    pub pages_skipped: Option<String>,
+}
+
+/// A page section that matched a recall query.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PageHit {
+    pub page_id: Uuid,
+    pub scope: Scope,
+    pub slug: String,
+    pub title: String,
+    pub version: i64,
+    /// Heading path, such as `Upgrade MemoryOS > Native install`.
+    pub section: String,
+    /// The section's first 300 characters.
+    pub snippet: String,
+    pub score: f64,
+}
+
+/// Input to `MemoryOs::put_page`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PageWrite {
+    pub title: String,
+    /// Markdown.
+    pub body: String,
+    /// What changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// `None` creates the page. `Some(v)` edits current version `v`.
+    pub expected_version: Option<i64>,
+    /// Admin keys only: write and approve in one step.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub approve: bool,
+}
+
+impl PageWrite {
+    pub fn create(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            summary: None,
+            expected_version: None,
+            approve: false,
+        }
+    }
+
+    pub fn update(
+        title: impl Into<String>,
+        body: impl Into<String>,
+        expected_version: i64,
+    ) -> Self {
+        Self {
+            expected_version: Some(expected_version),
+            ..Self::create(title, body)
+        }
+    }
+
+    pub fn summary(mut self, summary: impl Into<String>) -> Self {
+        self.summary = Some(summary.into());
+        self
+    }
+
+    /// Admin keys only. Forbidden when the current version's trust is above the key's `max_trust`.
+    pub fn approve(mut self) -> Self {
+        self.approve = true;
+        self
+    }
+}
+
+/// The version a page write stored, with its status.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PageWriteResponse {
+    #[serde(flatten)]
+    pub version: PageVersion,
+    /// The server masked a secret in the title, body or summary.
+    pub redacted: bool,
 }
 
 /// Input to `MemoryOs::put_block`.
@@ -246,6 +328,82 @@ mod tests {
             serde_json::to_value(&fact).expect("serializes")["expires_at"],
             "2030-01-04T00:00:00Z"
         );
+    }
+
+    #[test]
+    fn page_write_sends_only_what_is_set() {
+        assert_eq!(
+            serde_json::to_value(PageWrite::create("T", "# B")).expect("serializes"),
+            json!({"title": "T", "body": "# B", "expected_version": null})
+        );
+        assert_eq!(
+            serde_json::to_value(PageWrite::update("T", "B", 3).summary("why").approve())
+                .expect("serializes"),
+            json!({
+                "title": "T",
+                "body": "B",
+                "summary": "why",
+                "expected_version": 3,
+                "approve": true,
+            })
+        );
+    }
+
+    #[test]
+    fn page_write_response_is_a_flattened_version() {
+        let id = Uuid::now_v7();
+        let response: PageWriteResponse = serde_json::from_value(json!({
+            "page_id": id,
+            "scope": "shared:team",
+            "slug": "runbook",
+            "version": 2,
+            "base_version": 1,
+            "title": "Runbook",
+            "summary": null,
+            "trust": "agent",
+            "status": "quarantined",
+            "edited_by": "key:x",
+            "edited_at": "2026-01-01T00:00:00Z",
+            "redacted": true,
+        }))
+        .expect("parses");
+        assert_eq!(response.version.page_id, id);
+        assert_eq!(response.version.base_version, Some(1));
+        assert_eq!(
+            response.version.status,
+            memoryos_core::PageVersionStatus::Quarantined
+        );
+        assert!(response.redacted);
+    }
+
+    #[test]
+    fn recall_response_parses_with_and_without_pages() {
+        let old: RecallResponse = serde_json::from_value(json!({"facts": []})).expect("old shape");
+        assert!(old.pages.is_empty() && old.pages_skipped.is_none());
+
+        let id = Uuid::now_v7();
+        let new: RecallResponse = serde_json::from_value(json!({
+            "facts": [],
+            "pages": [{
+                "page_id": id,
+                "scope": "shared:team",
+                "slug": "runbook",
+                "title": "Runbook",
+                "version": 4,
+                "section": "Runbook > Restart",
+                "snippet": "Stop the service first.",
+                "score": 0.25,
+            }],
+            "pages_skipped": null,
+        }))
+        .expect("new shape");
+        assert_eq!(new.pages[0].page_id, id);
+        assert_eq!(new.pages[0].section, "Runbook > Restart");
+        let skipped: RecallResponse = serde_json::from_value(
+            json!({"facts": [], "pages": [], "pages_skipped": "time_travel"}),
+        )
+        .expect("skipped");
+        assert_eq!(skipped.pages_skipped.as_deref(), Some("time_travel"));
     }
 
     #[test]

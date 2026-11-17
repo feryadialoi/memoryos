@@ -1,4 +1,5 @@
 //! Hybrid retrieval over facts: vector, text and graph lists merged by reciprocal rank fusion.
+//! Recall also searches sections of current pages, ranked apart from facts.
 //! See docs/SPEC.md sections 2, 7 and 14.
 
 use std::sync::Arc;
@@ -7,13 +8,16 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use memoryos_core::{
-    Embedder, Error, Fact, FactFilter, MemoryStore, RequestContext, Reranker, Result, Scope,
-    ScoredFact,
+    Embedder, Error, Fact, FactFilter, MemoryStore, PageSectionHit, RequestContext, Reranker,
+    Result, Scope, ScoredFact,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 mod fusion;
+mod pages;
+
+pub use pages::{PageHit, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 
 pub const DEFAULT_LIMIT: i64 = 10;
 pub const MAX_LIMIT: i64 = 100;
@@ -57,15 +61,29 @@ pub struct RecallRequest {
     pub as_of: Option<DateTime<Utc>>,
     #[serde(default)]
     pub known_at: Option<DateTime<Utc>>,
+    /// Most page hits to return, 0 to 10. 0 turns page search off.
+    #[serde(default = "default_page_limit")]
+    pub page_limit: i64,
 }
 
 fn default_limit() -> i64 {
     DEFAULT_LIMIT
 }
 
+fn default_page_limit() -> i64 {
+    DEFAULT_PAGE_LIMIT
+}
+
+/// Why recall searched no pages although `page_limit` asked for some.
+pub const PAGES_SKIPPED_TIME_TRAVEL: &str = "time_travel";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RecallResponse {
     pub facts: Vec<ScoredFact>,
+    /// Best section per page, ranked apart from facts.
+    pub pages: Vec<PageHit>,
+    /// `time_travel` when `as_of` or `known_at` was set, since pages are searched at the present only.
+    pub pages_skipped: Option<&'static str>,
 }
 
 pub struct Retriever {
@@ -113,18 +131,26 @@ impl Retriever {
             as_of: req.as_of,
             known_at: req.known_at,
         };
+        let page_limit = pages::validate_page_limit(req.page_limit)?;
+        let time_travel = req.as_of.is_some() || req.known_at.is_some();
+        let page_limit = if time_travel { 0 } else { page_limit };
         let embedding = self.embed_query(&req.query).await;
-        let facts = self
-            .ranked_facts(
+        let (facts, pages) = self
+            .ranked(
                 ctx,
                 &req.scopes,
                 &req.query,
                 embedding.as_deref(),
                 limit,
+                page_limit,
                 Purpose::Recall(&filter),
             )
             .await?;
-        Ok(RecallResponse { facts })
+        Ok(RecallResponse {
+            facts,
+            pages,
+            pages_skipped: time_travel.then_some(PAGES_SKIPPED_TIME_TRAVEL),
+        })
     }
 
     /// Related current facts for a statement the host may commit.
@@ -137,15 +163,17 @@ impl Retriever {
     ) -> Result<Vec<ScoredFact>> {
         let limit = validate(scopes, statement, limit)?;
         let embedding = self.embed_query(statement).await;
-        self.ranked_facts(
+        self.ranked(
             ctx,
             scopes,
             statement,
             embedding.as_deref(),
             limit,
+            0,
             Purpose::Candidates,
         )
         .await
+        .map(|(facts, _)| facts)
     }
 
     /// `candidates` for a statement the caller has already embedded, so a commit that embeds its
@@ -159,35 +187,42 @@ impl Retriever {
         limit: i64,
     ) -> Result<Vec<ScoredFact>> {
         let limit = validate(scopes, statement, limit)?;
-        self.ranked_facts(
+        self.ranked(
             ctx,
             scopes,
             statement,
             Some(embedding),
             limit,
+            0,
             Purpose::Candidates,
         )
         .await
+        .map(|(facts, _)| facts)
     }
 
-    async fn ranked_facts(
+    /// Facts, and with `page_limit` above 0 also page hits. Page searches run alongside the fact
+    /// searches and share the reranker call; a failing page search only logs and returns no pages.
+    #[allow(clippy::too_many_arguments)]
+    async fn ranked(
         &self,
         ctx: &RequestContext,
         scopes: &[Scope],
         query: &str,
         embedding: Option<&[f32]>,
         limit: usize,
+        page_limit: usize,
         purpose: Purpose<'_>,
-    ) -> Result<Vec<ScoredFact>> {
+    ) -> Result<(Vec<ScoredFact>, Vec<PageHit>)> {
         let current = FactFilter::default();
         let filter = match purpose {
             Purpose::Recall(filter) => filter,
             Purpose::Candidates => &current,
         };
-        let (vector, text) = tokio::join!(
+        let (vector, text, (page_vector, page_text)) = tokio::join!(
             self.vector_list(ctx, scopes, embedding, filter),
             self.store
                 .search_facts_text(ctx, scopes, query, filter, CANDIDATES_PER_LIST),
+            self.page_lists(ctx, scopes, query, embedding, page_limit),
         );
         // Text search is the fallback for vector search, so nothing is left if it fails too.
         let text = facts_only(text?);
@@ -197,21 +232,77 @@ impl Retriever {
         let graph = self.graph_list(ctx, scopes, &subjects, filter).await;
 
         let fused = fusion::fuse(&[&vector, &text, &graph]);
-        let ranked = match purpose {
+        let sections = pages::fuse_sections(&[&page_vector, &page_text]);
+        let (ranked, sections) = match purpose {
             Purpose::Recall(_) => {
                 let boosted = fusion::boost_by_sources(fused);
-                fusion::without_near_copies(self.rerank.apply(query, boosted, limit).await)
+                let page_window = page_limit.saturating_mul(2);
+                let (facts, sections) = self
+                    .rerank
+                    .apply_with_pages(query, boosted, limit, sections, page_window)
+                    .await;
+                (fusion::without_near_copies(facts), sections)
             }
-            Purpose::Candidates => fused,
+            Purpose::Candidates => (fused, sections),
         };
-        Ok(ranked
+        let facts = ranked
             .into_iter()
             .take(limit)
             .map(|(fact, score)| ScoredFact {
                 fact: fact.clone(),
                 score,
             })
-            .collect())
+            .collect();
+        let pages = sections
+            .into_iter()
+            .take(page_limit)
+            .map(|(section, score)| PageHit::new(section, score))
+            .collect();
+        Ok((facts, pages))
+    }
+
+    /// Vector and text section searches for page recall, each logged and empty on failure. Nothing
+    /// is searched when `page_limit` is 0.
+    async fn page_lists(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        query: &str,
+        embedding: Option<&[f32]>,
+        page_limit: usize,
+    ) -> (Vec<PageSectionHit>, Vec<PageSectionHit>) {
+        if page_limit == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let vector = async {
+            let Some(embedding) = embedding else {
+                return Ok(Vec::new());
+            };
+            self.store
+                .search_page_sections_vector(
+                    ctx,
+                    scopes,
+                    embedding,
+                    pages::PAGE_CANDIDATES_PER_LIST,
+                )
+                .await
+        };
+        let text = self.store.search_page_sections_text(
+            ctx,
+            scopes,
+            query,
+            pages::PAGE_CANDIDATES_PER_LIST,
+        );
+        let (vector, text) = tokio::join!(vector, text);
+        let usable = |found: Result<Vec<PageSectionHit>>, list: &'static str| match found {
+            Ok(found) => found,
+            Err(error) => {
+                let kind = fusion::error_kind(&error);
+                tracing::warn!(kind, list, "page search failed, leaving it out");
+                Vec::new()
+            }
+        };
+        (usable(vector, "vector"), usable(text, "text"))
     }
 
     async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
@@ -312,44 +403,99 @@ impl Rerank {
     /// Reorders the first `min(limit * 2, top)` facts by the reranker. Twice the limit, so a
     /// relevant fact just below the cut can rise into it, and the near copies dropped next leave
     /// room. With no reranker, or on any failure or timeout, the order stays as it came.
+    #[cfg(test)]
     async fn apply<'a>(
         &self,
         query: &str,
         ranked: Vec<(&'a Fact, f64)>,
         limit: usize,
     ) -> Vec<(&'a Fact, f64)> {
+        self.apply_with_pages(query, ranked, limit, Vec::new(), 0)
+            .await
+            .0
+    }
+
+    /// `apply` for facts, then a second reranker call for the first `page_window` sections. The
+    /// calls stay apart on purpose: a cross-encoder batch is padded to its longest pair, so long
+    /// sections in the facts' batch would slow it and shift the facts' scores. With them apart the
+    /// facts rank exactly as with no pages. A window under 2 leaves that list as it came, and any
+    /// failure or timeout keeps that list's fused order.
+    async fn apply_with_pages<'a, 'b>(
+        &self,
+        query: &str,
+        facts: Vec<(&'a Fact, f64)>,
+        limit: usize,
+        sections: Vec<(&'b PageSectionHit, f64)>,
+        page_window: usize,
+    ) -> (Vec<(&'a Fact, f64)>, Vec<(&'b PageSectionHit, f64)>) {
         let Some(reranker) = &self.reranker else {
-            return ranked;
+            return (facts, sections);
         };
-        let window = limit.saturating_mul(2).min(self.top).min(ranked.len());
-        if window < 2 {
-            return ranked;
-        }
-        let statements: Vec<String> = ranked[..window]
-            .iter()
-            .map(|(fact, _)| fact.statement.clone())
-            .collect();
-        let scored = tokio::time::timeout(self.timeout, reranker.score(query, &statements)).await;
+        let fact_window = limit.saturating_mul(2).min(self.top).min(facts.len());
+        let facts = if fact_window < 2 {
+            facts
+        } else {
+            let statements: Vec<String> = facts[..fact_window]
+                .iter()
+                .map(|(fact, _)| fact.statement.clone())
+                .collect();
+            match self.score(reranker, query, &statements, "facts").await {
+                Some(scores) => fusion::reordered_by(facts, &scores),
+                None => facts,
+            }
+        };
+        let page_window = page_window.min(sections.len());
+        let sections = if page_window < 2 {
+            sections
+        } else {
+            let statements: Vec<String> = sections[..page_window]
+                .iter()
+                .map(|(section, _)| pages::rerank_text(section))
+                .collect();
+            match self.score(reranker, query, &statements, "pages").await {
+                Some(scores) => fusion::reordered_by(sections, &scores),
+                None => sections,
+            }
+        };
+        (facts, sections)
+    }
+
+    /// One reranker call with the timeout. `None`, after a warning, on failure, timeout or a wrong
+    /// number of scores.
+    async fn score(
+        &self,
+        reranker: &Arc<dyn Reranker>,
+        query: &str,
+        statements: &[String],
+        list: &'static str,
+    ) -> Option<Vec<f32>> {
+        let expected = statements.len();
+        let scored = tokio::time::timeout(self.timeout, reranker.score(query, statements)).await;
         match scored {
-            Ok(Ok(scores)) if scores.len() == window => fusion::reordered_by(ranked, &scores),
+            Ok(Ok(scores)) if scores.len() == expected => Some(scores),
             Ok(Ok(scores)) => {
                 let returned = scores.len();
                 tracing::warn!(
                     returned,
-                    expected = window,
+                    expected,
+                    list,
                     "reranker returned the wrong number of scores, keeping the fused order"
                 );
-                ranked
+                None
             }
             Ok(Err(error)) => {
                 let kind = fusion::error_kind(&error);
-                tracing::warn!(kind, "reranking failed, keeping the fused order");
-                ranked
+                tracing::warn!(kind, list, "reranking failed, keeping the fused order");
+                None
             }
             Err(_) => {
                 let timeout_ms = self.timeout.as_millis() as u64;
-                tracing::warn!(timeout_ms, "reranking timed out, keeping the fused order");
-                ranked
+                tracing::warn!(
+                    timeout_ms,
+                    list,
+                    "reranking timed out, keeping the fused order"
+                );
+                None
             }
         }
     }
@@ -448,9 +594,16 @@ mod tests {
 
     #[test]
     fn response_serializes_the_openapi_fields() {
-        let response = RecallResponse { facts: vec![] };
+        let response = RecallResponse {
+            facts: vec![],
+            pages: vec![],
+            pages_skipped: None,
+        };
         let json = serde_json::to_value(&response).expect("serializes");
-        assert_eq!(json, serde_json::json!({"facts": []}));
+        assert_eq!(
+            json,
+            serde_json::json!({"facts": [], "pages": [], "pages_skipped": null})
+        );
     }
 
     mod rerank {
@@ -468,6 +621,7 @@ mod tests {
             fail: bool,
             short: bool,
             seen: Mutex<Vec<String>>,
+            batches: Mutex<Vec<usize>>,
         }
 
         impl FakeReranker {
@@ -477,11 +631,16 @@ mod tests {
                     fail: false,
                     short: false,
                     seen: Mutex::new(Vec::new()),
+                    batches: Mutex::new(Vec::new()),
                 }
             }
 
             fn seen(&self) -> Vec<String> {
                 self.seen.lock().expect("lock").clone()
+            }
+
+            fn batches(&self) -> Vec<usize> {
+                self.batches.lock().expect("lock").clone()
             }
         }
 
@@ -492,6 +651,7 @@ mod tests {
                     .lock()
                     .expect("lock")
                     .extend_from_slice(statements);
+                self.batches.lock().expect("lock").push(statements.len());
                 tokio::time::sleep(self.delay).await;
                 if self.fail {
                     return Err(Error::Provider("model is not loaded yet".into()));
@@ -638,6 +798,104 @@ mod tests {
                     .await;
                 assert_eq!(order(&out), [0, 1, 2]);
             }
+        }
+
+        /// Sections of pages 0 to n-1, whose text ends with the given score, fused scores falling.
+        fn sections(scores: &[f32]) -> Vec<PageSectionHit> {
+            scores
+                .iter()
+                .enumerate()
+                .map(|(n, score)| PageSectionHit {
+                    section_id: Uuid::from_u128(500 + n as u128),
+                    page_id: Uuid::from_u128(n as u128),
+                    scope: Scope::shared("s"),
+                    slug: format!("p{n}"),
+                    title: format!("Page {n}"),
+                    version: 1,
+                    heading: format!("Page {n} > Intro"),
+                    text: format!("section{n} {score}"),
+                    score: 0.0,
+                })
+                .collect()
+        }
+
+        fn ranked_sections(sections: &[PageSectionHit]) -> Vec<(&PageSectionHit, f64)> {
+            sections
+                .iter()
+                .enumerate()
+                .map(|(n, section)| (section, 1.0 - n as f64 / 100.0))
+                .collect()
+        }
+
+        fn page_order(ranked: &[(&PageSectionHit, f64)]) -> Vec<u128> {
+            ranked.iter().map(|(s, _)| s.page_id.as_u128()).collect()
+        }
+
+        #[tokio::test]
+        async fn facts_and_sections_are_scored_in_separate_calls() {
+            let reranker = Arc::new(FakeReranker::new());
+            let facts = facts(&[0.1, 0.9]);
+            let pages = sections(&[0.2, 0.8, 0.5]);
+            let (out, page_out) = step(Some(reranker.clone()), 20)
+                .apply_with_pages("q", ranked(&facts), 1, ranked_sections(&pages), 2)
+                .await;
+            assert_eq!(order(&out), [1, 0]);
+            // Only the page window of 2 is reranked; page 2 stays behind it.
+            assert_eq!(page_order(&page_out), [1, 0, 2]);
+            assert_eq!(
+                reranker.seen(),
+                [
+                    "fact0 0.1",
+                    "fact1 0.9",
+                    "Page 0 > Intro\nsection0 0.2",
+                    "Page 1 > Intro\nsection1 0.8"
+                ]
+            );
+            // Facts first, then sections, never in one batch.
+            assert_eq!(reranker.batches(), [2, 2]);
+            // Slots keep their fused scores, so each list stays descending.
+            assert_eq!(page_out[0].1, 1.0);
+        }
+
+        #[tokio::test]
+        async fn fact_results_do_not_depend_on_pages() {
+            let facts = facts(&[0.1, 0.9, 0.5, 0.7]);
+            let pages = sections(&[0.3, 0.6]);
+            let without = step(Some(Arc::new(FakeReranker::new())), 20)
+                .apply("q", ranked(&facts), 10)
+                .await;
+            let (with, _) = step(Some(Arc::new(FakeReranker::new())), 20)
+                .apply_with_pages("q", ranked(&facts), 10, ranked_sections(&pages), 6)
+                .await;
+            assert_eq!(order(&with), order(&without));
+        }
+
+        #[tokio::test]
+        async fn sections_rerank_even_when_facts_are_too_few() {
+            let reranker = Arc::new(FakeReranker::new());
+            let facts = facts(&[0.1]);
+            let pages = sections(&[0.2, 0.8]);
+            let (out, page_out) = step(Some(reranker.clone()), 20)
+                .apply_with_pages("q", ranked(&facts), 10, ranked_sections(&pages), 6)
+                .await;
+            assert_eq!(order(&out), [0]);
+            assert_eq!(page_order(&page_out), [1, 0]);
+            assert_eq!(reranker.seen().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_failure_keeps_both_fused_orders() {
+            let reranker = FakeReranker {
+                fail: true,
+                ..FakeReranker::new()
+            };
+            let facts = facts(&[0.1, 0.9]);
+            let pages = sections(&[0.2, 0.8]);
+            let (out, page_out) = step(Some(Arc::new(reranker)), 20)
+                .apply_with_pages("q", ranked(&facts), 10, ranked_sections(&pages), 6)
+                .await;
+            assert_eq!(order(&out), [0, 1]);
+            assert_eq!(page_order(&page_out), [0, 1]);
         }
     }
 }
