@@ -641,21 +641,45 @@ fn setup_local(
     let data = local_data_dir(env)?;
     fs::create_dir_all(&data).map_err(|e| format!("cannot create {}: {e}", data.display()))?;
     let existing = settings::read(&path)?;
-    let defaults = [
-        ("MEMORYOS_STORE", "sqlite".to_owned()),
-        (
-            "DATABASE_URL",
-            format!("sqlite://{}", data.join("memoryos.db").display()),
-        ),
-        ("MEMORYOS_BIND", LOCAL_BIND.to_owned()),
-        ("MEMORYOS_RERANK_MODEL", LOCAL_RERANK_MODEL.to_owned()),
-    ];
-    let missing: Vec<(&str, String)> = defaults
-        .into_iter()
-        .filter(|(name, _)| setting(&existing, name).is_none())
-        .collect();
-    if !missing.is_empty() {
-        settings::write(&path, &missing)?;
+    let mut updates: Vec<(&str, String)> = Vec::new();
+    match setting(&existing, "DATABASE_URL") {
+        // No database yet: a local install uses SQLite.
+        None => {
+            updates.push(("MEMORYOS_STORE", "sqlite".to_owned()));
+            updates.push((
+                "DATABASE_URL",
+                format!("sqlite://{}", data.join("memoryos.db").display()),
+            ));
+        }
+        // A database the user chose, such as Postgres from `make local-setup`, stays. Only the
+        // store is set to match its URL, which also repairs the `MEMORYOS_STORE=sqlite` an
+        // earlier `setup --local` added next to a Postgres URL.
+        Some(url) => {
+            let store = if url.starts_with("sqlite:") {
+                "sqlite"
+            } else {
+                "postgres"
+            };
+            let current = setting(&existing, "MEMORYOS_STORE");
+            let matches = current
+                .as_deref()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case(store))
+                || (current.is_none() && store == "postgres");
+            if !matches {
+                updates.push(("MEMORYOS_STORE", store.to_owned()));
+            }
+        }
+    }
+    for (name, value) in [
+        ("MEMORYOS_BIND", LOCAL_BIND),
+        ("MEMORYOS_RERANK_MODEL", LOCAL_RERANK_MODEL),
+    ] {
+        if setting(&existing, name).is_none() {
+            updates.push((name, value.to_owned()));
+        }
+    }
+    if !updates.is_empty() {
+        settings::write(&path, &updates)?;
     }
     println!("Settings are in {}.", path.display());
 
@@ -1096,6 +1120,45 @@ mod tests {
         assert_eq!(local.issued.borrow().len(), 2, "no new keys");
         assert_eq!(sandbox.credentials().url, "http://127.0.0.1:9090");
         assert!(report.contains("kept"), "{report}");
+    }
+
+    #[test]
+    fn setup_local_keeps_a_postgres_database_and_repairs_a_sqlite_store_next_to_it() {
+        let sandbox = Sandbox::new();
+        let local = FakeLocal::default();
+        let path = sandbox.dir().join("server.env");
+        let postgres = "postgres://memoryos@localhost:6432/memoryos".to_owned();
+        let run = || {
+            setup_local(
+                &sandbox.env(),
+                &local,
+                Agent::ClaudeCode,
+                false,
+                &sandbox.project,
+            )
+        };
+
+        // As `make local-setup` writes it: a Postgres URL and no store.
+        fs::create_dir_all(sandbox.dir()).expect("dir");
+        settings::write(&path, &[("DATABASE_URL", postgres.clone())]).expect("write");
+        run().expect("postgres install");
+        let lines = settings::read(&path).expect("read");
+        assert_eq!(setting(&lines, "DATABASE_URL"), Some(postgres.clone()));
+        assert_eq!(
+            setting(&lines, "MEMORYOS_STORE"),
+            None,
+            "Postgres is the default"
+        );
+
+        // What an earlier `setup --local` left behind.
+        settings::write(&path, &[("MEMORYOS_STORE", "sqlite".to_owned())]).expect("write");
+        run().expect("repair");
+        let lines = settings::read(&path).expect("read");
+        assert_eq!(setting(&lines, "DATABASE_URL"), Some(postgres));
+        assert_eq!(
+            setting(&lines, "MEMORYOS_STORE").as_deref(),
+            Some("postgres")
+        );
     }
 
     #[test]
