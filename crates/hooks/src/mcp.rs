@@ -1,16 +1,21 @@
 //! `memoryos mcp`: a stdio MCP server for the agent, forwarding each JSON-RPC line to the server's
 //! `/mcp` with the agent key. The agent's configuration therefore holds no key and no reference to
 //! one. The admin key is never used here.
+//!
+//! A `commit_facts` call the server cannot take goes to the [`outbox`] and is sent again after the
+//! server next answers, so facts saved during an outage are not lost.
 
 use std::io::{BufRead, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use url::Url;
 
 use crate::config::{self, process_env};
+use crate::outbox;
 use crate::settings;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -18,6 +23,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Longer than any tool call should take, so a hung server cannot stall the agent forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// The least time between two sends of the outbox, so a queue the server keeps failing on does not
+/// slow every message.
+const FLUSH_EVERY: Duration = Duration::from_secs(30);
 const INTERNAL_ERROR: i64 = -32603;
 const PARSE_ERROR: i64 = -32700;
 
@@ -66,6 +74,15 @@ pub fn run() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| format!("cannot start the runtime: {e}"))?;
+    // Without it, calls are forwarded as before and nothing is queued.
+    let outbox_dir = match config::outbox_dir(&process_env) {
+        Ok(dir) => Some(dir),
+        Err(message) => {
+            eprintln!("memoryos mcp: {message}. Failed saves are not queued.");
+            None
+        }
+    };
+    let mut last_flush: Option<Instant> = None;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -74,8 +91,15 @@ pub fn run() -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
-        let reply = runtime.block_on(forward(&http, &endpoint, &key, &line, &defaults));
-        if let Some(reply) = reply {
+        let forwarded = runtime.block_on(forward(
+            &http,
+            &endpoint,
+            &key,
+            &line,
+            &defaults,
+            outbox_dir.as_deref(),
+        ));
+        if let Some(reply) = forwarded.reply {
             // The host closed the pipe, so there is nobody left to serve.
             if writeln!(stdout, "{reply}")
                 .and_then(|()| stdout.flush())
@@ -84,8 +108,66 @@ pub fn run() -> Result<(), String> {
                 return Ok(());
             }
         }
+        // After the reply, so the agent never waits on the queue for its own call.
+        if let Some(dir) = outbox_dir.as_deref() {
+            if forwarded.server_answered && last_flush.is_none_or(|at| at.elapsed() >= FLUSH_EVERY)
+            {
+                last_flush = Some(Instant::now());
+                flush_outbox(&runtime, &http, &endpoint, &key, dir);
+            }
+        }
     }
     Ok(())
+}
+
+fn flush_outbox(
+    runtime: &tokio::runtime::Runtime,
+    http: &reqwest::Client,
+    endpoint: &str,
+    key: &str,
+    dir: &Path,
+) {
+    if outbox::pending(dir).is_empty() {
+        return;
+    }
+    let report = runtime.block_on(outbox::flush(dir, |arguments| {
+        outbox::send(http, endpoint, key, arguments)
+    }));
+    if report.saved > 0 || report.failed > 0 {
+        eprintln!(
+            "memoryos mcp: sent queued saves: {} saved, {} moved to {}, {} still queued",
+            report.saved,
+            report.failed,
+            dir.join("failed").display(),
+            report.left
+        );
+    }
+}
+
+/// What one forwarded line produced.
+struct Forwarded {
+    reply: Option<String>,
+    /// The server answered and did not fail on its side, so the outbox may be sent.
+    server_answered: bool,
+}
+
+/// Queues a `commit_facts` call and answers the model that it was queued. `None` when the call
+/// cannot be queued, and the caller then sends the error it had.
+fn queue(dir: Option<&Path>, id: Option<&Value>, message: &Value, key: &str) -> Option<String> {
+    let dir = dir?;
+    let id = id?;
+    match outbox::enqueue(
+        dir,
+        &message["params"]["arguments"],
+        key,
+        chrono::Utc::now(),
+    ) {
+        Ok(_) => Some(outbox::queued_reply(id, key)),
+        Err(error) => {
+            eprintln!("memoryos mcp: cannot queue a save: {error}");
+            None
+        }
+    }
 }
 
 /// After a reboot nothing runs the server of a local install, so the proxy the agent starts does.
@@ -147,12 +229,20 @@ async fn forward(
     key: &str,
     line: &str,
     defaults: &[String],
-) -> Option<String> {
+    outbox_dir: Option<&Path>,
+) -> Forwarded {
     let Ok(mut message) = serde_json::from_str::<Value>(line) else {
-        return Some(error_reply(&Value::Null, PARSE_ERROR, "invalid JSON"));
+        return Forwarded {
+            reply: Some(error_reply(&Value::Null, PARSE_ERROR, "invalid JSON")),
+            server_answered: false,
+        };
     };
     let id = message.get("id").cloned();
-    let body = if fill_scopes(&mut message, defaults) {
+    let filled = fill_scopes(&mut message, defaults);
+    // Before sending: a call that reached the server before its answer was lost is then saved once
+    // when the queued copy is sent again.
+    let commit_key = outbox::ensure_key(&mut message);
+    let body = if filled || commit_key.is_some() {
         message.to_string()
     } else {
         line.to_owned()
@@ -171,23 +261,48 @@ async fn forward(
         Ok(response) => {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
+            if let Some(commit_key) = &commit_key {
+                if outbox::classify(status, &body).should_queue() {
+                    if let Some(reply) = queue(outbox_dir, id.as_ref(), &message, commit_key) {
+                        return Forwarded {
+                            reply: Some(reply),
+                            server_answered: false,
+                        };
+                    }
+                }
+            }
             let reply = reply_for(id.as_ref(), status, &body, endpoint);
-            if lists_tools {
+            let reply = if lists_tools {
                 reply.map(|reply| describe_defaults(reply, defaults))
             } else {
                 reply
+            };
+            Forwarded {
+                reply,
+                server_answered: status < 500,
             }
         }
         Err(error) => {
+            if let Some(commit_key) = &commit_key {
+                if let Some(reply) = queue(outbox_dir, id.as_ref(), &message, commit_key) {
+                    return Forwarded {
+                        reply: Some(reply),
+                        server_answered: false,
+                    };
+                }
+            }
             let cause = if error.is_timeout() {
                 "did not answer in time"
             } else {
                 "cannot be reached"
             };
-            failure(
-                id.as_ref(),
-                &format!("the MemoryOS server at {endpoint} {cause}. Is it running?"),
-            )
+            Forwarded {
+                reply: failure(
+                    id.as_ref(),
+                    &format!("the MemoryOS server at {endpoint} {cause}. Is it running?"),
+                ),
+                server_answered: false,
+            }
         }
     }
 }

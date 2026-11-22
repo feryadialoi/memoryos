@@ -292,8 +292,10 @@ Symptoms, from stopping Postgres under a running server: `/healthz` 200, `/ready
 2. `dc start postgres`.
 3. The server reconnects on its own, with no restart. The drill was ready again at once.
 
-If the data is damaged, restore from backup, above. Writes during the outage were rejected, not
-queued, so clients must retry them.
+If the data is damaged, restore from backup, above. During the outage the server rejected writes.
+Agents connected through `memoryos mcp` queued their `commit_facts` calls on their own machine and
+send them once the server answers again; `memoryos outbox` on that machine lists what is still queued.
+REST and SDK clients are not queued and must retry.
 
 ### Model download stall
 

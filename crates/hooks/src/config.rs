@@ -175,14 +175,24 @@ pub fn home(env: Env<'_>) -> Result<PathBuf, String> {
         .ok_or_else(|| "HOME is not set".to_owned())
 }
 
-/// Where hook state lives: `$XDG_STATE_HOME`, or `~/.local/state`.
-pub fn state_dir(env: Env<'_>) -> Result<PathBuf, String> {
+/// `memoryos` under `$XDG_STATE_HOME`, or under `~/.local/state`.
+fn state_home(env: Env<'_>) -> Result<PathBuf, String> {
     // The XDG specification says a relative value must be ignored.
     let base = match env("XDG_STATE_HOME").map(PathBuf::from) {
         Some(path) if path.is_absolute() => path,
         _ => home(env)?.join(".local").join("state"),
     };
-    Ok(base.join("memoryos").join("hook-turns"))
+    Ok(base.join("memoryos"))
+}
+
+/// Where hook state lives.
+pub fn state_dir(env: Env<'_>) -> Result<PathBuf, String> {
+    Ok(state_home(env)?.join("hook-turns"))
+}
+
+/// Where `commit_facts` calls wait while the server cannot take them.
+pub fn outbox_dir(env: Env<'_>) -> Result<PathBuf, String> {
+    Ok(state_home(env)?.join("outbox"))
 }
 
 /// `$XDG_CONFIG_HOME`, or `~/.config`.

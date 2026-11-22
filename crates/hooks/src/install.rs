@@ -40,9 +40,91 @@ const OPENCODE_ENTRY: &str = r#"{"type":"local","command":["memoryos","mcp"],"en
 const PI_ENTRY: &str = r#"{"command":"memoryos","args":["mcp"]}"#;
 
 /// The default export OpenCode 2.2.5 requires: an id and a setup function. A plain object needs no
-/// import, so nothing has to be installed next to the file. `execFile` replaces v1's `$`, which v2
-/// removed. Failing to recall must not fail a compaction, so any error yields no text.
-const OPENCODE_PLUGIN: &str = r#"import { execFile } from "node:child_process";
+/// import, so nothing has to be installed next to the file. Each handler runs the same
+/// `memoryos hook` command Claude Code runs, so no hook logic is repeated here:
+///
+/// - `compaction`: recalled memories go into the checkpoint summary, like Claude Code's PreCompact.
+/// - `prompt`, once per user message: `hook prompt` recalls facts for it and may add the save nudge.
+///   OpenCode documents that a hook's `system` text reaches only the outgoing model call, so the text
+///   is kept for the turn and added by `context`, which runs before every model call of the turn.
+///   No session id is passed, so the next prompt can recall the same facts again: they are gone
+///   from the model's view once the turn ends.
+/// - `experimental.idle`, when a turn ends: `hook stop` counts the turn and, every
+///   `MEMORYOS_HOOK_STOP_EVERY` turns, returns the save reminder, sent back as a synthetic message
+///   so the agent continues. The turn that message starts passes `stop_hook_active`, so the reminder
+///   cannot loop. Names and event fields checked against the OpenCode 2.2.5 binary.
+///
+/// Any failure yields no text and never throws into OpenCode. `execFile` replaced v1's `$`, which v2
+/// removed; `spawn` is used now because the hooks read JSON on stdin.
+const OPENCODE_PLUGIN: &str = r#"import { spawn } from "node:child_process";
+
+const hook = (name, input) =>
+  new Promise((resolve) => {
+    let out = "";
+    let child;
+    try {
+      child = spawn("memoryos", ["hook", name], { stdio: ["pipe", "pipe", "ignore"] });
+    } catch {
+      return resolve("");
+    }
+    const timer = setTimeout(() => child.kill(), 10000);
+    child.stdout.on("data", (chunk) => (out += chunk));
+    child.stdin.on("error", () => {});
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve("");
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve(code === 0 ? out : "");
+    });
+    child.stdin.end(JSON.stringify(input));
+  });
+
+export default {
+  id: "memoryos",
+  async setup(ctx) {
+    const turns = new Map();
+    const reminded = new Set();
+    await ctx.session.hook("compaction", async (event) => {
+      const memories = await hook("session-start", { cwd: process.cwd() });
+      if (memories.trim()) event.system.push({ type: "text", text: memories });
+    });
+    await ctx.session.hook("prompt", async (event) => {
+      const text = await hook("prompt", { cwd: process.cwd(), prompt: event.prompt?.text ?? "" });
+      if (text.trim()) turns.set(event.sessionID, text);
+      else turns.delete(event.sessionID);
+    });
+    await ctx.session.hook("context", (event) => {
+      const text = turns.get(event.sessionID);
+      if (text) event.system.push({ type: "text", text });
+    });
+    await ctx.session.hook("experimental.idle", async (event) => {
+      turns.delete(event.sessionID);
+      const active = reminded.delete(event.sessionID);
+      const out = await hook("stop", { session_id: event.sessionID, stop_hook_active: active });
+      let reason;
+      try {
+        reason = JSON.parse(out).reason;
+      } catch {
+        return;
+      }
+      if (typeof reason !== "string" || !reason) return;
+      reminded.add(event.sessionID);
+      try {
+        await ctx.session.synthetic({ sessionID: event.sessionID, text: reason, metadata: { source: "memoryos" } });
+      } catch {
+        reminded.delete(event.sessionID);
+      }
+    });
+  },
+};
+"#;
+
+/// Older forms: the compaction-only v2 plugin, then two in the v1 plugin API that OpenCode 2.2.5
+/// refuses to load.
+const OLD_OPENCODE_PLUGINS: [&str; 3] = [
+    r#"import { execFile } from "node:child_process";
 
 const recall = () =>
   new Promise((resolve) => {
@@ -60,10 +142,7 @@ export default {
     });
   },
 };
-"#;
-
-/// Older forms, in the v1 plugin API that OpenCode 2.2.5 refuses to load.
-const OLD_OPENCODE_PLUGINS: [&str; 2] = [
+"#,
     r#"export const MemoryOS = async ({ $ }) => ({
   "experimental.session.compacting": async (_input, output) => {
     const memories = await $`memoryos hook session-start`.nothrow().text();
@@ -789,7 +868,7 @@ fn install_plugin(existing: Option<&str>) -> Outcome {
         },
         Some(old) if OLD_OPENCODE_PLUGINS.contains(&old) => Outcome {
             after: After::Write(OPENCODE_PLUGIN.to_owned()),
-            notes: vec!["replaced the old plugin, which OpenCode 2 cannot load".to_owned()],
+            notes: vec!["replaced an older MemoryOS plugin".to_owned()],
         },
         Some(_) => Outcome {
             after: After::Unchanged,
@@ -1375,17 +1454,44 @@ mod tests {
         assert!(OPENCODE_PLUGIN.contains("export default {"));
         assert!(OPENCODE_PLUGIN.contains("id: \"memoryos\""));
         assert!(OPENCODE_PLUGIN.contains("async setup(ctx)"));
-        assert!(OPENCODE_PLUGIN.contains("ctx.session.hook(\"compaction\""));
+        for event in ["compaction", "prompt", "context", "experimental.idle"] {
+            assert!(
+                OPENCODE_PLUGIN.contains(&format!("ctx.session.hook(\"{event}\"")),
+                "{event}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plugin_runs_the_existing_hook_commands() {
+        for command in ["\"session-start\"", "\"prompt\"", "\"stop\""] {
+            assert!(
+                OPENCODE_PLUGIN.contains(&format!("hook({command}")),
+                "{command}"
+            );
+        }
+        assert!(OPENCODE_PLUGIN.contains("spawn(\"memoryos\", [\"hook\", name]"));
+    }
+
+    #[test]
+    fn the_save_reminder_cannot_loop() {
+        // The turn the reminder starts runs `hook stop` with `stop_hook_active`, which never blocks.
+        assert!(OPENCODE_PLUGIN.contains("const active = reminded.delete(event.sessionID);"));
+        assert!(OPENCODE_PLUGIN.contains("stop_hook_active: active"));
+        assert!(OPENCODE_PLUGIN.contains("reminded.add(event.sessionID);"));
     }
 
     #[test]
     fn the_plugin_cannot_raise_or_push_empty_text() {
-        assert!(OPENCODE_PLUGIN.contains("resolve(error ? \"\" : stdout)"));
+        assert!(OPENCODE_PLUGIN.contains("resolve(code === 0 ? out : \"\")"));
+        assert!(OPENCODE_PLUGIN.contains("child.on(\"error\""));
+        assert!(OPENCODE_PLUGIN.contains("child.stdin.on(\"error\""));
         assert!(OPENCODE_PLUGIN.contains("if (memories.trim()) event.system.push"));
+        assert!(OPENCODE_PLUGIN.contains("if (text) event.system.push"));
     }
 
     #[test]
-    fn the_v1_plugins_are_replaced_on_install_and_removed_on_uninstall() {
+    fn older_plugins_are_replaced_on_install_and_removed_on_uninstall() {
         for old in OLD_OPENCODE_PLUGINS {
             assert_eq!(
                 install_plugin(Some(old)).after,
