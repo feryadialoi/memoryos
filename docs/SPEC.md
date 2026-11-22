@@ -433,7 +433,7 @@ The environment wins. A missing file is no settings; one that cannot be read sto
 |---|---|---|
 | `MEMORYOS_STORE` | `postgres` | `postgres` or `sqlite` |
 | `DATABASE_URL` | required | PostgreSQL URL, or a `sqlite:` URL such as `sqlite:///absolute/path/memoryos.db` |
-| `MEMORYOS_BIND` | `0.0.0.0:6366` | |
+| `MEMORYOS_BIND` | `127.0.0.1:6366` | The Docker image sets `0.0.0.0:6366`, published on the host's loopback by Compose |
 | `MEMORYOS_DB_MAX_CONNECTIONS` | `20` | PostgreSQL only; SQLite uses one connection |
 | `MEMORYOS_RATE_LIMIT_RPS` | `100` | Per key |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Traces are exported only when set |

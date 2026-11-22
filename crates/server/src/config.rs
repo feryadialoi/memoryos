@@ -51,7 +51,10 @@ impl fmt::Debug for Config {
 
 pub type ConfigResult<T> = std::result::Result<T, String>;
 
-pub const DEFAULT_BIND: &str = "0.0.0.0:6366";
+/// Loopback only, so a server started without settings is not reachable from the network. The
+/// Docker image sets `MEMORYOS_BIND=0.0.0.0:6366`, since a container must listen on all of its own
+/// interfaces for a published port to reach it.
+pub const DEFAULT_BIND: &str = "127.0.0.1:6366";
 
 /// The three reranker settings, which `memoryos reranker` reads without the rest of the
 /// configuration, so it works where `DATABASE_URL` is not set.
@@ -195,7 +198,7 @@ mod tests {
         let config = load(&[DB]).expect("valid");
         assert_eq!(config.store_backend, Backend::Postgres);
         assert_eq!(config.rate_limit_rps, 100);
-        assert_eq!(config.bind, "0.0.0.0:6366");
+        assert_eq!(config.bind, "127.0.0.1:6366");
     }
 
     #[test]
