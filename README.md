@@ -61,6 +61,13 @@ a reboot, the `memoryos mcp` that Claude Code launches starts the server again.
 | Remove it | `memoryos setup --uninstall --global`, add `--delete-data` to delete the database |
 | Read and write knowledge pages | `memoryos page list`, `read`, `write` (markdown from a file or stdin), `edit` (opens your editor, such as `MEMORYOS_EDITOR="code --wait"`), `delete` |
 | Keep knowledge in git | `memoryos page sync docs/knowledge --scope shared:team` writes changed `.md` files, `memoryos page pull` writes MemoryOS edits back. Commit `.memoryos-sync.json` with the pages |
+| See saves queued during an outage | `memoryos outbox`, and `memoryos outbox --flush` to send them now |
+
+When the server cannot take an agent's `commit_facts` call (it is down, unreachable, or its database
+or embedder fails), `memoryos mcp` keeps the call in `~/.local/state/memoryos/outbox` and tells the
+agent it was queued. It sends the queue again, with the same idempotency key, after the server next
+answers, so a call that did arrive is not saved twice. A call the server refuses, or one that fails on
+the server 20 times, moves to `outbox/failed` and stays there for you to read.
 
 ### With Docker and Postgres
 
@@ -399,8 +406,11 @@ plugin, the MCP tools are named `mcp__plugin_memoryos_memoryos__*` instead of `m
 <details>
 <summary><b>OpenCode setup</b></summary>
 
-`.opencode/plugins/memoryos.ts` and an `mcp.memoryos` entry in `opencode.json`. The plugin adds recalled
-memories to compaction. It does not remind the agent to save, which would need a separate handler.
+`.opencode/plugins/memoryos.ts` and an `mcp.memoryos` entry in `opencode.json`. The plugin runs the same
+`memoryos hook` commands as Claude Code: recalled memories go into compaction; each user message gets
+the facts `hook prompt` recalls for it, and its save nudge, for the length of that turn; and when a turn
+ends, `hook stop` counts it and every `MEMORYOS_HOOK_STOP_EVERY` turns sends the save reminder back so the
+agent continues. Run `memoryos setup --agent opencode` again to replace an older plugin.
 
 </details>
 
@@ -430,7 +440,7 @@ The `memoryos hook` commands never fail the host: on an error they log to stderr
 
 | Agent | Checked against the real program, with no model turn |
 |---|---|
-| OpenCode 2.2.5 | The plugin loads, and MCP connects through `memoryos mcp` with 6 tools |
+| OpenCode 2.2.5 | The plugin loads, and MCP connects through `memoryos mcp` with 6 tools. In an `opencode run` turn, the prompt hook added recalled memories, and at the end of the turn the save reminder made the agent continue once and then stop |
 | Pi 1.4.0 | `pi mcp list` connects through `memoryos mcp` with 6 tools, in a trusted project |
 | Claude Code | Not run. Only the written files and the proxy are tested |
 
@@ -488,4 +498,4 @@ cargo deny check
 
 ## 📄 License
 
-Apache-2.0, as declared in `Cargo.toml`.
+Apache-2.0. The full text is in [`LICENSE`](LICENSE).

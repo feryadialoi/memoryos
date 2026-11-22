@@ -15,6 +15,7 @@ mod hook;
 mod install;
 mod knowledge;
 mod mcp;
+mod outbox;
 mod page;
 pub mod settings;
 mod setup;
@@ -75,6 +76,15 @@ pub enum Command {
     Setup(SetupArgs),
     /// Stdio MCP server for an agent, forwarding to the running server with the agent key.
     Mcp,
+    /// Show saves queued while the server could not take them, and those that failed.
+    Outbox {
+        /// Send the queued saves now, instead of waiting for `memoryos mcp` to send them.
+        #[arg(long)]
+        flush: bool,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Count MemoryOS tool use and prompt cache reads in Claude Code transcripts. Prints counts
     /// only, never transcript text.
     Stats {
@@ -229,6 +239,7 @@ pub fn run(command: Command) -> Result<(), String> {
         }
         Command::Setup(args) => setup::run(&args),
         Command::Mcp => mcp::run(),
+        Command::Outbox { flush, json } => outbox::run(flush, json),
         Command::Stats { dir, days, json } => stats::run(dir.as_deref(), days, json),
         Command::Hook(HookCommand::Install(args)) => install::run_install(&args),
         Command::Hook(HookCommand::Uninstall(args)) => install::run_uninstall(&args),

@@ -1646,7 +1646,10 @@ fn opencode_install_writes_the_plugin_and_merges_the_server() {
 
     let plugin = fs::read_to_string(sandbox.file(".opencode/plugins/memoryos.ts")).expect("plugin");
     assert!(plugin.contains("export default"));
-    assert!(plugin.contains("\"hook\", \"session-start\""));
+    assert!(plugin.contains("spawn(\"memoryos\", [\"hook\", name]"));
+    for command in ["session-start", "prompt", "stop"] {
+        assert!(plugin.contains(&format!("hook(\"{command}\"")), "{command}");
+    }
     let merged = read_json(&config);
     assert_eq!(merged["model"], "x");
     assert_eq!(
