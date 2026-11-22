@@ -37,6 +37,9 @@ RUN useradd --system --uid 10001 --user-group --home-dir /var/lib/memoryos --she
 COPY --from=builder /app/target/release/memoryos /usr/local/bin/memoryos
 COPY --chmod=0755 deploy/healthcheck.sh /usr/local/bin/memoryos-healthcheck
 ENV MEMORYOS_MODEL_CACHE=/var/lib/memoryos/models
+# The server's own default is loopback. In a container that would refuse the published port, so the
+# image listens on all of the container's interfaces; Compose publishes it on the host's loopback.
+ENV MEMORYOS_BIND=0.0.0.0:6366
 USER 10001:10001
 EXPOSE 6366
 # The first start downloads a 481 MB embedding model, and /readyz fails until it has loaded. A 571 MB

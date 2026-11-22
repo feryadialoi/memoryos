@@ -3141,6 +3141,43 @@ async fn row_level_security_holds_under_the_superuser_login() -> TestResult {
     Ok(())
 }
 
+/// The app role may add and read audit rows of its tenant, but never change or remove one.
+#[tokio::test]
+async fn the_audit_log_is_append_only_for_the_app_role() -> TestResult {
+    let db = db().await;
+    let a = ctx("tenant-a");
+    let scope = user("u1");
+    let subject = entity(&db, &a, &scope, "ada").await?;
+    let (_, fact) = add_fact(&db, &a, new_fact(&scope, subject, "f", date(2020, 1))).await?;
+    db.store.invalidate_fact(&a, fact, "audit").await?;
+
+    for statement in [
+        "UPDATE audit_events SET action = 'rewritten'",
+        "DELETE FROM audit_events",
+    ] {
+        let mut tx = db.admin.begin().await?;
+        sqlx::query("SET LOCAL ROLE memoryos_app")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT set_config('app.tenant', 'tenant-a', true)")
+            .execute(&mut *tx)
+            .await?;
+        let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events")
+            .fetch_one(&mut *tx)
+            .await?;
+        assert!(seen >= 1, "the app role still reads its audit rows");
+        let code = sqlx::query(statement)
+            .execute(&mut *tx)
+            .await
+            .expect_err(statement)
+            .into_database_error()
+            .and_then(|e| e.code().map(|c| c.into_owned()));
+        assert_eq!(code.as_deref(), Some("42501"), "{statement}");
+        tx.rollback().await?;
+    }
+    Ok(())
+}
+
 /// Calls the search function as memoryos_app. `tenant = None` leaves app.tenant unset.
 async fn search_ids_as_app(
     pool: &PgPool,
