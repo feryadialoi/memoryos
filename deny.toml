@@ -15,6 +15,10 @@ ignore = [
     # Unmaintained, no patched version. In the shipped dependency tree through tokenizers, but
     # paste is a proc macro: it runs at compile time on source code and is not linked or fed input.
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; compile-time proc macro under tokenizers, no runtime input" },
+    # Unmaintained since 2026-11, no patched version and no known vulnerability. Used by every crate
+    # for timestamps and also pulled in by sqlx-core, so it stays in the tree until both move to jiff
+    # or time.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; no patched version, also required by sqlx-core" },
 ]
 
 [licenses]
