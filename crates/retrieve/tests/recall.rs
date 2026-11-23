@@ -384,6 +384,7 @@ impl Fixture {
             as_of: None,
             known_at: None,
             page_limit: memoryos_retrieve::DEFAULT_PAGE_LIMIT,
+            insight_limit: memoryos_retrieve::DEFAULT_INSIGHT_LIMIT,
         }
     }
 
@@ -436,6 +437,38 @@ async fn pages_are_ranked_apart_and_only_current() {
         f.scope.clone(),
     )
     .pages_are_ranked_apart_and_only_current()
+    .await;
+}
+
+#[tokio::test]
+async fn insights_are_recalled_apart_and_only_active() {
+    let f = fixture().await;
+    common::Scenario::new(
+        f.store.clone(),
+        f.embedder.clone(),
+        f.ctx.clone(),
+        f.scope.clone(),
+    )
+    .insights_are_recalled_apart_and_only_active()
+    .await;
+}
+
+#[tokio::test]
+async fn failing_insight_searches_leave_facts_and_pages() {
+    let f = fixture().await;
+    let break_insights = async {
+        sqlx::query("ALTER TABLE insights RENAME TO gone")
+            .execute(&f.admin)
+            .await
+            .expect("rename insights");
+    };
+    common::Scenario::new(
+        f.store.clone(),
+        f.embedder.clone(),
+        f.ctx.clone(),
+        f.scope.clone(),
+    )
+    .recall_survives_failing_insight_searches(break_insights)
     .await;
 }
 
@@ -1036,6 +1069,11 @@ async fn invalid_requests_are_rejected() {
         assert!(is_invalid(f.retriever.recall(&f.ctx, request).await));
         let candidates = f.retriever.candidates(&f.ctx, &scopes, QUERY, limit).await;
         assert!(is_invalid(candidates));
+    }
+    for insight_limit in [-1, 11] {
+        let mut request = f.request(QUERY);
+        request.insight_limit = insight_limit;
+        assert!(is_invalid(f.retriever.recall(&f.ctx, request).await));
     }
     for blank in ["", "  \n\t"] {
         assert!(is_invalid(

@@ -1,17 +1,18 @@
 //! Page search for recall: sections of current page versions, fused like facts and returned as one
 //! hit per page. See docs/SPEC.md section 7.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use memoryos_core::{Error, PageSectionHit, Result, Scope};
+use memoryos_core::{PageSectionHit, Result, Scope};
 use serde::Serialize;
 use uuid::Uuid;
+
+use crate::fusion;
 
 pub const DEFAULT_PAGE_LIMIT: i64 = 3;
 pub const MAX_PAGE_LIMIT: i64 = 10;
 /// Candidates per search list, vector and text.
 pub(crate) const PAGE_CANDIDATES_PER_LIST: i64 = 20;
-const RRF_K: f64 = 60.0;
 const SNIPPET_CHARS: usize = 300;
 
 /// The best section of one page for a query.
@@ -52,21 +53,7 @@ pub(crate) fn rerank_text(section: &PageSectionHit) -> String {
 /// Reciprocal rank fusion over section lists with `k = 60`, then only the best section of each
 /// page, highest score first. Equal scores order by section id, so the result is deterministic.
 pub(crate) fn fuse_sections<'a>(lists: &[&'a [PageSectionHit]]) -> Vec<(&'a PageSectionHit, f64)> {
-    let mut scored: HashMap<Uuid, (&'a PageSectionHit, f64)> = HashMap::new();
-    for list in lists {
-        let mut seen = HashSet::new();
-        let unique = list.iter().filter(|hit| seen.insert(hit.section_id));
-        for (index, hit) in unique.enumerate() {
-            let contribution = 1.0 / (RRF_K + (index + 1) as f64);
-            scored.entry(hit.section_id).or_insert((hit, 0.0)).1 += contribution;
-        }
-    }
-    let mut fused: Vec<_> = scored.into_values().collect();
-    fused.sort_unstable_by(|(a, a_score), (b, b_score)| {
-        b_score
-            .total_cmp(a_score)
-            .then_with(|| a.section_id.cmp(&b.section_id))
-    });
+    let mut fused = fusion::fuse_by(lists, |hit| hit.section_id);
     let mut pages = HashSet::new();
     fused.retain(|(hit, _)| pages.insert(hit.page_id));
     fused
@@ -74,12 +61,7 @@ pub(crate) fn fuse_sections<'a>(lists: &[&'a [PageSectionHit]]) -> Vec<(&'a Page
 
 /// Checks `page_limit` and returns it as a count.
 pub(crate) fn validate_page_limit(page_limit: i64) -> Result<usize> {
-    if !(0..=MAX_PAGE_LIMIT).contains(&page_limit) {
-        return Err(Error::InvalidInput(format!(
-            "page_limit must be in 0..={MAX_PAGE_LIMIT}, got {page_limit}"
-        )));
-    }
-    Ok(page_limit as usize)
+    fusion::validate_side_limit("page_limit", page_limit, MAX_PAGE_LIMIT)
 }
 
 #[cfg(test)]
