@@ -16,4 +16,5 @@ pub use host::{
 pub use pages::{
     split_sections, PageWrite, PageWriteOutcome, PageWriter, SplitSection, PAGE_HEADING_MAX,
 };
+pub use redact::redact;
 pub use single::{normalize_predicate, SingleValued, DEFAULT_SINGLE_VALUED_PREDICATES};
