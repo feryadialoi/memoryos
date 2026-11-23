@@ -37,6 +37,10 @@ actually run. States: `todo`, `doing`, `done`, `blocked`, `removed`.
 | T31 Insights store | done | Merged b0fe4c3, lead fix (Store dispatched none of the insight methods, hidden by the trait's default bodies, which are now removed; confirm takes the writer's trust). Agent: store 108 Postgres, 66 SQLite, workspace 575. Lead after merging T31 and T33: store 108 Postgres and 66 SQLite, retrieve 29 Postgres and 6 SQLite, workspace tests pass |
 | T32 Reflect batch | done | Merged at 322c62c. Agent: reflect 10 on Postgres and 10 on SQLite, store suites and workspace pass; a mutation check showed the tests fail without the status filter or tenant predicate |
 | T33 Insights in recall | done | Merged. Insights fused with the shared `fusion::fuse_by`, never reranked; a failing insight search leaves only that list empty. Agent: retrieve 50 unit, 29 Postgres, 6 SQLite; fact ids and score bits equal with insight_limit 0 and 3 |
+| T34 Insights REST, MCP, SDK | done | Merged 911ade3. Statement masked with the ingest `redact` (now exported), writer trust is the key's max_trust capped at agent. Agent: server 86 Postgres integration and 21 SQLite, SDK 21, workspace 590; both contract tests cover every operation |
+| T35 Insights in hooks and CLI | done | Merged f5557c3; lead fix 413cc5e (the MCP proxy fills a missing scope for the insight tools). Agent: hooks 283 unit and 43 integration, workspace 632. Nightly schedule tested with fake launchctl, systemctl and claude in a temp HOME; host command forms checked against each CLI's --help only |
+| T36 Insights on the review page | done | Merged 9f4fd14. Agent's Playwright check on a throwaway SQLite server: every level, status and stale change, approve, reject, retire, planted HTML shown as text, light, dark, 390 px, no console errors. Lead viewed the stale drawer screenshot |
+| Map rework | done | Merged 2e8dcee. Live d3-force layout on a canvas. Agent measured in headless Chromium: settles in 1.7 s, no frame over 16.7 ms at 34 real nodes and at 300 and 450 synthetic nodes |
 
 ## Production gates (SPEC section 12)
 
