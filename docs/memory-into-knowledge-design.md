@@ -1,7 +1,9 @@
 # Memory into knowledge: design and plan
 
 Status: approved 2026-11-22 (D1 to D6 in section 13, with D3 revised so reflect runs without anyone
-remembering to start it). Nothing here is built. T30 starts with the contracts.
+remembering to start it). ADR 0008 records the decision. Where this file and `docs/SPEC.md`
+disagree, SPEC is the contract: T30 moved the details there, with the `superseded` status, the
+`pending_supersede_of` column and the strict lower-level rule for sources added.
 
 ## 1. Goal
 
@@ -54,7 +56,7 @@ CREATE TABLE insights (
     level         text NOT NULL CHECK (level IN ('context', 'understanding', 'guidance')),
     statement     text NOT NULL,       -- at most 1,000 chars
     trust         text NOT NULL,       -- lowest of the writer's trust and every source's trust
-    status        text NOT NULL CHECK (status IN ('active', 'stale', 'quarantined', 'rejected', 'retired')),
+    status        text NOT NULL CHECK (status IN ('active', 'stale', 'quarantined', 'rejected', 'retired', 'superseded')),
     stale_reason  jsonb,               -- which sources changed and how, set with status 'stale'
     valid_from    timestamptz NOT NULL,
     valid_to      timestamptz,         -- set when superseded or retired
@@ -92,8 +94,8 @@ Rules on write, all checked by the server:
 - At least 2 sources. One fact restated is not synthesis.
 - Every source is current and active, in the insight's own scope (decision D6). A quarantined,
   closed, expired or invalidated fact cannot be cited.
-- A source insight has a lower level: context and understanding can cite facts and context;
-  guidance can cite anything below it. No cycles, because a source must already exist.
+- A source insight has a strictly lower level: context cites facts only, understanding cites facts
+  and context, guidance cites anything below it. No cycles, because a source must already exist.
 - Row-level security, grants and the SQLite tables (`insight_embeddings` vec0, `insights_fts` FTS5)
   follow the facts tables.
 

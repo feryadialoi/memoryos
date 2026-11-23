@@ -134,6 +134,7 @@ impl PgStore {
                 entities: 0,
                 blocks: 0,
                 pages: 0,
+                insights: 0,
                 last_recorded_at: None,
             }))
         }

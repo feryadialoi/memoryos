@@ -966,6 +966,7 @@ mod tests {
             entities: 1,
             blocks: 0,
             pages: 0,
+            insights: 0,
             last_recorded_at: None,
         }
     }

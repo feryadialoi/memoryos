@@ -10,6 +10,24 @@ use crate::common::{random_uuid, Server};
 
 const METHODS: [&str; 7] = ["get", "post", "put", "delete", "patch", "head", "options"];
 
+/// Insight operations documented by T30 and served from T34, which removes this list.
+const NOT_YET_SERVED: [(&str, &str); 10] = [
+    ("GET", "/v1/insights"),
+    ("POST", "/v1/insights"),
+    ("GET", "/v1/insights/quarantine"),
+    ("POST", "/v1/insights/quarantine/{id}/approve"),
+    ("POST", "/v1/insights/quarantine/{id}/reject"),
+    ("GET", "/v1/insights/{id}"),
+    ("POST", "/v1/insights/{id}/confirm"),
+    ("POST", "/v1/insights/{id}/retire"),
+    ("POST", "/v1/reflect/batch"),
+    ("POST", "/v1/reflect/decline"),
+];
+
+fn not_yet_served(method: &str, path: &str) -> bool {
+    NOT_YET_SERVED.contains(&(method, path))
+}
+
 struct Operation {
     method: String,
     path: String,
@@ -48,8 +66,16 @@ fn operations() -> Vec<Operation> {
 
 #[test]
 fn served_routes_match_the_openapi_file_exactly() {
-    let documented: BTreeSet<(String, String, bool)> = operations()
+    let all = operations();
+    for (method, path) in NOT_YET_SERVED {
+        assert!(
+            all.iter().any(|op| op.method == method && op.path == path),
+            "{method} {path} is listed as not yet served but is not documented"
+        );
+    }
+    let documented: BTreeSet<(String, String, bool)> = all
         .into_iter()
+        .filter(|op| !not_yet_served(&op.method, &op.path))
         .map(|op| (op.method, op.path, op.public))
         .collect();
     let served: BTreeSet<(String, String, bool)> = served_routes()
@@ -74,6 +100,9 @@ async fn every_documented_operation_reaches_a_handler() {
     let server = Server::start().await;
     let key = server.root("contract").await;
     for operation in operations() {
+        if not_yet_served(&operation.method, &operation.path) {
+            continue;
+        }
         let path = operation
             .path
             .replace("{id}", &random_uuid().to_string())

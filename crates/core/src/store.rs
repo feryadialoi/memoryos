@@ -27,16 +27,17 @@ pub trait MemoryStore: Send + Sync {
     /// Deletes the episode. Facts it alone supports are deleted; facts with other sources lose
     /// this source and stay, with trust recomputed as the highest among the remaining sources. A
     /// surviving active fact whose new trust falls under a source quarantine rule of SPEC section 5
-    /// becomes quarantined. Entities left with no facts are deleted.
+    /// becomes quarantined. Entities left with no facts are deleted. Insights citing a deleted
+    /// fact, or a fact this reopens or relinks, become stale (SPEC section 8, Insights).
     async fn purge_episode(&self, ctx: &RequestContext, id: Uuid) -> Result<PurgeReport>;
-    /// Hard-deletes everything stored under `scope`, including its pages, and blocks when it is an
-    /// agent scope.
+    /// Hard-deletes everything stored under `scope`, including its pages and insights, and blocks
+    /// when it is an agent scope.
     async fn purge_scope(&self, ctx: &RequestContext, scope: &Scope) -> Result<PurgeReport>;
 
     // Commits
     /// Atomically applies `ops` and sets `episodes.processed_at`. If the episode is already
     /// processed this is a no-op returning an empty list, which makes a replayed commit idempotent.
-    /// Returns ids of inserted facts.
+    /// Returns ids of inserted facts. Insights citing a fact this closes become stale.
     async fn apply_commit(
         &self,
         ctx: &RequestContext,
@@ -81,7 +82,8 @@ pub trait MemoryStore: Send + Sync {
     async fn facts_for_episode(&self, ctx: &RequestContext, episode_id: Uuid) -> Result<Vec<Fact>>;
     /// All versions in the supersession chain containing `id`, oldest first.
     async fn fact_history(&self, ctx: &RequestContext, id: Uuid) -> Result<Vec<Fact>>;
-    /// Marks the fact retracted by setting `invalidated_at`. Writes an audit event.
+    /// Marks the fact retracted by setting `invalidated_at`. Writes an audit event. Insights citing
+    /// it become stale.
     async fn invalidate_fact(&self, ctx: &RequestContext, id: Uuid, reason: &str) -> Result<Fact>;
     /// The fact if it is current in `scope`: active and visible now, as section 4 defines it.
     async fn current_fact(
@@ -128,6 +130,7 @@ pub trait MemoryStore: Send + Sync {
     /// moved to a head the fact was not reviewed against, and that head has higher trust, nothing
     /// is activated or closed: the fact stays quarantined, `pending_supersede_of` moves to the new
     /// head, that change is committed, and this returns `InvalidInput` so it can be reviewed again.
+    /// Insights citing the closed head become stale.
     async fn approve_fact(&self, ctx: &RequestContext, id: Uuid) -> Result<Fact>;
     async fn reject_fact(&self, ctx: &RequestContext, id: Uuid) -> Result<Fact>;
 
@@ -257,6 +260,134 @@ pub trait MemoryStore: Send + Sync {
         limit: i64,
     ) -> Result<Vec<PageSectionHit>>;
 
+    // Insights (docs/SPEC.md section 8, Insights). The default bodies exist only until both
+    // backends implement insights in T31, which removes them. Every method that lists or searches
+    // insights first marks stale the active insights of the scopes it reads whose fact sources
+    // have expired, since expiry is a time and no write marks it.
+    /// Writes an insight atomically:
+    /// - `InvalidInput` unless the statement is 1 to `INSIGHT_STATEMENT_MAX` characters, there are
+    ///   `INSIGHT_SOURCES_MIN` to `INSIGHT_SOURCES_MAX` distinct sources, every source is in
+    ///   `scope`, every fact source is active and valid now, and every insight source is active and
+    ///   of a level that `InsightLevel::may_cite` allows.
+    /// - Trust is the lowest of `trust` and every source's trust. The insight is quarantined when
+    ///   `insight_requires_quarantine(scope, level, trust)` holds, and active otherwise.
+    /// - With `supersedes`, that insight must be active or stale in `scope`, else `InvalidInput`.
+    ///   When the new insight is active, the old one becomes superseded with `valid_to` and
+    ///   `superseded_by` set; a quarantined new insight closes it on approval.
+    /// - Writes an `insight.write` audit event.
+    async fn put_insight(&self, ctx: &RequestContext, insight: NewInsight) -> Result<Insight> {
+        let _ = (ctx, insight);
+        Err(insights_not_implemented())
+    }
+    /// The insight in any status, its sources as they are now, and the insights it replaced.
+    async fn get_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<InsightDetail> {
+        let _ = (ctx, id);
+        Err(insights_not_implemented())
+    }
+    /// Insights in `scopes`, newest first, at most `limit` (1..=500).
+    async fn list_insights(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        filter: &InsightFilter,
+        limit: i64,
+    ) -> Result<Vec<Insight>> {
+        let _ = (ctx, scopes, filter, limit);
+        Err(insights_not_implemented())
+    }
+    /// Replaces a stale insight's sources with `sources`, checked as `put_insight` checks them, and
+    /// makes it active again, or quarantined if the gate now says so. `InvalidInput` unless it is
+    /// stale. Writes an `insight.confirm` audit event.
+    async fn confirm_insight(
+        &self,
+        ctx: &RequestContext,
+        id: Uuid,
+        sources: &[InsightSourceRef],
+    ) -> Result<Insight> {
+        let _ = (ctx, id, sources);
+        Err(insights_not_implemented())
+    }
+    /// Retires an active or stale insight: no longer true. Insights citing it become stale.
+    /// Writes an `insight.retire` audit event with `reason`.
+    async fn retire_insight(
+        &self,
+        ctx: &RequestContext,
+        id: Uuid,
+        reason: &str,
+    ) -> Result<Insight> {
+        let _ = (ctx, id, reason);
+        Err(insights_not_implemented())
+    }
+    /// Quarantined insights in `scopes`, oldest first.
+    async fn list_quarantined_insights(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        limit: i64,
+    ) -> Result<Vec<Insight>> {
+        let _ = (ctx, scopes, limit);
+        Err(insights_not_implemented())
+    }
+    /// Activates a quarantined insight, and closes the insight it supersedes. If any source is no
+    /// longer current it becomes stale instead. Writes an `insight.approve` audit event.
+    async fn approve_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<Insight> {
+        let _ = (ctx, id);
+        Err(insights_not_implemented())
+    }
+    /// Rejects a quarantined insight. Writes an `insight.reject` audit event.
+    async fn reject_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<Insight> {
+        let _ = (ctx, id);
+        Err(insights_not_implemented())
+    }
+    /// What the agent should synthesize next in `scope`, deterministically ordered: stale
+    /// insights oldest first, then topics, at most `limit` items in all. A topic is the current,
+    /// active facts of one subject that no active, stale or quarantined insight cites, offered
+    /// when there are at least `min_facts` and no decline matches their current fact set.
+    async fn reflect_batch(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        limit: i64,
+        min_facts: i64,
+    ) -> Result<ReflectBatch> {
+        let _ = (ctx, scope, limit, min_facts);
+        Err(insights_not_implemented())
+    }
+    /// Records that the agent chose not to synthesize this topic's facts, identified by the
+    /// `fact_set` a batch returned. The topic is offered again once its fact set differs.
+    async fn decline_topic(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        topic_key: Uuid,
+        fact_set: &str,
+    ) -> Result<()> {
+        let _ = (ctx, scope, topic_key, fact_set);
+        Err(insights_not_implemented())
+    }
+    /// Vector search over active insights in `scopes`, nearest first.
+    async fn search_insights_vector(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<ScoredInsight>> {
+        let _ = (ctx, scopes, embedding, limit);
+        Err(insights_not_implemented())
+    }
+    /// Full-text search over active insights in `scopes`.
+    async fn search_insights_text(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<ScoredInsight>> {
+        let _ = (ctx, scopes, query, limit);
+        Err(insights_not_implemented())
+    }
+
     // API keys: cross-tenant, looked up before the tenant is known
     /// `key_hash` is the hex SHA-256 of the presented token. Revoked keys return `None`.
     async fn find_api_key(&self, key_hash: &str) -> Result<Option<ApiKey>>;
@@ -273,4 +404,8 @@ pub trait MemoryStore: Send + Sync {
 
     /// Verifies database connectivity for `/readyz`.
     async fn ping(&self) -> Result<()>;
+}
+
+fn insights_not_implemented() -> crate::Error {
+    crate::Error::Internal("insights are not implemented by this store".to_owned())
 }

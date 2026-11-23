@@ -573,6 +573,197 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/PurgeReport" }
         default: { $ref: "#/components/responses/Error" }
+  /v1/insights:
+    get:
+      summary: List insights in the given scopes, newest first (SPEC section 8, Insights)
+      parameters:
+        - name: scopes
+          in: query
+          required: true
+          description: Comma-separated scopes
+          schema: { type: string }
+        - name: level
+          in: query
+          schema: { $ref: "#/components/schemas/InsightLevel" }
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/InsightStatus" }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        "200":
+          description: Insights
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [insights]
+                properties:
+                  insights: { type: array, items: { $ref: "#/components/schemas/Insight" } }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      summary: >-
+        Write an insight citing 2 to 50 current sources of its scope. Trust and status follow SPEC
+        section 8, Insights; a quarantined insight waits for review
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InsightWriteRequest" }
+      responses:
+        "200":
+          description: The insight written, with its status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InsightWriteResponse" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/insights/quarantine:
+    get:
+      summary: List quarantined insights, oldest first. Admin only
+      parameters:
+        - name: scopes
+          in: query
+          required: true
+          description: Comma-separated scopes or patterns, with the rules of GET /v1/quarantine
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: Pending insights
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [insights]
+                properties:
+                  insights: { type: array, items: { $ref: "#/components/schemas/Insight" } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/insights/quarantine/{id}/approve:
+    post:
+      summary: >-
+        Activate a quarantined insight and close the insight it supersedes. It becomes stale instead
+        when a source is no longer current. Admin only
+      parameters:
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200":
+          description: The insight
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Insight" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/insights/quarantine/{id}/reject:
+    post:
+      summary: Reject a quarantined insight. Admin only
+      parameters:
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200":
+          description: The insight
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Insight" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/insights/{id}:
+    get:
+      summary: An insight in any status, its sources as they are now, and the insights it replaced
+      parameters:
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200":
+          description: The insight with its evidence
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InsightDetail" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/insights/{id}/confirm:
+    post:
+      summary: Make a stale insight current again with new sources, checked as a write
+      parameters:
+        - { $ref: "#/components/parameters/Id" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sources]
+              properties:
+                sources:
+                  type: array
+                  items: { $ref: "#/components/schemas/InsightSourceRef" }
+                  minItems: 2
+                  maxItems: 50
+      responses:
+        "200":
+          description: The insight
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Insight" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/insights/{id}/retire:
+    post:
+      summary: Withdraw an active or stale insight as no longer true. Insights citing it become stale
+      parameters:
+        - { $ref: "#/components/parameters/Id" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 1, maxLength: 500 }
+      responses:
+        "200":
+          description: The insight
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Insight" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/reflect/batch:
+    post:
+      summary: >-
+        What the agent should synthesize next in one scope: stale insights, then topics of uncited
+        facts. Deterministic order
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope]
+              properties:
+                scope: { type: string }
+                limit: { type: integer, minimum: 1, maximum: 20, default: 5 }
+      responses:
+        "200":
+          description: The batch
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReflectBatch" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/reflect/decline:
+    post:
+      summary: Do not offer this topic again until its fact set changes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope, topic_key, fact_set]
+              properties:
+                scope: { type: string }
+                topic_key: { type: string, format: uuid }
+                fact_set: { type: string, pattern: "^[0-9a-f]{64}$" }
+      responses:
+        "204": { description: Declined }
+        default: { $ref: "#/components/responses/Error" }
   /mcp:
     post:
       summary: MCP Streamable HTTP endpoint. Tools recall_candidates, commit_facts, recall, block_read, block_replace, graph_neighbors, page_read, page_write, page_list
@@ -736,6 +927,7 @@ components:
         entities: { type: integer }
         blocks: { type: integer }
         pages: { type: integer, description: Pages with a current version }
+        insights: { type: integer, description: Active insights }
         last_recorded_at: { type: [string, "null"], format: date-time }
     RecallRequest:
       type: object
@@ -798,6 +990,7 @@ components:
         episodes_deleted: { type: integer }
         entities_deleted: { type: integer }
         pages_deleted: { type: integer }
+        insights_deleted: { type: integer }
     Page:
       type: object
       required: [id, scope, slug, title, body, summary, version, trust, status, edited_by, edited_at]
@@ -881,3 +1074,95 @@ components:
         section: { type: string, description: "Heading path, such as Upgrade MemoryOS > Native install" }
         snippet: { type: string, description: The section's first 300 characters }
         score: { type: number }
+    InsightLevel: { type: string, enum: [context, understanding, guidance] }
+    InsightStatus: { type: string, enum: [active, stale, quarantined, rejected, retired, superseded] }
+    InsightSourceRef:
+      type: object
+      required: [kind, id]
+      properties:
+        kind: { type: string, enum: [fact, insight] }
+        id: { type: string, format: uuid }
+    StaleSource:
+      type: object
+      required: [kind, id, change]
+      properties:
+        kind: { type: string, enum: [fact, insight] }
+        id: { type: string, format: uuid }
+        change: { type: string, enum: [superseded, invalidated, expired, purged, insight_changed] }
+        by: { type: string, format: uuid, description: The successor, for change superseded }
+        status: { $ref: "#/components/schemas/InsightStatus" }
+    Insight:
+      type: object
+      required: [id, scope, level, statement, trust, status, sources, valid_from, written_by, recorded_at]
+      properties:
+        id: { type: string, format: uuid }
+        scope: { type: string }
+        level: { $ref: "#/components/schemas/InsightLevel" }
+        statement: { type: string }
+        trust: { type: string, enum: [external, agent, user, system] }
+        status: { $ref: "#/components/schemas/InsightStatus" }
+        stale_reason:
+          type: [array, "null"]
+          items: { $ref: "#/components/schemas/StaleSource" }
+          description: Set exactly while status is stale
+        sources: { type: array, items: { $ref: "#/components/schemas/InsightSourceRef" } }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: [string, "null"], format: date-time }
+        superseded_by: { type: [string, "null"], format: uuid }
+        pending_supersede_of: { type: [string, "null"], format: uuid }
+        written_by: { type: string }
+        recorded_at: { type: string, format: date-time }
+    InsightDetail:
+      allOf:
+        - { $ref: "#/components/schemas/Insight" }
+        - type: object
+          required: [source_views, history]
+          properties:
+            source_views:
+              type: array
+              items:
+                type: object
+                required: [kind, id, current]
+                properties:
+                  kind: { type: string, enum: [fact, insight] }
+                  id: { type: string, format: uuid }
+                  statement: { type: [string, "null"], description: "null when the source was purged" }
+                  current: { type: boolean }
+            history:
+              type: array
+              description: The insights this one replaced, newest first
+              items: { $ref: "#/components/schemas/Insight" }
+    InsightWriteRequest:
+      type: object
+      required: [scope, level, statement, sources]
+      properties:
+        scope: { type: string }
+        level: { $ref: "#/components/schemas/InsightLevel" }
+        statement: { type: string, minLength: 1, maxLength: 1000 }
+        sources:
+          type: array
+          items: { $ref: "#/components/schemas/InsightSourceRef" }
+          minItems: 2
+          maxItems: 50
+        supersedes: { type: string, format: uuid }
+    InsightWriteResponse:
+      type: object
+      required: [insight, redacted]
+      properties:
+        insight: { $ref: "#/components/schemas/Insight" }
+        redacted: { type: boolean }
+    ReflectTopic:
+      type: object
+      required: [topic_key, subject, facts, fact_set, insights]
+      properties:
+        topic_key: { type: string, format: uuid, description: The subject entity's id }
+        subject: { type: string }
+        facts: { type: array, items: { $ref: "#/components/schemas/Fact" }, maxItems: 30 }
+        fact_set: { type: string, description: Hex SHA-256 of the sorted fact ids, passed back by a decline }
+        insights: { type: array, items: { $ref: "#/components/schemas/Insight" } }
+    ReflectBatch:
+      type: object
+      required: [stale, topics]
+      properties:
+        stale: { type: array, items: { $ref: "#/components/schemas/InsightDetail" } }
+        topics: { type: array, items: { $ref: "#/components/schemas/ReflectTopic" } }

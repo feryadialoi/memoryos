@@ -39,8 +39,17 @@ Goal: production-grade and ready to use. `docs/SPEC.md` section 12 defines done.
 | 9b | T25 Pages in hooks and CLI | Agent | `crates/hooks` | T24 |
 | 9b | T26 Pages on the review page | Agent | `crates/server/src/ui` | T24 |
 | 10 | T27 Pages eval suite, latency numbers, README | Agent | `crates/eval`, `README.md`, `docs/` | T24 |
+| 11 | T30 Insights contracts: SPEC, core, migrations, OpenAPI, ADR 0008 | Lead | `docs/`, `crates/core`, `migrations/` | |
+| 12 | T31 Insights store, Postgres and SQLite, staleness in the same transaction | Agent | `crates/store` | T30 |
+| 12 | T32 Reflect batch: topics, declines, stale list | Agent | `crates/store`, `crates/retrieve` | T30 |
+| 13 | T33 Insight search inside recall, with the recall fields in OpenAPI | Agent | `crates/retrieve`, `docs/openapi.yaml` | T31 |
+| 14 | T34 Insights REST, MCP tools, SDK; removes the contract test's not-yet-served list | Agent | `crates/server`, `crates/sdk` | T31, T32, T33 |
+| 14b | T35 Insights in hooks: session start, prompt, stop hook reflect; `memoryos reflect` and `--schedule` | Agent | `crates/hooks` | T34 |
+| 14b | T36 Insights on the review page | Agent | `crates/server/src/ui` | T34 |
+| 15 | T37 Insights eval suite, live run, README | Agent | `crates/eval`, `README.md`, `docs/` | T35 |
 
 Waves 6 to 10 build knowledge pages (`docs/pages-design.md`) on branch `feat/knowledge-pages`.
+Waves 11 to 15 build insights (`docs/memory-into-knowledge-design.md`).
 
 The lead merges each wave into `develop` and runs the workspace gates before the next wave starts.
 `main` holds only the approved baseline until the user confirms a merge.
