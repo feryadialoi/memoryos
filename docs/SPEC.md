@@ -391,8 +391,9 @@ searched at the present only; older versions are read by version.
 
 ### Insights
 
-Design and reasons: `docs/memory-into-knowledge-design.md`, ADR 0008. Status: contracts only (T30);
-the store implements them in T31, and the API, MCP tools and hooks follow in T32 to T35.
+Design and reasons: `docs/memory-into-knowledge-design.md`, ADR 0008. Status: the store (T31) and
+recall (T33) are done; the reflect batch, API, MCP tools, hooks and review page follow in T32 and
+T34 to T36.
 
 - An insight is what several facts mean together, written by the agent: MemoryOS never runs a model
   (ADR 0005). It has a `level`: `context` (who or what this is), `understanding` (what it means) or
@@ -416,7 +417,8 @@ the store implements them in T31, and the API, MCP tools and hooks follow in T32
   |---|---|
   | Fact superseded (commit, single-valued replace, or approval closing a head) | `stale`, change `superseded` with the successor |
   | Fact invalidated | `stale`, change `invalidated` |
-  | Fact deleted by a purge, or reopened or relinked by one | `stale`, change `purged` for a deleted fact; `superseded` or `invalidated` as it now stands otherwise |
+  | Fact deleted by a purge, or reopened or relinked by one | `stale`, change `purged` for a deleted fact; `superseded` or `invalidated` as it now stands otherwise; a fact reopened to current keeps the entry its insights already have |
+  | Fact re-quarantined or lowered in trust by a purge | `stale`, change `purged`, so no insight keeps a trust above its evidence |
   | Cited insight becomes `stale`, `retired` or `superseded` | `stale`, change `insight_changed`, applied up every level |
   | Fact corroborated | No change |
 
@@ -424,9 +426,11 @@ the store implements them in T31, and the API, MCP tools and hooks follow in T32
   change `expired`, the active insights of the scopes it reads whose fact sources have expired.
   `stale_reason` lists each changed source with its change and is set exactly while the status is
   `stale`. Stale insights are never printed by hooks or returned by recall.
-- Resolving a stale insight: `confirm` with new sources (checked as a write) makes it active again, or
-  quarantined if the gate now says so; a new write with `supersedes` replaces it; `retire` withdraws it
-  and makes insights citing it stale.
+- Resolving a stale insight: `confirm` with new sources (checked as a write, with trust recomputed
+  from the confirming writer and the new sources) makes it active again, or quarantined if the gate
+  now says so; a new write with `supersedes` replaces it; `retire` withdraws it and makes insights
+  citing it stale. Only active and stale insights go stale; a quarantined one is checked when it is
+  approved.
 - Reflect batch, for the agent: in one scope, stale insights oldest first with their sources as they
   are now, then topics, at most 5 items by default and 20 at most. A topic is the current, active facts
   of one subject entity that no active, stale or quarantined insight cites, offered when there are at
