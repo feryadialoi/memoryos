@@ -15,6 +15,7 @@ mod facts;
 mod insight_rules;
 mod insights;
 mod pages;
+mod reflect;
 mod rows;
 mod sqlite;
 mod store_impl;

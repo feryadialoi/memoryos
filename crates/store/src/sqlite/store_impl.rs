@@ -1380,6 +1380,26 @@ impl MemoryStore for SqliteStore {
         tx.commit().await.map_err(db)?;
         Ok(())
     }
+
+    async fn reflect_batch(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        limit: i64,
+        min_facts: i64,
+    ) -> Result<memoryos_core::ReflectBatch> {
+        super::reflect::reflect_batch(self, ctx, scope, limit, min_facts).await
+    }
+
+    async fn decline_topic(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        topic_key: Uuid,
+        fact_set: &str,
+    ) -> Result<()> {
+        super::reflect::decline_topic(self, ctx, scope, topic_key, fact_set).await
+    }
 }
 
 fn text_scored_facts(found: &[SqliteRow], limit: i64) -> Result<Vec<ScoredFact>> {
