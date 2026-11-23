@@ -9,6 +9,7 @@ const GRAPH_LIMIT = 300;
 const PAGE = 100;
 const REFRESH_MS = 30000;
 const PAGE_LIST_LIMIT = 500;
+const INSIGHT_LIMIT = 500;
 const DIFF_CONTEXT = 3;
 const DIFF_MAX_CELLS = 4000000;
 const VERSION_CONFLICT = "The page changed since this edit; reject it and ask for a new edit.";
@@ -32,6 +33,11 @@ const S = {
   pageReview: null,
   pageConflicts: new Set(),
   pendingPages: new Map(),
+  pendingInsights: new Map(),
+  insights: null,
+  insightState: "active",
+  insightsMissing: false,
+  insightReview: null,
   editing: null,
   pageView: "rendered",
   pages: null,
@@ -158,9 +164,10 @@ function scopeParts(scope) {
 
 const current = () => S.scopes.find((item) => item.scope === S.scope) || null;
 
-// Page versions waiting for review, which the server counts apart from facts.
+// Page versions and insights waiting for review, which the server counts apart from facts.
 const pendingPagesIn = (scope) => S.pendingPages.get(scope) || 0;
-const waitingIn = (summary) => summary.quarantined + pendingPagesIn(summary.scope);
+const pendingInsightsIn = (scope) => S.pendingInsights.get(scope) || 0;
+const waitingIn = (summary) => summary.quarantined + pendingPagesIn(summary.scope) + pendingInsightsIn(summary.scope);
 const pagePath = (slug) => `pages/${encodeURIComponent(S.scope)}/${encodeURIComponent(slug)}`;
 
 // ---- API --------------------------------------------------------------------------------------
@@ -193,16 +200,18 @@ const scopeQuery = (extra) => new URLSearchParams({ scope: S.scope, ...extra }).
 
 // `memoryos setup` keeps an image it already built, so a newer command can meet an older server.
 async function loadScopes() {
-  const [body, pending] = await Promise.all([
+  const [body, pending, pendingInsights] = await Promise.all([
     api("scopes").catch((error) => {
       if (error.status !== 404) throw error;
       throw Object.assign(new Error("Your server is older than this page. Update it with: docker compose -f ~/.config/memoryos/docker-compose.yml up -d --build"), { status: 0 });
     }),
     loadPendingPages(),
+    loadPendingInsights(),
   ]);
   S.scopes = body.scopes;
   S.truncated = body.truncated;
   S.pendingPages = pending;
+  S.pendingInsights = pendingInsights;
   // A scope whose only page waits for its first review is not in the scope list. Show it anyway.
   for (const scope of pending.keys()) {
     if (!S.scopes.some((item) => item.scope === scope)) {
@@ -220,6 +229,19 @@ async function loadPendingPages() {
     for (const version of body.versions) counts.set(version.scope, (counts.get(version.scope) || 0) + 1);
   } catch {
     // The fact counts still show. The review list itself reports real failures.
+  }
+  return counts;
+}
+
+// Quarantined insights per scope. Empty for a key that cannot review and for a server from before
+// insights.
+async function loadPendingInsights() {
+  const counts = new Map();
+  try {
+    const body = await api(`insights/quarantine?${new URLSearchParams({ scopes: "*", limit: 200 })}`);
+    for (const insight of body.insights) counts.set(insight.scope, (counts.get(insight.scope) || 0) + 1);
+  } catch {
+    // As for pages: the review list reports real failures.
   }
   return counts;
 }
@@ -253,6 +275,7 @@ async function loadTab() {
   }
   if (S.tab === "review") await loadReview();
   if (S.tab === "pages") await loadPages();
+  if (S.tab === "insights") await loadInsights();
   if (S.tab === "notes") {
     S.notes = (await api(`agents/${encodeURIComponent(scopeParts(S.scope).name)}/blocks`)).blocks;
   }
@@ -260,9 +283,10 @@ async function loadTab() {
 
 async function loadReview() {
   S.reviewDenied = false;
-  const [facts, pages] = await Promise.all([reviewFacts(), reviewPages()]);
+  const [facts, pages, insights] = await Promise.all([reviewFacts(), reviewPages(), reviewInsights()]);
   S.review = facts;
   S.pageReview = pages;
+  S.insightReview = insights;
 }
 
 async function reviewFacts() {
@@ -299,6 +323,42 @@ async function reviewPages() {
     return [slug, page ? page.version : null];
   })));
   return body.versions.map((version) => ({ version, current: currents.get(version.slug) ?? null }));
+}
+
+// Each quarantined insight with its sources as they are now, and the insight it would replace.
+async function reviewInsights() {
+  let body;
+  try {
+    body = await api(`insights/quarantine?${new URLSearchParams({ scopes: S.scope, limit: 200 })}`);
+  } catch (error) {
+    // 403: a key that cannot review, reported with the facts. 404: a server from before insights.
+    if (error.status === 403 || error.status === 404) return [];
+    throw error;
+  }
+  return Promise.all(body.insights.map(async (insight) => {
+    const [detail, replaces] = await Promise.all([
+      api(`insights/${insight.id}`).catch(() => null),
+      insight.pending_supersede_of ? api(`insights/${insight.pending_supersede_of}`).catch(() => null) : null,
+    ]);
+    return { insight, sources: detail?.source_views ?? null, replaces };
+  }));
+}
+
+async function loadInsights() {
+  const params = { scopes: S.scope, limit: INSIGHT_LIMIT };
+  if (S.insightState !== "all") params.status = S.insightState;
+  const state = S.insightState;
+  let insights;
+  try {
+    insights = (await api(`insights?${new URLSearchParams(params)}`)).insights;
+    S.insightsMissing = false;
+  } catch (error) {
+    if (error.status !== 404) throw error;
+    insights = [];
+    S.insightsMissing = true;
+  }
+  // A filter pressed while this loaded wins.
+  if (S.insightState === state) S.insights = insights;
 }
 
 async function loadPages() {
@@ -340,6 +400,7 @@ function selectScope(scope) {
   S.facts = [];
   S.graph = S.timeline = S.review = S.notes = null;
   S.pageReview = S.pages = S.page = null;
+  S.insights = S.insightReview = null;
   S.pageFilter = "";
   const summary = current();
   if (S.tab === "notes" && !summary?.blocks) S.tab = "facts";
@@ -487,12 +548,69 @@ async function decide(id, action) {
   render();
 }
 
+async function openInsight(id) {
+  S.drawer = { type: "insight", id, insight: null };
+  renderDrawer();
+  await guarded(async () => {
+    const insight = await api(`insights/${id}`);
+    if (S.drawer?.id !== id) return;
+    S.drawer.insight = insight;
+    renderDrawer();
+  });
+}
+
+// After a review or a retire: the counts, the open list and the open insight as they are now.
+async function reloadInsights(id) {
+  const work = [loadScopes()];
+  if (S.tab === "review") work.push(loadReview());
+  if (S.tab === "insights") work.push(loadInsights());
+  await Promise.all(work);
+  if (S.drawer?.type === "insight" && S.drawer.id === id) {
+    const insight = await api(`insights/${id}`).catch(() => null);
+    if (S.drawer?.id === id) S.drawer.insight = insight;
+    if (!insight) S.drawer = null;
+  }
+}
+
+async function decideInsight(id, action) {
+  await guarded(async () => {
+    const insight = await api(`insights/quarantine/${id}/${action}`, { method: "POST" });
+    if (action === "reject") toast("Rejected. Your agent will not be shown this.");
+    else if (insight?.status === "stale") toast("Approved, but a source changed since, so it is stale until your agent looks again.");
+    else toast("Approved. Your agent can now recall this.");
+    await reloadInsights(id);
+  });
+  // Also after a failure, so the buttons are enabled again.
+  render();
+}
+
+function retireInsight(insight) {
+  openDialog({
+    title: "Retire this insight",
+    intro: "Your agent stops seeing it, and insights built on it become stale until your agent looks at them again. This cannot be undone.",
+    fields: [
+      { name: "reason", label: "Why it is no longer true", placeholder: "We moved off this setup", hint: "Up to 500 characters. Kept in the audit log.",
+        check: /^[\s\S]{1,500}$/, problem: "Say why in 1 to 500 characters." },
+    ],
+    submit: "Retire",
+    onSubmit: (reason) => guarded(async () => {
+      await api(`insights/${insight.id}/retire`, { method: "POST", body: { reason } });
+      toast("Retired. Your agent will not be shown this again.");
+      await reloadInsights(insight.id);
+      render();
+    }),
+  });
+}
+
+// What a quiet refresh compares to decide whether the open tab needs loading again.
+const countsSignature = () => JSON.stringify([S.scopes, [...S.pendingPages], [...S.pendingInsights]]);
+
 async function refresh(quiet) {
   await guarded(async () => {
     await Promise.all([loadScopes(), loadHealth()]);
     const recovered = Boolean(S.offline);
     S.offline = null;
-    const signature = JSON.stringify([S.scopes, [...S.pendingPages]]);
+    const signature = countsSignature();
     const changed = recovered || signature !== S.signature;
     S.signature = signature;
     if (!quiet || changed) {
@@ -636,19 +754,22 @@ function renderHead() {
   }
   const { name, kind } = scopeParts(summary.scope);
   const waiting = waitingIn(summary);
-  const tabs = [["facts", "Facts"], ["map", "Map"], ["timeline", "Timeline"], ["pages", "Knowledge"], ["review", "Review"]];
+  const tabs = [["facts", "Facts"], ["map", "Map"], ["timeline", "Timeline"], ["pages", "Knowledge"], ["insights", "Insights"], ["review", "Review"]];
   if (summary.blocks > 0) tabs.push(["notes", "Agent notes"]);
+  // A server from before insights does not count them.
+  const insights = typeof summary.insights === "number" ? summary.insights : null;
   return h("header", { class: "head" },
     h("select", {
       class: "mobile-select", "aria-label": "Memory space",
       onchange: (event) => selectScope(event.target.value),
     }, S.scopes.map((item) => h("option", { value: item.scope, selected: item.scope === S.scope }, item.scope))),
     h("div", { class: "head-top" }, h("h1", {}, name), h("span", { class: "scope-code" }, `${kind} space`)),
-    h("div", { class: "stats" },
+    h("div", { class: `stats${insights === null ? "" : " five"}` },
       stat(summary.current, "Known now", () => showFacts("current")),
       stat(summary.past, "Replaced or ended", () => showFacts("past")),
       stat(waiting, "Waiting for review", () => selectTab("review"), waiting > 0),
-      stat(summary.entities, "People and things", () => selectTab("map"))),
+      stat(summary.entities, "People and things", () => selectTab("map")),
+      insights !== null && stat(insights, "Insights", () => showInsights("active"))),
     h("div", { class: "ask" }, icon(ICONS.search),
       h("input", {
         id: "ask", type: "search", placeholder: "Ask what this memory knows, the way your agent would", "aria-label": "Ask this memory",
@@ -664,6 +785,7 @@ function renderHead() {
       onclick: () => selectTab(key),
     }, label,
     key === "pages" && summary.pages > 0 && h("span", { class: "tab-count" }, summary.pages),
+    key === "insights" && insights > 0 && h("span", { class: "tab-count" }, insights),
     key === "review" && waiting > 0 && h("span", { class: "tab-badge" }, waiting)))));
 }
 
@@ -671,6 +793,15 @@ function stat(value, label, onclick, attention) {
   return h("button", { class: `stat${attention ? " attention" : ""}`, onclick },
     h("div", { class: "stat-value" }, value.toLocaleString()),
     h("div", { class: "stat-label" }, label));
+}
+
+function showInsights(state) {
+  S.insightState = state;
+  S.tab = "insights";
+  S.ask = null;
+  S.insights = null;
+  render();
+  return guarded(async () => { await loadInsights(); render(); });
 }
 
 function showFacts(state) {
@@ -686,7 +817,7 @@ function renderBody() {
   if (!body) return;
   if (!S.scope) { body.replaceChildren(welcome()); return; }
   if (S.ask) { body.replaceChildren(renderAsk()); return; }
-  const views = { facts: renderFacts, map: renderMap, timeline: renderTimeline, pages: renderPages, review: renderReview, notes: renderNotes };
+  const views = { facts: renderFacts, map: renderMap, timeline: renderTimeline, pages: renderPages, insights: renderInsights, review: renderReview, notes: renderNotes };
   body.replaceChildren(views[S.tab]());
 }
 
@@ -1450,24 +1581,136 @@ function renderTimeline() {
       })))));
 }
 
+// ---- Insights ---------------------------------------------------------------------------------
+
+// Highest level first: what to do, what it means, who or what this is.
+const LEVEL = {
+  guidance: ["Guidance", "What to do about it"],
+  understanding: ["Understanding", "What it means"],
+  context: ["Context", "Who or what this is"],
+};
+
+const INSIGHT_STATUS = {
+  active: ["Current", "current", "Your agent is shown this."],
+  stale: ["Stale", "waiting", "Something it was built on changed. Your agent is not shown it until it looks again."],
+  quarantined: ["Waiting for review", "waiting", "Held back until you approve it in Review."],
+  rejected: ["Rejected", "bad", "You rejected it. Your agent is never shown it."],
+  retired: ["Retired", "past", "Withdrawn as no longer true."],
+  superseded: ["Replaced", "past", "A newer insight took its place."],
+};
+
+const insightStatus = (status) => INSIGHT_STATUS[status] || [humanize(status), "past", ""];
+
+// What happened to one source of a stale insight.
+const CHANGE = {
+  superseded: "Replaced by a newer fact",
+  invalidated: "Retracted",
+  expired: "Expired",
+  purged: "Removed or lowered in trust by a purge",
+  insight_changed: "The insight it builds on changed",
+};
+
+function changeText(change) {
+  if (change.change === "insight_changed" && change.status) {
+    return `The insight it builds on is now ${insightStatus(change.status)[0].toLowerCase()}`;
+  }
+  return CHANGE[change.change] || humanize(change.change);
+}
+
+function renderInsights() {
+  if (S.insights === null) return loading();
+  if (S.insightsMissing) {
+    return empty("Your server is older than this page", "Insights need a newer server. Update it with: docker compose -f ~/.config/memoryos/docker-compose.yml up -d --build");
+  }
+  const count = S.insights.length;
+  const toolbar = h("div", { class: "toolbar" },
+    h("div", { class: "segmented", role: "group", "aria-label": "Which insights" },
+      [["active", "Current"], ["stale", "Stale"], ["all", "All"]].map(([key, label]) => h("button", {
+        "aria-pressed": S.insightState === key ? "true" : "false",
+        onclick: () => showInsights(key),
+      }, label))),
+    h("span", { class: "toolbar-note" }, count >= INSIGHT_LIMIT ? `Newest ${INSIGHT_LIMIT}` : `${count} insight${count === 1 ? "" : "s"}`));
+  if (!count) {
+    const words = {
+      active: ["No insights yet", "When your agent works out what several facts mean together, it saves an insight. They show up here."],
+      stale: ["Nothing is stale", "An insight turns stale when a fact it was built on changes. None has."],
+      all: ["No insights yet", "When your agent works out what several facts mean together, it saves an insight. They show up here."],
+    }[S.insightState];
+    return h("div", {}, toolbar, empty(...words));
+  }
+  return h("div", {}, toolbar, Object.entries(LEVEL).map(([level, [label, help]]) => {
+    const items = S.insights.filter((insight) => insight.level === level);
+    if (!items.length) return null;
+    return h("section", { class: "group" },
+      h("div", { class: "group-title" }, label, h("span", { class: "kind-tag" }, `${help}, ${items.length}`)),
+      h("div", { class: "list" }, items.map(insightRow)));
+  }));
+}
+
+function changeSummary(reasons) {
+  const counts = new Map();
+  for (const reason of reasons || []) counts.set(reason.change, (counts.get(reason.change) || 0) + 1);
+  const words = { superseded: "replaced", invalidated: "retracted", expired: "expired", purged: "purged", insight_changed: "changed" };
+  return [...counts].map(([change, n]) => `${n} source${n === 1 ? "" : "s"} ${words[change] || humanize(change)}`).join(", ");
+}
+
+function insightRow(insight) {
+  const [label, kind] = insightStatus(insight.status);
+  const ended = ["rejected", "retired", "superseded"].includes(insight.status);
+  return h("button", {
+    class: `row${ended ? " is-past" : ""}`,
+    "aria-current": S.drawer?.id === insight.id ? "true" : null,
+    onclick: () => openInsight(insight.id),
+  },
+    h("div", { class: "row-text" }, insight.statement),
+    h("div", { class: "meta" },
+      insight.status !== "active" && h("span", { class: `pill ${kind}` }, label),
+      insight.status === "stale" && h("span", { class: "change" }, changeSummary(insight.stale_reason)),
+      h("span", {}, `${insight.sources.length} source${insight.sources.length === 1 ? "" : "s"}`),
+      h("span", {}, `since ${date(insight.valid_from)}`),
+      h("span", {}, TRUST[insight.trust]?.[0] || insight.trust)));
+}
+
 // ---- Review -----------------------------------------------------------------------------------
 
 function renderReview() {
-  if (S.review === null || S.pageReview === null) return loading();
+  if (S.review === null || S.pageReview === null || S.insightReview === null) return loading();
   if (S.reviewDenied) return empty("Review needs the admin key", "This page is using a key that cannot review. Run memoryos setup to create the admin key.");
-  if (!S.review.length && !S.pageReview.length) {
-    return empty("All clear", "Nothing is waiting. Facts and page edits held back from your agent's memory will show up here for you to decide.");
+  if (!S.review.length && !S.pageReview.length && !S.insightReview.length) {
+    return empty("All clear", "Nothing is waiting. Facts, page edits and insights held back from your agent's memory will show up here for you to decide.");
   }
-  const both = S.review.length > 0 && S.pageReview.length > 0;
+  const kinds = [S.review, S.pageReview, S.insightReview].filter((list) => list.length > 0).length;
+  const titled = kinds > 1;
   return h("div", {},
     h("div", { class: "toolbar" }, h("span", { class: "toolbar-note", css: { "margin-left": "0" } },
       "Your agent cannot recall these until you approve them. Check the source: outside content can try to plant false facts.")),
     S.pageReview.length > 0 && h("section", { class: "group" },
-      both && h("div", { class: "group-title" }, "Page edits", h("span", { class: "kind-tag" }, S.pageReview.length)),
+      titled && h("div", { class: "group-title" }, "Page edits", h("span", { class: "kind-tag" }, S.pageReview.length)),
       S.pageReview.map(renderPageEdit)),
+    S.insightReview.length > 0 && h("section", { class: "group" },
+      titled && h("div", { class: "group-title" }, "Insights", h("span", { class: "kind-tag" }, S.insightReview.length)),
+      S.insightReview.map(renderInsightReview)),
     S.review.length > 0 && h("section", { class: "group" },
-      both && h("div", { class: "group-title" }, "Facts", h("span", { class: "kind-tag" }, S.review.length)),
+      titled && h("div", { class: "group-title" }, "Facts", h("span", { class: "kind-tag" }, S.review.length)),
       renderFactReview()));
+}
+
+function renderInsightReview({ insight, sources, replaces }) {
+  return h("article", { class: "card" },
+    h("div", { class: "card-title" }, insight.statement),
+    h("div", { class: "meta" },
+      h("span", {}, LEVEL[insight.level]?.[0] || insight.level),
+      h("span", {}, TRUST[insight.trust]?.[0] || insight.trust),
+      h("span", {}, `by ${insight.written_by}`),
+      h("span", {}, `added ${ago(insight.recorded_at)}`)),
+    replaces && h("div", { class: "quote" }, h("span", { class: "quote-label" }, "Would replace"), replaces.statement),
+    h("div", { class: "quote" }, h("span", { class: "quote-label" }, `Built on ${insight.sources.length} source${insight.sources.length === 1 ? "" : "s"}`),
+      sources ? h("ul", { class: "source-quotes" }, sources.map((view) => h("li", {}, view.statement ?? "Deleted by a purge")))
+        : "The sources could not be read."),
+    h("div", { class: "actions" },
+      h("button", { class: "btn primary", onclick: (event) => { event.target.disabled = true; decideInsight(insight.id, "approve"); } }, "Approve"),
+      h("button", { class: "btn danger", onclick: (event) => { event.target.disabled = true; decideInsight(insight.id, "reject"); } }, "Reject"),
+      h("button", { class: "link-btn", css: { "margin-left": "auto" }, onclick: () => openInsight(insight.id) }, "Details")));
 }
 
 function renderFactReview() {
@@ -1752,10 +1995,12 @@ function renderNotes() {
 function renderDrawer() {
   document.getElementById("drawer")?.remove();
   if (!S.drawer || !S.token) return;
-  const content = S.drawer.type === "entity" ? renderEntityDrawer(S.drawer.node) : renderFactDrawer(S.drawer);
+  const { type } = S.drawer;
+  const content = type === "entity" ? renderEntityDrawer(S.drawer.node)
+    : type === "insight" ? renderInsightDrawer(S.drawer) : renderFactDrawer(S.drawer);
   document.body.append(h("aside", { class: "drawer", id: "drawer", "aria-label": "Detail" },
     h("div", { class: "drawer-head" },
-      h("strong", {}, S.drawer.type === "entity" ? humanize(S.drawer.node.kind) : "Fact"),
+      h("strong", {}, type === "entity" ? humanize(S.drawer.node.kind) : type === "insight" ? "Insight" : "Fact"),
       h("span", { class: "spacer" }),
       h("button", { class: "icon-btn", "aria-label": "Close", title: "Close (Esc)", onclick: closeDrawer }, icon(ICONS.close))),
     h("div", { class: "drawer-body" }, content)));
@@ -1800,6 +2045,65 @@ function renderFactDrawer({ fact, history, sources }) {
       h("button", { class: "btn danger", onclick: () => decide(fact.id, "reject") }, "Reject")));
 }
 
+const openSource = (kind, id) => (kind === "insight" ? openInsight(id) : openFact(id));
+
+function renderInsightDrawer({ insight }) {
+  if (!insight) return loading();
+  const [label, kind, meaning] = insightStatus(insight.status);
+  const level = LEVEL[insight.level] || [humanize(insight.level), ""];
+  const trust = TRUST[insight.trust] || [insight.trust, ""];
+  const changes = new Map((insight.stale_reason || []).map((change) => [change.id, change]));
+  const views = insight.source_views || [];
+  const byId = new Map(views.map((view) => [view.id, view]));
+  const history = insight.history || [];
+  return h("div", {},
+    h("div", { class: "drawer-title" }, insight.statement),
+    h("div", { class: "meta" }, h("span", { class: `pill ${kind}` }, label), h("span", {}, level[0])),
+    h("dl", { class: "fields" },
+      h("dt", {}, "Level"), h("dd", {}, level[0], h("div", { class: "help" }, level[1])),
+      h("dt", {}, "Status"), h("dd", {}, label, meaning && h("div", { class: "help" }, meaning)),
+      h("dt", {}, "True from"), h("dd", {}, date(insight.valid_from)),
+      insight.valid_to && [h("dt", {}, "Until"), h("dd", {}, date(insight.valid_to))],
+      h("dt", {}, "Learned"), h("dd", {}, `${date(insight.recorded_at)} (${ago(insight.recorded_at)})`),
+      h("dt", {}, "Written by"), h("dd", {}, insight.written_by),
+      h("dt", {}, "Trust"), h("dd", {}, trust[0], trust[1] && h("div", { class: "help" }, trust[1])),
+      h("dt", {}, "Space"), h("dd", {}, insight.scope)),
+    insight.superseded_by && h("div", { class: "section" },
+      h("button", { class: "link-btn", onclick: () => openInsight(insight.superseded_by) }, "Read the insight that replaced it")),
+    insight.pending_supersede_of && h("div", { class: "section" },
+      h("button", { class: "link-btn", onclick: () => openInsight(insight.pending_supersede_of) }, "Read the insight it would replace")),
+    changes.size > 0 && h("div", { class: "section" }, h("h3", {}, "What changed"),
+      [...changes.values()].map((change) => h("div", { class: "change-item" },
+        h("div", { class: "change" }, changeText(change)),
+        h("div", { class: "chain-text" }, byId.get(change.id)?.statement ?? "Deleted by a purge"),
+        change.by && h("button", { class: "link-btn", onclick: () => openFact(change.by) }, "Read the newer fact")))),
+    h("div", { class: "section" }, h("h3", {}, `Built on ${views.length} source${views.length === 1 ? "" : "s"}`),
+      views.map(renderSourceView)),
+    history.length > 0 && h("div", { class: "section" }, h("h3", {}, "Insights it replaced"),
+      h("div", { class: "chain" }, history.map((item) => h("button", { class: "chain-item", onclick: () => openInsight(item.id) },
+        h("div", { class: "chain-text" }, item.statement),
+        h("div", { class: "meta" }, `${date(item.valid_from)} to ${item.valid_to ? date(item.valid_to) : "now"}`))))),
+    insight.status === "quarantined" && h("div", { class: "actions" },
+      h("button", { class: "btn primary", onclick: (event) => { event.target.disabled = true; decideInsight(insight.id, "approve"); } }, "Approve"),
+      h("button", { class: "btn danger", onclick: (event) => { event.target.disabled = true; decideInsight(insight.id, "reject"); } }, "Reject")),
+    (insight.status === "active" || insight.status === "stale") && h("div", { class: "actions" },
+      h("button", { class: "btn danger", onclick: () => retireInsight(insight) }, "Retire")));
+}
+
+// One source as it is now: a fact or a lower insight, which opens in this drawer. What changed is
+// shown once, above, under "What changed".
+function renderSourceView(view) {
+  const content = [
+    h("div", { class: "source-top" },
+      h("span", { class: "kind-tag" }, view.kind === "insight" ? "Insight" : "Fact"),
+      h("span", { class: `pill ${view.current ? "current" : "past"}` }, view.current ? "Current" : "No longer current")),
+    h("div", { class: "chain-text" }, view.statement ?? "Deleted by a purge"),
+  ];
+  // A purged source has nothing left to open.
+  if (view.statement === null || view.statement === undefined) return h("div", { class: "mini-row source-row" }, content);
+  return h("button", { class: "mini-row source-row", onclick: () => openSource(view.kind, view.id) }, content);
+}
+
 // ---- Start ------------------------------------------------------------------------------------
 
 function toggleTheme() {
@@ -1810,11 +2114,13 @@ function toggleTheme() {
 }
 
 document.addEventListener("keydown", (event) => {
+  // Esc in an open dialog closes only the dialog.
+  if (document.querySelector("dialog[open]")) return;
   if (event.key === "Escape" && S.drawer) { closeDrawer(); return; }
   const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(event.target.tagName);
   if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
   if (event.key === "/") { event.preventDefault(); document.getElementById("ask")?.focus(); }
-  const tabs = { 1: "facts", 2: "map", 3: "timeline", 4: "review" };
+  const tabs = { 1: "facts", 2: "map", 3: "timeline", 4: "review", 5: "insights" };
   if (tabs[event.key] && S.scope) selectTab(tabs[event.key]);
 });
 
@@ -1837,7 +2143,7 @@ async function start() {
   if (!S.token) return;
   await guarded(async () => {
     await Promise.all([loadScopes(), loadHealth()]);
-    S.signature = JSON.stringify([S.scopes, [...S.pendingPages]]);
+    S.signature = countsSignature();
     render();
     await loadTab();
     render();
