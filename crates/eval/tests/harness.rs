@@ -942,7 +942,12 @@ async fn a_correct_server_passes_every_suite_through_the_host_flow_only() {
     let mut ids = Ids::default();
     wiremock.import(healthy_server(&mut ids)).await;
 
-    let run = run_harness(&wiremock.url, &["--suite", "all"]).await;
+    // Every suite but insights, whose stubs below cover only the cases their tests name.
+    let run = run_harness(
+        &wiremock.url,
+        &["--suite", "recall,staleness,poisoning,pages"],
+    )
+    .await;
 
     assert_eq!(
         run.output.status.code(),
@@ -1519,4 +1524,250 @@ async fn facts_that_change_with_page_search_fail_and_latency_is_measured() {
     assert_eq!(pages["metrics"]["latency_calls"], json!(5));
     assert_eq!(pages["metrics"]["latency_errors"], json!(0));
     assert!(stdout(&run).contains("gate failed: pages.facts_changed_cases = 1"));
+}
+
+// Insights. Each test stubs one scripted case in full and checks that case's verdict. The other
+// cases reach no stub and error, which is why these tests never expect the suite to pass.
+
+const INVALIDATE_CASE: &str = "invalidate";
+const TIME_TRAVEL_CASE: &str = "recall-time-travel";
+const INVALIDATED: &str = "invalidated";
+
+fn insight_json(id: Uuid, status: &str, stale_reason: &Value) -> Value {
+    json!({
+        "id": id,
+        "scope": "agent:stub",
+        "level": "context",
+        "statement": "stub",
+        "trust": "agent",
+        "status": status,
+        "stale_reason": stale_reason,
+        "sources": [],
+        "valid_from": NOW,
+        "written_by": "stub",
+        "recorded_at": NOW,
+    })
+}
+
+/// `POST /v1/insights` whose first source is `first_source`.
+fn insight_write_stub(first_source: Uuid, insight: &Value) -> Value {
+    json!({
+        "priority": DEFAULT_PRIORITY,
+        "request": {
+            "method": "POST",
+            "urlPath": "/v1/insights",
+            "headers": auth(AGENT_TOKEN),
+            "bodyPatterns": [{ "matchesJsonPath": {
+                "expression": "$.sources[0].id",
+                "equalTo": first_source.to_string(),
+            }}],
+        },
+        "response": json_response(200, &json!({ "insight": insight, "redacted": false })),
+    })
+}
+
+fn insight_get_stub(id: Uuid, body: &Value) -> Value {
+    json!({
+        "priority": DEFAULT_PRIORITY,
+        "request": {
+            "method": "GET",
+            "urlPath": format!("/v1/insights/{id}"),
+            "headers": auth(AGENT_TOKEN),
+        },
+        "response": json_response(200, body),
+    })
+}
+
+/// One active commit per fact label of a case, `f0` to `f{count - 1}`.
+fn fact_commit_stubs(case_id: &str, count: usize, ids: &mut Ids) -> (Vec<Uuid>, Vec<Value>) {
+    let mut facts = Vec::new();
+    let mut stubs = Vec::new();
+    for index in 0..count {
+        let label = format!("f{index}");
+        let fact = ids.of(&format!("{case_id}/{label}"));
+        let episode = ids.of(&format!("{case_id}/{label}/episode"));
+        stubs.push(commit_stub(
+            AGENT_TOKEN,
+            case_id,
+            &label,
+            episode,
+            &[(fact, "active")],
+        ));
+        facts.push(fact);
+    }
+    (facts, stubs)
+}
+
+/// The invalidate case: an insight citing the retracted fact goes stale, the control does not.
+/// `stale_after` is what the server answers for the insight once the fact is invalidated.
+fn invalidate_case_stubs(ids: &mut Ids, stale_after: &Value) -> Vec<Value> {
+    let (facts, mut stubs) = fact_commit_stubs(INVALIDATE_CASE, 3, ids);
+    let insight = ids.of("invalidate/insight");
+    let control = ids.of("invalidate/control");
+    let scenario = "insights-invalidate";
+    let active = |id| insight_json(id, "active", &Value::Null);
+    stubs.push(insight_write_stub(facts[0], &active(insight)));
+    stubs.push(insight_write_stub(facts[1], &active(control)));
+    stubs.push(in_state(
+        json!({
+            "priority": DEFAULT_PRIORITY,
+            "request": {
+                "method": "POST",
+                "urlPath": format!("/v1/facts/{}/invalidate", facts[0]),
+                "headers": auth(AGENT_TOKEN),
+            },
+            "response": json_response(200, &fact_json(facts[0], "retracted", "active", "agent", &[])),
+        }),
+        scenario,
+        HELD,
+        Some(INVALIDATED),
+    ));
+    stubs.push(in_state(
+        insight_get_stub(insight, stale_after),
+        scenario,
+        INVALIDATED,
+        None,
+    ));
+    stubs.push(insight_get_stub(control, &active(control)));
+    stubs
+}
+
+fn stale_invalidated(ids: &mut Ids, change: &str) -> Value {
+    let insight = ids.of("invalidate/insight");
+    let fact = ids.of("invalidate/f0");
+    insight_json(
+        insight,
+        "stale",
+        &json!([{ "kind": "fact", "id": fact, "change": change }]),
+    )
+}
+
+#[tokio::test]
+async fn an_insight_stale_with_the_right_change_passes_its_case() {
+    let wiremock = start_wiremock().await;
+    let mut ids = Ids::default();
+    let stale = stale_invalidated(&mut ids, "invalidated");
+    wiremock
+        .import(invalidate_case_stubs(&mut ids, &stale))
+        .await;
+
+    let run = run_harness(&wiremock.url, &["--suite", "insights"]).await;
+
+    // The unstubbed cases error, so the suite fails as a whole.
+    assert_eq!(run.output.status.code(), Some(1), "{}", stdout(&run));
+    let insights = suite(&run.report, "insights");
+    let passed = case(insights, INVALIDATE_CASE);
+    assert_eq!(passed["status"], json!("passed"), "{passed}");
+    assert_eq!(passed["class"], json!("staleness"));
+    // Two writes, the stale insight and the active control.
+    assert_eq!(passed["detail"]["checks"], json!(4));
+    assert_eq!(wiremock.count("POST", "/v1/insights").await, 2);
+}
+
+#[tokio::test]
+async fn an_insight_left_active_after_invalidation_fails() {
+    let wiremock = start_wiremock().await;
+    let mut ids = Ids::default();
+    let insight = ids.of("invalidate/insight");
+    let still_active = insight_json(insight, "active", &Value::Null);
+    wiremock
+        .import(invalidate_case_stubs(&mut ids, &still_active))
+        .await;
+
+    let run = run_harness(&wiremock.url, &["--suite", "insights"]).await;
+
+    let insights = suite(&run.report, "insights");
+    let failed = case(insights, INVALIDATE_CASE);
+    assert_eq!(failed["status"], json!("failed"), "{failed}");
+    assert!(
+        failed["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("status active, expected stale"),
+        "{failed}"
+    );
+    assert!(stdout(&run).contains("gate failed: insights.failed_cases"));
+}
+
+#[tokio::test]
+async fn a_stale_reason_with_the_wrong_change_fails() {
+    let wiremock = start_wiremock().await;
+    let mut ids = Ids::default();
+    let wrong = stale_invalidated(&mut ids, "purged");
+    wiremock
+        .import(invalidate_case_stubs(&mut ids, &wrong))
+        .await;
+
+    let run = run_harness(&wiremock.url, &["--suite", "insights"]).await;
+
+    let failed = case(suite(&run.report, "insights"), INVALIDATE_CASE);
+    assert_eq!(failed["status"], json!("failed"), "{failed}");
+    assert!(
+        failed["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("stale_reason is"),
+        "{failed}"
+    );
+}
+
+/// The time travel case: the insight is recalled at the present and skipped with `as_of` or
+/// `known_at`. `with_as_of` is what the server answers for an `as_of` recall.
+fn time_travel_stubs(ids: &mut Ids, with_as_of: &Value) -> Vec<Value> {
+    let (facts, mut stubs) = fact_commit_stubs(TIME_TRAVEL_CASE, 2, ids);
+    let insight = insight_json(ids.of("time-travel/insight"), "active", &Value::Null);
+    stubs.push(insight_write_stub(facts[0], &insight));
+    let recall = |field: Option<&str>, priority: u32, body: &Value| {
+        let mut patterns = vec![scope_pattern(TIME_TRAVEL_CASE)];
+        if let Some(field) = field {
+            patterns.push(json!({ "matchesJsonPath": format!("$.{field}") }));
+        }
+        json!({
+            "priority": priority,
+            "request": {
+                "method": "POST",
+                "urlPath": "/v1/recall",
+                "headers": auth(AGENT_TOKEN),
+                "bodyPatterns": patterns,
+            },
+            "response": json_response(200, body),
+        })
+    };
+    let skipped = json!({ "facts": [], "insights": [], "insights_skipped": "time_travel" });
+    stubs.push(recall(
+        None,
+        DEFAULT_PRIORITY,
+        &json!({ "facts": [], "insights": [{ "insight": insight, "score": 0.03 }] }),
+    ));
+    stubs.push(recall(Some("as_of"), AS_OF_PRIORITY, with_as_of));
+    stubs.push(recall(Some("known_at"), AS_OF_PRIORITY, &skipped));
+    stubs
+}
+
+#[tokio::test]
+async fn insights_skipped_on_time_travel_pass_and_returned_ones_fail() {
+    let wiremock = start_wiremock().await;
+    let mut ids = Ids::default();
+    let skipped = json!({ "facts": [], "insights": [], "insights_skipped": "time_travel" });
+    wiremock.import(time_travel_stubs(&mut ids, &skipped)).await;
+    let run = run_harness(&wiremock.url, &["--suite", "insights"]).await;
+    let passed = case(suite(&run.report, "insights"), TIME_TRAVEL_CASE);
+    assert_eq!(passed["status"], json!("passed"), "{passed}");
+
+    let wiremock = start_wiremock().await;
+    let mut ids = Ids::default();
+    let insight = insight_json(ids.of("time-travel/insight"), "active", &Value::Null);
+    // An as_of recall that still searches insights.
+    let wrong = json!({ "facts": [], "insights": [{ "insight": insight, "score": 0.03 }] });
+    wiremock.import(time_travel_stubs(&mut ids, &wrong)).await;
+    let run = run_harness(&wiremock.url, &["--suite", "insights"]).await;
+    let failed = case(suite(&run.report, "insights"), TIME_TRAVEL_CASE);
+    assert_eq!(failed["status"], json!("failed"), "{failed}");
+    assert!(
+        failed["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("with as_of: 1 insights"),
+        "{failed}"
+    );
 }
