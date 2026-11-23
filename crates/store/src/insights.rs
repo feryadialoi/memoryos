@@ -624,6 +624,7 @@ pub(crate) async fn confirm_insight(
     ctx: &RequestContext,
     id: Uuid,
     sources: &[InsightSourceRef],
+    writer: Trust,
 ) -> Result<Insight> {
     let sources = rules::sources(sources)?;
     let mut tx = store.tenant_tx(ctx).await?;
@@ -638,16 +639,14 @@ pub(crate) async fn confirm_insight(
     let level = parse(row.try_get("level").map_err(db)?, "level")?;
     let (facts, found) = lock_sources(&mut tx, &sources).await?;
     let lowest = rules::check_sources(&scope, level, &sources, &facts, &found)?;
-    let row = sqlx::query("SELECT status, trust FROM insights WHERE id = $1 FOR UPDATE")
+    let row = sqlx::query("SELECT status FROM insights WHERE id = $1 FOR UPDATE")
         .bind(id)
         .fetch_one(&mut *tx)
         .await
         .map_err(db)?;
     let status: InsightStatus = parse(row.try_get("status").map_err(db)?, "status")?;
     require(id, status, &[InsightStatus::Stale])?;
-    // The writer's trust is not stored, so confirming never raises trust above what it was.
-    let current: Trust = parse(row.try_get("trust").map_err(db)?, "trust")?;
-    let trust = current.min(lowest);
+    let trust = writer.min(lowest);
     let status = if insight_requires_quarantine(&scope, level, trust) {
         InsightStatus::Quarantined
     } else {

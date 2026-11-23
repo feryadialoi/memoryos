@@ -1251,8 +1251,9 @@ impl MemoryStore for SqliteStore {
         ctx: &RequestContext,
         id: Uuid,
         sources: &[InsightSourceRef],
+        trust: Trust,
     ) -> Result<Insight> {
-        insights::confirm_insight(self, ctx, id, sources).await
+        insights::confirm_insight(self, ctx, id, sources, trust).await
     }
 
     async fn retire_insight(

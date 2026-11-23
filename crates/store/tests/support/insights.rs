@@ -727,7 +727,7 @@ pub(crate) async fn insight_bad_input_is_refused<H: Harness>(h: &H) -> Res<()> {
     // Transitions from the wrong status, and unknown ids.
     assert!(is_invalid(
         store
-            .confirm_insight(&s.c, context.id, &[f(s.f1), f(s.f2)])
+            .confirm_insight(&s.c, context.id, &[f(s.f1), f(s.f2)], Trust::Agent)
             .await
     ));
     assert!(is_invalid(
@@ -743,7 +743,7 @@ pub(crate) async fn insight_bad_input_is_refused<H: Harness>(h: &H) -> Res<()> {
     ));
     assert!(is_not_found(
         store
-            .confirm_insight(&s.c, Uuid::now_v7(), &[f(s.f1), f(s.f2)])
+            .confirm_insight(&s.c, Uuid::now_v7(), &[f(s.f1), f(s.f2)], Trust::Agent)
             .await
     ));
     // Nothing above changed the insight it was refused for.
@@ -1316,11 +1316,13 @@ pub(crate) async fn insight_confirm_reactivates_a_stale_insight<H: Harness>(h: &
     // Bad sources leave it stale.
     assert!(is_invalid(
         store
-            .confirm_insight(&s.c, insight.id, &[f(s.f1), f(s.f2)])
+            .confirm_insight(&s.c, insight.id, &[f(s.f1), f(s.f2)], Trust::Agent)
             .await
     ));
     assert!(is_invalid(
-        store.confirm_insight(&s.c, insight.id, &[f(s.f2)]).await
+        store
+            .confirm_insight(&s.c, insight.id, &[f(s.f2)], Trust::Agent)
+            .await
     ));
     assert_eq!(
         status(h, &s.c, insight.id).await?.status,
@@ -1328,7 +1330,7 @@ pub(crate) async fn insight_confirm_reactivates_a_stale_insight<H: Harness>(h: &
     );
     let (_, f3) = fact(h, &s.c, &s.scope, s.subject, "ada uses rust", Trust::User).await?;
     let confirmed = store
-        .confirm_insight(&s.c, insight.id, &[f(f3), f(s.f2)])
+        .confirm_insight(&s.c, insight.id, &[f(f3), f(s.f2)], Trust::Agent)
         .await?;
     assert_eq!(confirmed.status, InsightStatus::Active);
     assert_eq!(confirmed.stale_reason, None);
@@ -1345,10 +1347,26 @@ pub(crate) async fn insight_confirm_reactivates_a_stale_insight<H: Harness>(h: &
     let (_, ext) = fact(h, &s.c, &s.scope, s.subject, "ada said y", Trust::External).await?;
     store.approve_fact(&s.c, ext).await?;
     let held = store
-        .confirm_insight(&s.c, insight.id, &[f(ext), f(s.f2)])
+        .confirm_insight(&s.c, insight.id, &[f(ext), f(s.f2)], Trust::Agent)
         .await?;
     assert_eq!(held.status, InsightStatus::Quarantined);
     assert_eq!(held.trust, Trust::External);
+    // Once the weak source is replaced, trust comes from the confirming writer again: it rises.
+    store.approve_insight(&s.c, insight.id).await?;
+    store.invalidate_fact(&s.c, ext, "wrong").await?;
+    let (_, f4) = fact(h, &s.c, &s.scope, s.subject, "ada uses go", Trust::User).await?;
+    let raised = store
+        .confirm_insight(&s.c, insight.id, &[f(f4), f(s.f2)], Trust::Agent)
+        .await?;
+    assert_eq!(raised.status, InsightStatus::Active);
+    assert_eq!(raised.trust, Trust::Agent);
+    // A writer weaker than the sources caps the trust.
+    store.invalidate_fact(&s.c, f4, "wrong").await?;
+    let (_, f5) = fact(h, &s.c, &s.scope, s.subject, "ada uses zig", Trust::User).await?;
+    let capped = store
+        .confirm_insight(&s.c, insight.id, &[f(f5), f(s.f2)], Trust::External)
+        .await?;
+    assert_eq!(capped.trust, Trust::External);
     Ok(())
 }
 
@@ -1667,7 +1685,7 @@ pub(crate) async fn insight_another_tenant_sees_and_changes_nothing<H: Harness>(
     assert!(is_not_found(store.reject_insight(&b, held.id).await));
     assert!(is_not_found(
         store
-            .confirm_insight(&b, insight.id, &[f(s.f1), f(s.f2)])
+            .confirm_insight(&b, insight.id, &[f(s.f1), f(s.f2)], Trust::Agent)
             .await
     ));
     // Tenant A's facts and insights cannot be cited or superseded from tenant B.

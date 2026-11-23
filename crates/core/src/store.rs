@@ -260,10 +260,9 @@ pub trait MemoryStore: Send + Sync {
         limit: i64,
     ) -> Result<Vec<PageSectionHit>>;
 
-    // Insights (docs/SPEC.md section 8, Insights). The default bodies exist only until both
-    // backends implement insights in T31, which removes them. Every method that lists or searches
-    // insights first marks stale the active insights of the scopes it reads whose fact sources
-    // have expired, since expiry is a time and no write marks it.
+    // Insights (docs/SPEC.md section 8, Insights). Every method that lists or searches insights
+    // first marks stale the active insights of the scopes it reads whose fact sources have
+    // expired, since expiry is a time and no write marks it.
     /// Writes an insight atomically:
     /// - `InvalidInput` unless the statement is 1 to `INSIGHT_STATEMENT_MAX` characters, there are
     ///   `INSIGHT_SOURCES_MIN` to `INSIGHT_SOURCES_MAX` distinct sources, every source is in
@@ -275,15 +274,9 @@ pub trait MemoryStore: Send + Sync {
     ///   When the new insight is active, the old one becomes superseded with `valid_to` and
     ///   `superseded_by` set; a quarantined new insight closes it on approval.
     /// - Writes an `insight.write` audit event.
-    async fn put_insight(&self, ctx: &RequestContext, insight: NewInsight) -> Result<Insight> {
-        let _ = (ctx, insight);
-        Err(insights_not_implemented())
-    }
+    async fn put_insight(&self, ctx: &RequestContext, insight: NewInsight) -> Result<Insight>;
     /// The insight in any status, its sources as they are now, and the insights it replaced.
-    async fn get_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<InsightDetail> {
-        let _ = (ctx, id);
-        Err(insights_not_implemented())
-    }
+    async fn get_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<InsightDetail>;
     /// Insights in `scopes`, newest first, at most `limit` (1..=500).
     async fn list_insights(
         &self,
@@ -291,58 +284,39 @@ pub trait MemoryStore: Send + Sync {
         scopes: &[Scope],
         filter: &InsightFilter,
         limit: i64,
-    ) -> Result<Vec<Insight>> {
-        let _ = (ctx, scopes, filter, limit);
-        Err(insights_not_implemented())
-    }
+    ) -> Result<Vec<Insight>>;
     /// Replaces a stale insight's sources with `sources`, checked as `put_insight` checks them, and
-    /// makes it active again, or quarantined if the gate now says so. `InvalidInput` unless it is
-    /// stale. Writes an `insight.confirm` audit event.
+    /// makes it active again, or quarantined if the gate now says so. Trust is recomputed as on a
+    /// write: the lowest of the confirming writer's `trust` and every new source's trust.
+    /// `InvalidInput` unless it is stale. Writes an `insight.confirm` audit event.
     async fn confirm_insight(
         &self,
         ctx: &RequestContext,
         id: Uuid,
         sources: &[InsightSourceRef],
-    ) -> Result<Insight> {
-        let _ = (ctx, id, sources);
-        Err(insights_not_implemented())
-    }
+        trust: Trust,
+    ) -> Result<Insight>;
     /// Retires an active or stale insight: no longer true. Insights citing it become stale.
     /// Writes an `insight.retire` audit event with `reason`.
-    async fn retire_insight(
-        &self,
-        ctx: &RequestContext,
-        id: Uuid,
-        reason: &str,
-    ) -> Result<Insight> {
-        let _ = (ctx, id, reason);
-        Err(insights_not_implemented())
-    }
+    async fn retire_insight(&self, ctx: &RequestContext, id: Uuid, reason: &str)
+        -> Result<Insight>;
     /// Quarantined insights in `scopes`, oldest first.
     async fn list_quarantined_insights(
         &self,
         ctx: &RequestContext,
         scopes: &[Scope],
         limit: i64,
-    ) -> Result<Vec<Insight>> {
-        let _ = (ctx, scopes, limit);
-        Err(insights_not_implemented())
-    }
+    ) -> Result<Vec<Insight>>;
     /// Activates a quarantined insight, and closes the insight it supersedes. If any source is no
     /// longer current it becomes stale instead. Writes an `insight.approve` audit event.
-    async fn approve_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<Insight> {
-        let _ = (ctx, id);
-        Err(insights_not_implemented())
-    }
+    async fn approve_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<Insight>;
     /// Rejects a quarantined insight. Writes an `insight.reject` audit event.
-    async fn reject_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<Insight> {
-        let _ = (ctx, id);
-        Err(insights_not_implemented())
-    }
+    async fn reject_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<Insight>;
     /// What the agent should synthesize next in `scope`, deterministically ordered: stale
     /// insights oldest first, then topics, at most `limit` items in all. A topic is the current,
     /// active facts of one subject that no active, stale or quarantined insight cites, offered
     /// when there are at least `min_facts` and no decline matches their current fact set.
+    /// The default body exists only until T32 implements it on both backends.
     async fn reflect_batch(
         &self,
         ctx: &RequestContext,
@@ -355,6 +329,7 @@ pub trait MemoryStore: Send + Sync {
     }
     /// Records that the agent chose not to synthesize this topic's facts, identified by the
     /// `fact_set` a batch returned. The topic is offered again once its fact set differs.
+    /// The default body exists only until T32 implements it on both backends.
     async fn decline_topic(
         &self,
         ctx: &RequestContext,
@@ -372,10 +347,7 @@ pub trait MemoryStore: Send + Sync {
         scopes: &[Scope],
         embedding: &[f32],
         limit: i64,
-    ) -> Result<Vec<ScoredInsight>> {
-        let _ = (ctx, scopes, embedding, limit);
-        Err(insights_not_implemented())
-    }
+    ) -> Result<Vec<ScoredInsight>>;
     /// Full-text search over active insights in `scopes`.
     async fn search_insights_text(
         &self,
@@ -383,10 +355,7 @@ pub trait MemoryStore: Send + Sync {
         scopes: &[Scope],
         query: &str,
         limit: i64,
-    ) -> Result<Vec<ScoredInsight>> {
-        let _ = (ctx, scopes, query, limit);
-        Err(insights_not_implemented())
-    }
+    ) -> Result<Vec<ScoredInsight>>;
 
     // API keys: cross-tenant, looked up before the tenant is known
     /// `key_hash` is the hex SHA-256 of the presented token. Revoked keys return `None`.
