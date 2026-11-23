@@ -1717,3 +1717,411 @@ fn install_refuses_a_url_with_credentials() {
     assert!(!run.stderr.contains("pass"), "{}", run.stderr);
     assert_eq!(fs::read_dir(&sandbox.project).expect("project").count(), 0);
 }
+
+// ---- Insights -----------------------------------------------------------------------------------
+
+const REFLECT_REASON_START: &str =
+    "Before stopping, call reflect_batch and resolve what it returns";
+
+impl Sandbox {
+    fn var(&self, name: &str) -> &str {
+        self.env
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .expect("set")
+    }
+
+    /// A REST call with the sandbox's key, for what no command does, such as writing an insight.
+    fn rest(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> (u16, Value) {
+        let url = format!("{}{path}", self.var("MEMORYOS_URL"));
+        let key = self.var("MEMORYOS_API_KEY").to_owned();
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let mut request = reqwest::Client::new()
+                    .request(method, url)
+                    .bearer_auth(key)
+                    .timeout(Duration::from_secs(30));
+                if let Some(body) = body {
+                    request = request.json(&body);
+                }
+                let response = request.send().await.expect("send");
+                let status = response.status().as_u16();
+                let text = response.text().await.expect("body");
+                (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+            })
+    }
+
+    fn write_insight(&self, level: &str, statement: &str, facts: &[&str]) -> Value {
+        let sources: Vec<Value> = facts
+            .iter()
+            .map(|id| json!({"kind": "fact", "id": id}))
+            .collect();
+        let body = json!({"scope": "agent:coding-agent", "level": level,
+            "statement": statement, "sources": sources});
+        let (status, value) = self.rest(reqwest::Method::POST, "/v1/insights", Some(body));
+        assert_eq!(status, 200, "{value}");
+        value["insight"].clone()
+    }
+}
+
+fn commit_superseding(sandbox: &Sandbox, old: &str, statement: &str) {
+    let mut request: Value =
+        serde_json::from_str(&commit_json("agent:coding-agent", statement)).expect("json");
+    request["facts"][0]["supersedes"] = json!(old);
+    sandbox.json(&["commit", "--json"], &request.to_string());
+}
+
+#[test]
+fn session_start_prints_guidance_first_skips_cited_facts_and_never_a_stale_insight() {
+    let sandbox = live_sandbox();
+    let word = unique("insightproj");
+    let statement = |text: &str| format!("{word} {text}");
+    let (fridays, _) = commit(
+        &sandbox,
+        "agent:coding-agent",
+        &statement("deploys run on Fridays"),
+    );
+    let (rollback, _) = commit(
+        &sandbox,
+        "agent:coding-agent",
+        &statement("deploys need a rollback plan"),
+    );
+    let (tabs, _) = commit(&sandbox, "agent:coding-agent", &statement("uses tabs"));
+    let (tea, _) = commit(
+        &sandbox,
+        "agent:coding-agent",
+        &statement("team drinks tea"),
+    );
+    let guidance = sandbox.write_insight(
+        "guidance",
+        &statement("GUIDANCE: prepare the rollback plan before a Friday deploy"),
+        &[&fridays, &rollback],
+    );
+    assert_eq!(guidance["status"], "active", "{guidance}");
+    let stale = sandbox.write_insight(
+        "context",
+        &statement("STALE-CONTEXT: a calm tabs-and-tea team"),
+        &[&tabs, &tea],
+    );
+    commit_superseding(&sandbox, &tea, &statement("team drinks coffee"));
+    let (_, read) = sandbox.rest(
+        reqwest::Method::GET,
+        &format!("/v1/insights/{}", stale["id"].as_str().expect("id")),
+        None,
+    );
+    assert_eq!(read["status"], "stale", "{read}");
+
+    let input = json!({"session_id": "i1", "cwd": format!("/x/{word}")}).to_string();
+    let run = sandbox.run(&["hook", "session-start"], &input);
+
+    assert!(run.success, "{}", run.stderr);
+    let out = &run.stdout;
+    let at = |needle: &str| {
+        out.find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {out}"))
+    };
+    assert!(at("<memoryos-memories>") < at("How to work with this user (learned from memory"));
+    assert!(out.contains("the user and CLAUDE.md override it"), "{out}");
+    assert!(at("How to work with this user") < at("GUIDANCE: prepare"));
+    assert!(at("GUIDANCE: prepare") < at("Facts:\n"));
+    assert!(at("Facts:\n") < at(&statement("uses tabs")));
+    assert!(at(&statement("uses tabs")) < at("</memoryos-memories>"));
+    assert!(
+        !out.contains("STALE-CONTEXT"),
+        "a stale insight is never printed: {out}"
+    );
+    assert!(
+        !out.contains("deploys run on Fridays"),
+        "cited by printed guidance: {out}"
+    );
+    assert!(!out.contains("deploys need a rollback plan"), "{out}");
+    assert!(out.chars().count() <= 9_000);
+}
+
+#[test]
+fn prompt_shows_an_insight_once_per_session() {
+    let sandbox = live_sandbox();
+    let word = unique("prompthint");
+    let (one, _) = commit(
+        &sandbox,
+        "agent:coding-agent",
+        &format!("{word} builds take long"),
+    );
+    let (two, _) = commit(
+        &sandbox,
+        "agent:coding-agent",
+        &format!("{word} builds run nightly"),
+    );
+    let insight = format!("{word} UNDERSTANDING: builds are slow, so they run at night");
+    sandbox.write_insight("understanding", &insight, &[&one, &two]);
+    let question = format!("why are {word} builds slow");
+
+    let first = sandbox.run(&["hook", "prompt"], &prompt_input("q1", &question));
+    assert!(first.success, "{}", first.stderr);
+    let at = |needle: &str| {
+        first
+            .stdout
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {}", first.stdout))
+    };
+    assert!(at("Insights (learned from memory") < at("UNDERSTANDING: builds are slow"));
+    assert!(at("UNDERSTANDING: builds are slow") < at("</memoryos-memories>"));
+
+    let again = sandbox.run(&["hook", "prompt"], &prompt_input("q1", &question));
+    assert!(!again.stdout.contains("UNDERSTANDING"), "{}", again.stdout);
+
+    let other = sandbox.run(&["hook", "prompt"], &prompt_input("q2", &question));
+    assert!(other.stdout.contains("UNDERSTANDING"), "{}", other.stdout);
+}
+
+/// Three facts about one subject: one ready topic.
+fn seed_topic(sandbox: &Sandbox) -> Vec<String> {
+    let word = unique("topic");
+    ["likes tea", "uses vim", "deploys on Fridays"]
+        .iter()
+        .map(|text| commit(sandbox, "agent:coding-agent", &format!("{word} {text}")).0)
+        .collect()
+}
+
+#[test]
+fn stop_asks_for_a_reflect_once_the_backlog_reaches_the_threshold() {
+    let mut sandbox = live_sandbox();
+    sandbox.set("MEMORYOS_HOOK_STOP_EVERY", "1");
+    sandbox.set("MEMORYOS_REFLECT_BACKLOG", "1");
+    assert_eq!(
+        sandbox.ok(&["hook", "stop"], &stop_input("r", false)),
+        STOP_JSON,
+        "nothing waits yet"
+    );
+    seed_topic(&sandbox);
+
+    let output = sandbox.ok(&["hook", "stop"], &stop_input("r", false));
+    let value: Value = serde_json::from_str(&output).expect("json");
+    assert_eq!(value["decision"], "block");
+    let reason = value["reason"].as_str().expect("reason");
+    assert!(reason.starts_with(REFLECT_REASON_START), "{reason}");
+    assert!(reason.contains("insight_write") && reason.contains("reflect_decline"));
+    assert!(
+        reason.ends_with("Scopes with items waiting: agent:coding-agent."),
+        "{reason}"
+    );
+
+    // The turn the reflect starts never blocks again.
+    assert_eq!(sandbox.ok(&["hook", "stop"], &stop_input("r", true)), "");
+
+    // OpenCode's plugin sends only these two fields, from the project folder.
+    let opencode = json!({"session_id": "oc", "stop_hook_active": false}).to_string();
+    let output = sandbox.ok(&["hook", "stop"], &opencode);
+    let reason: Value = serde_json::from_str(&output).expect("json");
+    assert!(reason["reason"]
+        .as_str()
+        .expect("reason")
+        .starts_with(REFLECT_REASON_START));
+
+    // One topic is below the default threshold of 3.
+    sandbox.unset("MEMORYOS_REFLECT_BACKLOG");
+    assert_eq!(
+        sandbox.ok(&["hook", "stop"], &stop_input("r", false)),
+        STOP_JSON
+    );
+}
+
+#[test]
+fn reflect_prints_the_batch_with_instructions_and_nothing_once_declined() {
+    let sandbox = live_sandbox();
+    let facts = seed_topic(&sandbox);
+
+    let text = sandbox.ok(&["reflect"], "");
+    assert!(text.starts_with("Reflect on what MemoryOS holds"), "{text}");
+    assert!(text.contains("<memoryos-reflect>\n"), "{text}");
+    assert!(text.contains("Scope agent:coding-agent: 0 stale insights, 1 topics."));
+    for id in &facts {
+        assert!(text.contains(&format!("  - fact {id}: ")), "{id}: {text}");
+    }
+    assert!(text.trim_end().ends_with("</memoryos-reflect>"));
+
+    let json = sandbox.json(&["reflect", "--scope", "agent:coding-agent", "--json"], "");
+    let topic = &json["batches"][0]["topics"][0];
+    assert_eq!(json["batches"][0]["scope"], "agent:coding-agent");
+    let body = json!({"scope": "agent:coding-agent", "topic_key": topic["topic_key"],
+        "fact_set": topic["fact_set"]});
+    let (status, _) = sandbox.rest(reqwest::Method::POST, "/v1/reflect/decline", Some(body));
+    assert_eq!(status, 204);
+
+    assert_eq!(
+        sandbox.ok(&["reflect"], "").trim_end(),
+        "Nothing to reflect on in agent:coding-agent."
+    );
+}
+
+#[test]
+fn insight_list_read_and_retire() {
+    let sandbox = live_sandbox();
+    let facts = seed_topic(&sandbox);
+    let written = sandbox.write_insight(
+        "context",
+        "CLI-INSIGHT: a vim user who deploys on Fridays",
+        &[&facts[1], &facts[2]],
+    );
+    let id = written["id"].as_str().expect("id").to_owned();
+
+    let list = sandbox.ok(&["insight", "list"], "");
+    assert!(
+        list.contains(&format!(
+            "{id}  active  context  agent:coding-agent  CLI-INSIGHT"
+        )),
+        "{list}"
+    );
+    let json = sandbox.json(&["insight", "list", "--level", "context", "--json"], "");
+    assert_eq!(json["insights"][0]["id"], id.as_str());
+
+    let read = sandbox.ok(&["insight", "read", &id], "");
+    assert!(
+        read.starts_with(&format!("context insight {id} (agent:coding-agent, active")),
+        "{read}"
+    );
+    assert!(
+        read.contains(&format!("- fact {} (current): ", facts[1])),
+        "{read}"
+    );
+
+    let retired = sandbox.ok(
+        &["insight", "retire", &id, "--reason", "moved to emacs"],
+        "",
+    );
+    assert!(
+        retired.starts_with(&format!("retired {id}: CLI-INSIGHT")),
+        "{retired}"
+    );
+    let active = sandbox.ok(&["insight", "list", "--status", "active"], "");
+    assert_eq!(active.trim_end(), "no insights");
+
+    let missing = sandbox.run(
+        &["insight", "read", "00000000-0000-0000-0000-000000000000"],
+        "",
+    );
+    assert!(!missing.success);
+    assert!(missing.stderr.contains("not found"), "{}", missing.stderr);
+}
+
+/// A directory of stand-ins for `launchctl`, `systemctl` and `claude`, each appending its
+/// arguments to `calls.log`, so no test reaches the real launchd, systemd or host.
+fn fake_tools(sandbox: &Sandbox) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = sandbox.home.join("fakebin");
+    fs::create_dir_all(&bin).expect("bin");
+    let log = sandbox.home.join("calls.log");
+    for tool in ["launchctl", "systemctl", "claude"] {
+        let path = bin.join(tool);
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"{tool} $*\" >> '{}'\n",
+            log.display()
+        );
+        fs::write(&path, script).expect("script");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    (bin, log)
+}
+
+#[test]
+fn reflect_schedule_installs_and_removes_the_job_in_the_temporary_home() {
+    let mut sandbox = live_sandbox();
+    let (bin, log) = fake_tools(&sandbox);
+    sandbox.set("PATH", &bin.display().to_string());
+
+    let installed = sandbox.ok(&["reflect", "--schedule", "nightly"], "");
+    let again = sandbox.ok(&["reflect", "--schedule", "nightly"], "");
+    let files: Vec<PathBuf> = if cfg!(target_os = "macos") {
+        vec![sandbox
+            .home
+            .join("Library/LaunchAgents/memoryos.reflect.plist")]
+    } else {
+        let dir = sandbox.home.join(".config/systemd/user");
+        vec![
+            dir.join("memoryos-reflect.service"),
+            dir.join("memoryos-reflect.timer"),
+        ]
+    };
+    for file in &files {
+        assert!(
+            installed.contains(&format!("wrote {}", file.display())),
+            "{installed}"
+        );
+        assert!(
+            again.contains(&format!("unchanged {}", file.display())),
+            "{again}"
+        );
+        let content = fs::read_to_string(file).expect("job file");
+        assert!(
+            !content.contains(sandbox.var("MEMORYOS_API_KEY")),
+            "never the key"
+        );
+    }
+    let job = fs::read_to_string(&files[0]).expect("job");
+    assert!(job.contains(&binary().display().to_string()), "{job}");
+    assert!(job.contains("reflect") && job.contains("--run"), "{job}");
+    assert!(
+        job.contains(&sandbox.project.display().to_string()),
+        "runs in the project: {job}"
+    );
+    assert!(
+        installed.contains("MEMORYOS_API_KEY is not written"),
+        "{installed}"
+    );
+
+    let removed = sandbox.ok(&["reflect", "--schedule", "off"], "");
+    assert!(
+        removed.starts_with("Removed the nightly reflect."),
+        "{removed}"
+    );
+    assert!(files.iter().all(|file| !file.exists()));
+    let nothing = sandbox.ok(&["reflect", "--schedule", "off"], "");
+    assert_eq!(nothing.trim_end(), "No nightly reflect is installed.");
+
+    let calls = fs::read_to_string(&log).expect("calls");
+    if cfg!(target_os = "macos") {
+        assert!(calls.contains("launchctl load -w "), "{calls}");
+        assert!(calls.contains("launchctl unload "), "{calls}");
+    } else {
+        assert!(
+            calls.contains("systemctl --user enable --now memoryos-reflect.timer"),
+            "{calls}"
+        );
+    }
+}
+
+#[test]
+fn reflect_run_gives_the_batch_to_the_host_and_stops_when_nothing_changes() {
+    let mut sandbox = live_sandbox();
+    let (bin, log) = fake_tools(&sandbox);
+    sandbox.set("PATH", &bin.display().to_string());
+
+    let empty = sandbox.ok(&["reflect", "--run"], "");
+    assert_eq!(empty.trim_end(), "round 1: nothing to reflect on");
+    assert!(!log.exists(), "no host run for an empty batch");
+
+    seed_topic(&sandbox);
+    let output = sandbox.ok(&["reflect", "--run"], "");
+    assert!(
+        output.contains("round 1: the host resolved 1 items"),
+        "{output}"
+    );
+    assert!(
+        output.contains("round 2: the batch did not change"),
+        "{output}"
+    );
+    let calls = fs::read_to_string(&log).expect("calls");
+    assert!(
+        calls.starts_with("claude -p Reflect on what MemoryOS holds"),
+        "{calls}"
+    );
+    assert!(calls.contains("<memoryos-reflect>"), "{calls}");
+    assert!(
+        calls.contains("--allowedTools mcp__memoryos__reflect_batch,"),
+        "{calls}"
+    );
+    assert_eq!(calls.matches("claude -p").count(), 1);
+}

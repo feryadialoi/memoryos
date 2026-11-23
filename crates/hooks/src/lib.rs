@@ -12,11 +12,13 @@ mod credentials;
 mod doc;
 mod files;
 mod hook;
+mod insight;
 mod install;
 mod knowledge;
 mod mcp;
 mod outbox;
 mod page;
+mod reflect;
 pub mod settings;
 mod setup;
 mod stats;
@@ -28,8 +30,10 @@ use clap::{Args, Subcommand};
 use memoryos_sdk::Scope;
 use uuid::Uuid;
 
+pub use insight::InsightCommand;
 pub use install::Agent;
 pub use page::PageCommand;
+pub use reflect::{ReflectArgs, Schedule};
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -69,6 +73,13 @@ pub enum Command {
     /// List, read, write and delete knowledge pages. The scope defaults to the first hook scope.
     #[command(subcommand)]
     Page(PageCommand),
+    /// List, read and retire insights: what several facts mean together, written by the agent.
+    #[command(subcommand)]
+    Insight(InsightCommand),
+    /// Print what memory needs the agent to synthesize, with the instructions, for a host to run
+    /// as a prompt. `--run` gives it to the host CLI headless; `--schedule nightly` does that at
+    /// 02:00.
+    Reflect(ReflectArgs),
     /// Agent hooks and their installer.
     #[command(subcommand)]
     Hook(HookCommand),
@@ -165,7 +176,8 @@ pub enum HookCommand {
     /// Print memories and page titles related to the user's prompt that this session has not shown
     /// yet, and a reminder to save when the prompt seems to state a fact. Never fails the host.
     Prompt,
-    /// Periodically ask the host to save durable facts. Never fails the host.
+    /// Periodically ask the host to save durable facts, or to reflect when stale insights and
+    /// ready topics wait (`MEMORYOS_REFLECT_BACKLOG`, default 3). Never fails the host.
     Stop,
     /// At session end, keep the user's typed prompts locally when the session saved nothing, for
     /// the next session start to show. Never fails the host.
@@ -264,6 +276,8 @@ pub fn run(command: Command) -> Result<(), String> {
         Command::Quarantine(QuarantineCommand::Approve { id, json }) => client::approve(id, json),
         Command::Quarantine(QuarantineCommand::Reject { id, json }) => client::reject(id, json),
         Command::Page(command) => page::run(command),
+        Command::Insight(command) => insight::run(command),
+        Command::Reflect(args) => reflect::run(&args),
     }
 }
 
@@ -386,6 +400,56 @@ mod tests {
             parse(&["page", "delete", "deploy", "--scope", "shared:team"]),
             Ok(Command::Page(PageCommand::Delete { .. }))
         ));
+    }
+
+    #[test]
+    fn insight_commands_are_reachable() {
+        assert!(matches!(
+            parse(&["insight", "list", "--scope", "agent:a", "--level", "guidance"]),
+            Ok(Command::Insight(InsightCommand::List { .. }))
+        ));
+        assert!(parse(&["insight", "list", "--level", "rule"]).is_err());
+        assert!(parse(&["insight", "list", "--status", "stale", "--json"]).is_ok());
+        let id = Uuid::nil().to_string();
+        assert!(matches!(
+            parse(&["insight", "read", &id]),
+            Ok(Command::Insight(InsightCommand::Read { .. }))
+        ));
+        assert!(
+            parse(&["insight", "retire", &id]).is_err(),
+            "a reason is required"
+        );
+        assert!(matches!(
+            parse(&["insight", "retire", &id, "--reason", "moved on"]),
+            Ok(Command::Insight(InsightCommand::Retire { .. }))
+        ));
+    }
+
+    #[test]
+    fn reflect_takes_a_scope_a_run_or_a_schedule() {
+        let Command::Reflect(args) = parse(&["reflect"]).expect("ok") else {
+            panic!("wrong command");
+        };
+        assert!(args.scopes.is_empty() && !args.run && args.schedule.is_none());
+        assert_eq!(args.agent, Agent::ClaudeCode);
+        assert!(parse(&["reflect", "--scope", "agent:a,shared:t", "--limit", "20"]).is_ok());
+        assert!(parse(&["reflect", "--limit", "21"]).is_err());
+        assert!(parse(&["reflect", "--limit", "0"]).is_err());
+        let Command::Reflect(args) =
+            parse(&["reflect", "--schedule", "nightly", "--agent", "opencode"]).expect("ok")
+        else {
+            panic!("wrong command");
+        };
+        assert_eq!(
+            (args.schedule, args.agent),
+            (Some(Schedule::Nightly), Agent::Opencode)
+        );
+        assert!(parse(&["reflect", "--schedule", "off"]).is_ok());
+        assert!(parse(&["reflect", "--schedule", "weekly"]).is_err());
+        assert!(parse(&["reflect", "--schedule", "off", "--run"]).is_err());
+        assert!(parse(&["reflect", "--schedule", "off", "--scope", "agent:a"]).is_err());
+        assert!(parse(&["reflect", "--run", "--json"]).is_err());
+        assert!(parse(&["reflect", "--run", "--scope", "agent:a"]).is_ok());
     }
 
     #[test]

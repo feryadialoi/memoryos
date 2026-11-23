@@ -1719,7 +1719,8 @@ mod tests {
             insight(InsightLevel::Guidance, "Offer tea before deep work", &[]),
             insight(InsightLevel::Context, "Ada is a backend engineer", &[]),
         ];
-        let (text, shown) = render_with_insights(&insights, &[tea.clone()], MAX_OUTPUT_CHARS);
+        let (text, shown) =
+            render_with_insights(&insights, std::slice::from_ref(&tea), MAX_OUTPUT_CHARS);
 
         let at = |needle: &str| {
             text.find(needle)
@@ -1782,7 +1783,8 @@ mod tests {
             insight(InsightLevel::Context, "Ada is slow", &[cited.fact.id]),
             InsightStatus::Stale,
         );
-        let (text, shown) = render_with_insights(&[stale.clone()], &[cited], MAX_OUTPUT_CHARS);
+        let (text, shown) =
+            render_with_insights(std::slice::from_ref(&stale), &[cited], MAX_OUTPUT_CHARS);
         assert!(text.contains("Ada drinks tea"), "{text}");
         assert!(!shown.contains(&stale.id));
     }
@@ -1903,7 +1905,7 @@ mod tests {
         let home = tempfile::tempdir().expect("dir");
         let (cited, other) = (fact("CITED-FACT tea at 9"), fact("OTHER-FACT vim"));
         let guidance = insight(InsightLevel::Guidance, "Offer tea first", &[cited.fact.id]);
-        let listed = insights_json(&[guidance.clone()]);
+        let listed = insights_json(std::slice::from_ref(&guidance));
         let recall = json!({"facts": [cited.clone(), other.clone()], "pages": []}).to_string();
         let server = Server::routed(3, move |request| {
             if request.target.starts_with("/v1/insights") {

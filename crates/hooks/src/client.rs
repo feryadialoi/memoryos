@@ -133,7 +133,7 @@ where
     Ok(())
 }
 
-fn describe(error: Error) -> String {
+pub(crate) fn describe(error: Error) -> String {
     match error {
         Error::Transport(cause) if cause.is_timeout() => {
             "the server did not answer in time. Check MEMORYOS_URL".to_owned()
