@@ -102,3 +102,12 @@ async fn sqlite_pages_are_ranked_apart_and_only_current() {
         .pages_are_ranked_apart_and_only_current()
         .await;
 }
+
+#[tokio::test]
+async fn sqlite_insights_are_recalled_apart_and_only_active() {
+    let fixture = fixture().await;
+    fixture
+        .scenario()
+        .insights_are_recalled_apart_and_only_active()
+        .await;
+}

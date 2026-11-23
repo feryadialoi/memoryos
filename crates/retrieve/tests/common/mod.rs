@@ -5,8 +5,10 @@ use std::sync::Arc;
 
 use chrono::{DateTime, TimeZone, Utc};
 use memoryos_core::{
-    FactFilter, FactOp, FactStatus, MemoryStore, NewEntity, NewEpisode, NewFact, NewPageSection,
-    NewPageVersion, PageVersionStatus, RequestContext, Scope, ScoredFact, Trust, EMBEDDING_DIMS,
+    FactFilter, FactOp, FactStatus, InsightLevel, InsightSourceKind, InsightSourceRef,
+    InsightStatus, MemoryStore, NewEntity, NewEpisode, NewFact, NewInsight, NewPageSection,
+    NewPageVersion, PageVersionStatus, RequestContext, Scope, ScoredFact, ScoredInsight, Trust,
+    EMBEDDING_DIMS,
 };
 use memoryos_embed::TestEmbedder;
 use memoryos_retrieve::{RecallRequest, RecallResponse, Retriever};
@@ -276,6 +278,148 @@ impl Scenario {
         assert!(then.pages.is_empty());
         assert_eq!(then.pages_skipped, Some("time_travel"));
     }
+}
+
+impl Scenario {
+    /// Writes an insight at user trust citing `facts`, at `degrees` from the query vector.
+    async fn insight(
+        &self,
+        level: InsightLevel,
+        statement: &str,
+        degrees: f32,
+        facts: &[Uuid],
+    ) -> (Uuid, InsightStatus) {
+        let sources = facts
+            .iter()
+            .map(|&id| InsightSourceRef {
+                kind: InsightSourceKind::Fact,
+                id,
+            })
+            .collect();
+        let insight = self
+            .store
+            .put_insight(
+                &self.ctx,
+                NewInsight {
+                    scope: self.scope.clone(),
+                    level,
+                    statement: statement.into(),
+                    embedding: at_angle(degrees),
+                    trust: Trust::User,
+                    sources,
+                    supersedes: None,
+                    written_by: "test".into(),
+                },
+            )
+            .await
+            .expect("write insight");
+        (insight.id, insight.status)
+    }
+
+    async fn recall_with(&self, request: RecallRequest) -> RecallResponse {
+        Retriever::new(self.store.clone(), self.embedder.clone())
+            .recall(&self.ctx, request)
+            .await
+            .expect("recall")
+    }
+
+    /// Insights come back as their own list, only active ones, cut at `insight_limit`, skipped
+    /// with time travel, and leave facts exactly as they rank without insights.
+    pub async fn insights_are_recalled_apart_and_only_active(&self) {
+        let subject = self.entity("a").await;
+        let mut facts = Vec::new();
+        for n in 0..4 {
+            facts.push(
+                self.add(subject, &format!("a zebra was seen {n}"), 1.0)
+                    .await,
+            );
+        }
+        let cited = &facts[..2];
+
+        use InsightLevel::*;
+        let (best, status) = self
+            .insight(Context, "the zebra lives nearby", 0.0, cited)
+            .await;
+        assert_eq!(status, InsightStatus::Active);
+        let mut active = BTreeSet::from([best]);
+        for n in 0..5 {
+            let statement = format!("unrelated pattern {n}");
+            let (id, status) = self
+                .insight(Understanding, &statement, 30.0 + n as f32 * 10.0, cited)
+                .await;
+            assert_eq!(status, InsightStatus::Active);
+            active.insert(id);
+        }
+        // Guidance outside an agent scope is held for review.
+        let (held, status) = self
+            .insight(Guidance, "zebra zebra zebra", 0.0, cited)
+            .await;
+        assert_eq!(status, InsightStatus::Quarantined);
+        // An insight whose source fact is invalidated goes stale.
+        let (stale, status) = self
+            .insight(Context, "the zebra herd", 0.0, &facts[2..])
+            .await;
+        assert_eq!(status, InsightStatus::Active);
+        self.store
+            .invalidate_fact(&self.ctx, facts[2], "wrong")
+            .await
+            .expect("invalidate source");
+
+        let response = self.recall(QUERY).await;
+        assert_eq!(response.insights.len(), 3, "insight_limit defaults to 3");
+        assert_eq!(response.insights[0].insight.id, best);
+        assert_eq!(response.insights_skipped, None);
+        let scores: Vec<f64> = response.insights.iter().map(|hit| hit.score).collect();
+        assert!(
+            scores.windows(2).all(|pair| pair[0] >= pair[1]),
+            "{scores:?}"
+        );
+
+        let mut all = self.request(QUERY);
+        all.insight_limit = 10;
+        let all = self.recall_with(all).await;
+        assert_eq!(insight_ids(&all.insights), active);
+        assert!(!insight_ids(&all.insights).contains(&held));
+        assert!(!insight_ids(&all.insights).contains(&stale));
+        assert!(all
+            .insights
+            .iter()
+            .all(|hit| hit.insight.status == InsightStatus::Active));
+
+        let mut two = self.request(QUERY);
+        two.insight_limit = 2;
+        assert_eq!(self.recall_with(two).await.insights.len(), 2);
+
+        let mut off = self.request(QUERY);
+        off.insight_limit = 0;
+        let off = self.recall_with(off).await;
+        assert!(off.insights.is_empty());
+        assert_eq!(off.insights_skipped, None);
+        assert_eq!(fact_shape(&off.facts), fact_shape(&response.facts));
+        assert!(!response.facts.is_empty());
+
+        let mut as_of = self.request(QUERY);
+        as_of.as_of = Some(Utc::now());
+        let mut known_at = self.request(QUERY);
+        known_at.known_at = Some(Utc::now());
+        for past in [as_of, known_at] {
+            let past = self.recall_with(past).await;
+            assert!(past.insights.is_empty());
+            assert_eq!(past.insights_skipped, Some("time_travel"));
+        }
+    }
+}
+
+fn insight_ids(insights: &[ScoredInsight]) -> BTreeSet<Uuid> {
+    insights.iter().map(|hit| hit.insight.id).collect()
+}
+
+/// Fact ids in order with their exact scores.
+fn fact_shape(facts: &[ScoredFact]) -> Vec<(Uuid, u64)> {
+    facts
+        .iter()
+        .map(|scored| (scored.fact.id, scored.score.to_bits()))
+        .collect()
 }
 
 fn at_angle(degrees: f32) -> Vec<f32> {

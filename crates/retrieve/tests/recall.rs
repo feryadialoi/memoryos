@@ -441,6 +441,19 @@ async fn pages_are_ranked_apart_and_only_current() {
 }
 
 #[tokio::test]
+async fn insights_are_recalled_apart_and_only_active() {
+    let f = fixture().await;
+    common::Scenario::new(
+        f.store.clone(),
+        f.embedder.clone(),
+        f.ctx.clone(),
+        f.scope.clone(),
+    )
+    .insights_are_recalled_apart_and_only_active()
+    .await;
+}
+
+#[tokio::test]
 async fn finds_a_fact_only_by_text() {
     let f = fixture().await;
     f.add_fillers(50).await;
