@@ -281,6 +281,64 @@ curl -sS -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:6366/v1/epi
 dc exec -T postgres psql -U memoryos -d memoryos -c "SELECT created_at, tenant, actor, action, target_id FROM audit_events ORDER BY created_at DESC LIMIT 20;"
 ```
 
+## Insights
+
+Insights are what the agent concludes from several facts (SPEC section 8, Insights). The server
+never writes them, so two things need an operator: whether the nightly reflect runs, and the review
+of held insights.
+
+### Nightly reflect on and off
+
+```bash
+memoryos reflect --schedule nightly   # install, or replace, the nightly job
+memoryos reflect --schedule off       # remove it
+memoryos reflect                      # print the batch the job would work on
+```
+
+`nightly` installs a launchd agent on macOS, or a systemd user timer on Linux, that runs the host
+CLI headless at 02:00 until the reflect batch is empty or 10 rounds have run. It runs only while the
+machine is awake and spends the user's host usage, so it is off until someone turns it on. Without
+it, the stop hook still asks for a reflect during sessions once the hook scopes have at least 3
+stale insights or ready topics (`MEMORYOS_REFLECT_BACKLOG`). `MEMORYOS_REFLECT_MIN_FACTS` on the
+server (default 3) sets how many uncited facts on one subject make a topic.
+
+To see the backlog without the CLI:
+
+```bash
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"scope":"agent:coding-agent","limit":20}' http://localhost:6366/v1/reflect/batch
+```
+
+**Not run** for this page: `memoryos reflect` and `--schedule` were built in T35, in parallel with
+this section, and are documented from the design (`docs/memory-into-knowledge-design.md` section 4).
+
+### Reviewing held insights
+
+The trust gate holds an insight for an admin when its trust is `external` (written by an external
+key, or citing an external fact), and every insight an agent writes in a `user:*` or `shared:*`
+scope, guidance included. Held insights never reach recall or the hooks. Review them in the
+Insights view of `memoryos ui`, or over REST with an admin key:
+
+```bash
+curl -sS -H "Authorization: Bearer $TOKEN" "http://localhost:6366/v1/insights/quarantine?scopes=shared:team"
+curl -sS -H "Authorization: Bearer $TOKEN" "http://localhost:6366/v1/insights/$INSIGHT_ID"
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:6366/v1/insights/quarantine/$INSIGHT_ID/approve"
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:6366/v1/insights/quarantine/$INSIGHT_ID/reject"
+```
+
+- `GET /v1/insights/{id}` shows each source as it is now. Approve only what those sources support.
+- Approval needs `max_trust` at least the insight's trust. An insight whose source changed while it
+  was held becomes stale on approval instead of active, and goes back to the agent.
+- Stale insights are not an admin queue: the agent confirms, rewrites or retires them through the
+  reflect batch. A person can withdraw one with `memoryos insight retire`; in a `user:*` or
+  `shared:*` scope that needs a key with `max_trust` of at least `user`.
+- Every change is in `audit_events` as `insight.write`, `insight.stale`, `insight.confirm`,
+  `insight.retire`, `insight.approve` or `insight.reject`.
+
+The REST calls above were run by the insights eval suite on 2026-11-23 (`docs/eval-results.md`):
+held insights stayed out of recall, an approved one was recalled, and a rejected one was not. The
+`memoryos ui` view and `memoryos insight` were not run for this page.
+
 ## Incidents
 
 ### Database down

@@ -9,6 +9,10 @@ use uuid::Uuid;
 
 use crate::client::{RecallResponse, Trust};
 use crate::dataset::{PAGES_DATASET, POISONING_DATASET, RECALL_DATASET, STALENESS_DATASET};
+use crate::insights::{
+    InsightDetail, InsightsRun, CLASS_CONFIRM, CLASS_RECALL, CLASS_REFLECT, CLASS_STALENESS,
+    CLASS_TRUST, INSIGHTS_DATASET,
+};
 use crate::pages::{PagesRun, QuestionDetail, PAGE_TOP_K};
 use crate::report::{Counts, Gate, SuiteReport};
 use crate::suites::{
@@ -38,6 +42,17 @@ host's edit to a reviewed page in a shared scope stays out of page reads and rec
 and shows up once it is. Fact results are the same with page_limit 0 and 3. It does not measure \
 how well a model writes pages, the pages are short, and the questions were written by the same \
 author as the pages.";
+
+const INSIGHTS_PROVES: &str =
+    "Every staleness event of SPEC section 8 marks exactly the insights citing the \
+changed source stale, with the right change, and carries it up every level; corroboration and \
+changes to uncited facts change nothing. Insights from the external key, citing an external fact, \
+or written by the host in a shared scope are held until approved. Confirm returns a stale insight \
+to active. Recall returns active insights only, respects insight_limit, skips insights on time \
+travel, and returns the same facts with insight_limit 0 and 3. The reflect batch offers a topic at \
+the threshold, honours a decline until the fact set changes, and lists stale insights first. Every \
+insight is scripted, so it says nothing about how well a model writes insights. The host's key has \
+agent trust, so the guidance rule is not separated from the shared scope rule.";
 
 pub fn contains_ci(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
@@ -418,6 +433,81 @@ pub fn pages_report(run: &PagesRun, min_page_hit: f64) -> Result<SuiteReport, se
     ))
 }
 
+pub fn insights_report(run: &InsightsRun) -> Result<SuiteReport, serde_json::Error> {
+    let scripted = count(&run.cases);
+    let facts = count(&run.facts);
+    let counts = Counts {
+        total: scripted.total + facts.total,
+        passed: scripted.passed + facts.passed,
+        failed: scripted.failed + facts.failed,
+        errors: scripted.errors + facts.errors,
+    };
+    let mut metrics = json!({
+        "cases": scripted.total,
+        "cases_passed": scripted.passed,
+        "checks": run.cases.iter().map(|r| r.detail.checks).sum::<usize>(),
+        "facts_cases": facts.total,
+        "facts_unchanged_rate": ratio(facts.passed, facts.total),
+        "corpus_insights": run.corpus_insights,
+    });
+    for class in [
+        CLASS_STALENESS,
+        CLASS_TRUST,
+        CLASS_CONFIRM,
+        CLASS_RECALL,
+        CLASS_REFLECT,
+    ] {
+        let of_class: Vec<&CaseResult<InsightDetail>> = run
+            .cases
+            .iter()
+            .filter(|r| r.class.as_deref() == Some(class))
+            .collect();
+        let passed = of_class
+            .iter()
+            .filter(|r| r.status == CaseStatus::Passed)
+            .count();
+        metrics[format!("{class}_passed")] = json!(passed);
+        metrics[format!("{class}_cases")] = json!(of_class.len());
+    }
+    if let Some(latency) = &run.latency {
+        metrics["latency_calls"] = json!(latency.calls);
+        metrics["latency_errors"] = json!(latency.errors);
+        metrics["latency_p50_ms_insight_limit_0"] = json!(round_ms(latency.p50_ms_insight_limit_0));
+        metrics["latency_p95_ms_insight_limit_0"] = json!(round_ms(latency.p95_ms_insight_limit_0));
+        metrics["latency_p50_ms_insight_limit_3"] = json!(round_ms(latency.p50_ms_insight_limit_3));
+        metrics["latency_p95_ms_insight_limit_3"] = json!(round_ms(latency.p95_ms_insight_limit_3));
+    }
+    let facts_changed = run
+        .facts
+        .iter()
+        .filter(|r| r.status == CaseStatus::Failed)
+        .count();
+    let gates = vec![
+        no_errors_gate("insights", counts),
+        // Every scripted check is a SPEC requirement, so one wrong answer fails the suite.
+        Gate::at_most("insights.failed_cases", scripted.failed as f64, 0.0),
+        // SPEC section 8: facts are ranked as before.
+        Gate::at_most("insights.facts_changed_cases", facts_changed as f64, 0.0),
+    ];
+
+    let mut cases = Vec::new();
+    for value in run.cases.iter().map(serde_json::to_value) {
+        cases.push(value?);
+    }
+    for value in run.facts.iter().map(serde_json::to_value) {
+        cases.push(value?);
+    }
+    Ok(SuiteReport::new(
+        "insights",
+        INSIGHTS_DATASET,
+        INSIGHTS_PROVES,
+        counts,
+        metrics,
+        gates,
+        cases,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +730,8 @@ mod tests {
                 facts,
                 pages: Vec::new(),
                 pages_skipped: None,
+                insights: Vec::new(),
+                insights_skipped: None,
             },
             &s(&["Reykjavik"]),
             poison(),
@@ -850,6 +942,69 @@ mod tests {
         assert_eq!(report.metrics["facts_unchanged_rate"], json!(0.0));
         assert_eq!(report.metrics["latency_p50_ms_page_limit_0"], json!(12.3));
         assert_eq!(report.metrics["latency_p95_ms_page_limit_3"], json!(25.1));
+    }
+
+    fn insight_case(class: &str, status: CaseStatus) -> CaseResult<InsightDetail> {
+        let mut case = result(
+            status,
+            InsightDetail {
+                checks: 2,
+                completed: true,
+                ..InsightDetail::default()
+            },
+        );
+        case.class = Some(class.to_owned());
+        case
+    }
+
+    fn insights_run(
+        cases: Vec<CaseResult<InsightDetail>>,
+        facts_status: CaseStatus,
+    ) -> InsightsRun {
+        InsightsRun {
+            cases,
+            facts: vec![result(
+                facts_status,
+                crate::insights::FactsDetail {
+                    compared: true,
+                    ..crate::insights::FactsDetail::default()
+                },
+            )],
+            corpus_insights: 1,
+            latency: None,
+        }
+    }
+
+    #[test]
+    fn insights_pass_only_when_every_scripted_case_passes() {
+        let good = insights_run(
+            vec![
+                insight_case(CLASS_STALENESS, CaseStatus::Passed),
+                insight_case(CLASS_REFLECT, CaseStatus::Passed),
+            ],
+            CaseStatus::Passed,
+        );
+        let report = insights_report(&good).expect("report");
+        assert!(report.passed);
+        assert_eq!(report.total, 3);
+        assert_eq!(report.metrics["staleness_passed"], json!(1));
+        assert_eq!(report.metrics["checks"], json!(4));
+
+        let wrong = insights_run(
+            vec![insight_case(CLASS_TRUST, CaseStatus::Failed)],
+            CaseStatus::Passed,
+        );
+        assert!(!insights_report(&wrong).expect("report").passed);
+        let errored = insights_run(
+            vec![insight_case(CLASS_TRUST, CaseStatus::Error)],
+            CaseStatus::Passed,
+        );
+        assert!(!insights_report(&errored).expect("report").passed);
+        let facts_changed = insights_run(
+            vec![insight_case(CLASS_RECALL, CaseStatus::Passed)],
+            CaseStatus::Failed,
+        );
+        assert!(!insights_report(&facts_changed).expect("report").passed);
     }
 
     #[test]

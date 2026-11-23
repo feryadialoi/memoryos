@@ -66,6 +66,10 @@ pub struct CommitFact<'a> {
     pub valid_from: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corroborates: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 impl<'a> CommitFact<'a> {
@@ -76,6 +80,8 @@ impl<'a> CommitFact<'a> {
             predicate: &spec.predicate,
             valid_from: spec.valid_from,
             supersedes,
+            corroborates: None,
+            expires_at: None,
         }
     }
 }
@@ -93,6 +99,9 @@ pub struct CommitRequest<'a> {
 pub struct CommittedFact {
     pub id: Uuid,
     pub status: String,
+    /// The fact this one closed, when a single-valued predicate or a reused fact closed it.
+    #[serde(default)]
+    pub superseded: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +144,130 @@ pub struct RecallResponse {
     pub pages: Vec<PageHit>,
     #[serde(default)]
     pub pages_skipped: Option<String>,
+    #[serde(default)]
+    pub insights: Vec<ScoredInsight>,
+    #[serde(default)]
+    pub insights_skipped: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScoredInsight {
+    pub insight: Insight,
+    pub score: f64,
+}
+
+/// A source an insight cites. `kind` is `fact` or `insight`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub struct SourceRef {
+    pub kind: String,
+    pub id: Uuid,
+}
+
+impl SourceRef {
+    pub fn fact(id: Uuid) -> Self {
+        Self {
+            kind: "fact".to_owned(),
+            id,
+        }
+    }
+
+    pub fn insight(id: Uuid) -> Self {
+        Self {
+            kind: "insight".to_owned(),
+            id,
+        }
+    }
+}
+
+/// One entry of `stale_reason`: which source changed, and how.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub struct StaleEntry {
+    pub kind: String,
+    pub id: Uuid,
+    pub change: String,
+    /// The successor, for change `superseded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<Uuid>,
+    /// The cited insight's status, for change `insight_changed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// An insight as written, read, listed or recalled. `GET /v1/insights/{id}` and the reflect
+/// batch add evidence fields, which this type ignores.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Insight {
+    pub id: Uuid,
+    pub scope: String,
+    pub level: String,
+    pub statement: String,
+    pub trust: Trust,
+    pub status: String,
+    #[serde(default)]
+    pub stale_reason: Option<Vec<StaleEntry>>,
+    pub sources: Vec<SourceRef>,
+    #[serde(default)]
+    pub valid_to: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub superseded_by: Option<Uuid>,
+    #[serde(default)]
+    pub pending_supersede_of: Option<Uuid>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// The body of `POST /v1/insights`.
+#[derive(Debug, Serialize)]
+pub struct InsightWrite<'a> {
+    pub scope: &'a str,
+    pub level: &'a str,
+    pub statement: &'a str,
+    pub sources: Vec<SourceRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InsightWriteResponse {
+    pub insight: Insight,
+    pub redacted: bool,
+}
+
+/// Which key writes an insight. Insight trust starts from the key, as commit trust does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsightWriter {
+    /// The host's key: `agent`.
+    Agent,
+    /// The low-trust key: `external`.
+    External,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReflectTopic {
+    pub topic_key: Uuid,
+    pub subject: String,
+    pub facts: Vec<Fact>,
+    pub fact_set: String,
+    pub insights: Vec<Insight>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReflectBatch {
+    pub stale: Vec<Insight>,
+    pub topics: Vec<ReflectTopic>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InsightList {
+    insights: Vec<Insight>,
+}
+
+/// Optional recall settings beyond scope, query and limit. Left out, the server defaults apply.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RecallOptions {
+    pub as_of: Option<DateTime<Utc>>,
+    pub known_at: Option<DateTime<Utc>>,
+    pub page_limit: Option<u32>,
+    pub insight_limit: Option<u32>,
 }
 
 /// The best section of one current page version, as `POST /v1/recall` returns it.
@@ -214,6 +347,11 @@ struct RecallBody<'a> {
     /// Left out, the server's default of 3 applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     page_limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    known_at: Option<DateTime<Utc>>,
+    /// Left out, the server's default of 3 applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    insight_limit: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -319,6 +457,8 @@ impl Client {
             limit,
             as_of,
             page_limit: None,
+            known_at: None,
+            insight_limit: None,
         })
         .await
     }
@@ -337,8 +477,159 @@ impl Client {
             limit,
             as_of: None,
             page_limit: Some(page_limit),
+            known_at: None,
+            insight_limit: None,
         })
         .await
+    }
+
+    /// Recall with every optional setting stated by the caller.
+    pub async fn recall_with(
+        &self,
+        scope: &str,
+        query: &str,
+        limit: u32,
+        options: RecallOptions,
+    ) -> Result<RecallResponse, CaseError> {
+        self.recall_body(&RecallBody {
+            scopes: [scope],
+            query,
+            limit,
+            as_of: options.as_of,
+            page_limit: options.page_limit,
+            known_at: options.known_at,
+            insight_limit: options.insight_limit,
+        })
+        .await
+    }
+
+    pub async fn write_insight(
+        &self,
+        writer: InsightWriter,
+        request: &InsightWrite<'_>,
+    ) -> Result<InsightWriteResponse, CaseError> {
+        let token = match writer {
+            InsightWriter::Agent => &self.keys.agent,
+            InsightWriter::External => &self.keys.external,
+        };
+        let path = "/v1/insights";
+        let body = to_body(request);
+        let (status, text) = self
+            .send(token, Method::POST, path, &[], Some(&body))
+            .await?;
+        decode(Method::POST, path, StatusCode::OK, status, text)
+    }
+
+    /// An insight in any status. Reading it first applies lazy expiry to its scope.
+    pub async fn get_insight(&self, id: Uuid) -> Result<Insight, CaseError> {
+        let path = format!("/v1/insights/{id}");
+        let (status, text) = self
+            .send(&self.keys.agent, Method::GET, &path, &[], None)
+            .await?;
+        decode(Method::GET, &path, StatusCode::OK, status, text)
+    }
+
+    pub async fn list_insights(
+        &self,
+        scope: &str,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<Insight>, CaseError> {
+        let path = "/v1/insights";
+        let mut query = vec![("scopes", scope), ("limit", "500")];
+        if let Some(status_filter) = status_filter {
+            query.push(("status", status_filter));
+        }
+        let (status, text) = self
+            .send(&self.keys.agent, Method::GET, path, &query, None)
+            .await?;
+        let list: InsightList = decode(Method::GET, path, StatusCode::OK, status, text)?;
+        Ok(list.insights)
+    }
+
+    pub async fn confirm_insight(
+        &self,
+        id: Uuid,
+        sources: &[SourceRef],
+    ) -> Result<Insight, CaseError> {
+        let path = format!("/v1/insights/{id}/confirm");
+        let body = serde_json::json!({ "sources": sources });
+        let (status, text) = self
+            .send(&self.keys.agent, Method::POST, &path, &[], Some(&body))
+            .await?;
+        decode(Method::POST, &path, StatusCode::OK, status, text)
+    }
+
+    pub async fn retire_insight(&self, id: Uuid, reason: &str) -> Result<Insight, CaseError> {
+        let path = format!("/v1/insights/{id}/retire");
+        let body = serde_json::json!({ "reason": reason });
+        let (status, text) = self
+            .send(&self.keys.agent, Method::POST, &path, &[], Some(&body))
+            .await?;
+        decode(Method::POST, &path, StatusCode::OK, status, text)
+    }
+
+    pub async fn insight_quarantine(&self, scope: &str) -> Result<Vec<Insight>, CaseError> {
+        let path = "/v1/insights/quarantine";
+        let query = [("scopes", scope), ("limit", QUARANTINE_PAGE)];
+        let (status, text) = self
+            .send(&self.keys.admin, Method::GET, path, &query, None)
+            .await?;
+        let list: InsightList = decode(Method::GET, path, StatusCode::OK, status, text)?;
+        Ok(list.insights)
+    }
+
+    pub async fn approve_insight(&self, id: Uuid) -> Result<Insight, CaseError> {
+        let path = format!("/v1/insights/quarantine/{id}/approve");
+        let (status, text) = self
+            .send(&self.keys.admin, Method::POST, &path, &[], None)
+            .await?;
+        decode(Method::POST, &path, StatusCode::OK, status, text)
+    }
+
+    pub async fn reject_insight(&self, id: Uuid) -> Result<Insight, CaseError> {
+        let path = format!("/v1/insights/quarantine/{id}/reject");
+        let (status, text) = self
+            .send(&self.keys.admin, Method::POST, &path, &[], None)
+            .await?;
+        decode(Method::POST, &path, StatusCode::OK, status, text)
+    }
+
+    pub async fn reflect_batch(&self, scope: &str, limit: u32) -> Result<ReflectBatch, CaseError> {
+        let path = "/v1/reflect/batch";
+        let body = serde_json::json!({ "scope": scope, "limit": limit });
+        let (status, text) = self
+            .send(&self.keys.agent, Method::POST, path, &[], Some(&body))
+            .await?;
+        decode(Method::POST, path, StatusCode::OK, status, text)
+    }
+
+    pub async fn reflect_decline(
+        &self,
+        scope: &str,
+        topic_key: Uuid,
+        fact_set: &str,
+    ) -> Result<(), CaseError> {
+        let path = "/v1/reflect/decline";
+        let body =
+            serde_json::json!({ "scope": scope, "topic_key": topic_key, "fact_set": fact_set });
+        let (status, text) = self
+            .send(&self.keys.agent, Method::POST, path, &[], Some(&body))
+            .await?;
+        if status == StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            Err(status_error(&Method::POST, path, status, text))
+        }
+    }
+
+    /// Retracts a fact as the host. The fact's trust is `agent`, so the host's key may.
+    pub async fn invalidate_fact(&self, id: Uuid, reason: &str) -> Result<Fact, CaseError> {
+        let path = format!("/v1/facts/{id}/invalidate");
+        let body = serde_json::json!({ "reason": reason });
+        let (status, text) = self
+            .send(&self.keys.agent, Method::POST, &path, &[], Some(&body))
+            .await?;
+        decode(Method::POST, &path, StatusCode::OK, status, text)
     }
 
     async fn recall_body(&self, request: &RecallBody<'_>) -> Result<RecallResponse, CaseError> {
