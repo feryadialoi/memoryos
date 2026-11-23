@@ -90,6 +90,7 @@ impl Scenario {
             as_of: None,
             known_at: None,
             page_limit: memoryos_retrieve::DEFAULT_PAGE_LIMIT,
+            insight_limit: memoryos_retrieve::DEFAULT_INSIGHT_LIMIT,
         }
     }
 

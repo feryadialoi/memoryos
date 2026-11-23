@@ -50,7 +50,7 @@ paths:
         default: { $ref: "#/components/responses/Error" }
   /v1/recall:
     post:
-      summary: Hybrid search over facts, and over sections of current pages
+      summary: Hybrid search over facts, over sections of current pages, and over active insights
       requestBody:
         required: true
         content:
@@ -944,6 +944,12 @@ components:
           maximum: 10
           default: 3
           description: Most page hits to return. 0 turns page search off
+        insight_limit:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 3
+          description: Most insights to return. 0 turns insight search off
     RecallResponse:
       type: object
       required: [facts]
@@ -964,6 +970,14 @@ components:
           type: [string, "null"]
           enum: [time_travel, null]
           description: time_travel when as_of or known_at was set, since pages are searched at the present only
+        insights:
+          type: array
+          description: Active insights in the request's scopes, vector and text search fused. Ranked apart from facts and pages
+          items: { $ref: "#/components/schemas/Insight" }
+        insights_skipped:
+          type: [string, "null"]
+          enum: [time_travel, null]
+          description: time_travel when as_of or known_at was set, since insights are searched at the present only
     GraphNeighborhood:
       type: object
       required: [root, entities, edges]

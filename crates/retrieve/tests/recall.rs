@@ -384,6 +384,7 @@ impl Fixture {
             as_of: None,
             known_at: None,
             page_limit: memoryos_retrieve::DEFAULT_PAGE_LIMIT,
+            insight_limit: memoryos_retrieve::DEFAULT_INSIGHT_LIMIT,
         }
     }
 
@@ -1036,6 +1037,11 @@ async fn invalid_requests_are_rejected() {
         assert!(is_invalid(f.retriever.recall(&f.ctx, request).await));
         let candidates = f.retriever.candidates(&f.ctx, &scopes, QUERY, limit).await;
         assert!(is_invalid(candidates));
+    }
+    for insight_limit in [-1, 11] {
+        let mut request = f.request(QUERY);
+        request.insight_limit = insight_limit;
+        assert!(is_invalid(f.retriever.recall(&f.ctx, request).await));
     }
     for blank in ["", "  \n\t"] {
         assert!(is_invalid(
