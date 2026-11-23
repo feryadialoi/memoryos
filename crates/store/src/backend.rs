@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use memoryos_core::{
     ApiKey, Block, BlockVersion, Entity, Episode, Fact, FactFilter, FactListState, FactOp,
-    FactView, GraphNeighborhood, MemoryStore, NewEntity, NewEpisode, NewPageVersion, Page,
-    PageSectionHit, PageSummary, PageVersion, PendingPageVersion, PurgeReport, RequestContext,
-    Result, Scope, ScopeSummary, ScoredFact, Trust,
+    FactView, GraphNeighborhood, Insight, InsightDetail, InsightFilter, InsightSourceRef,
+    MemoryStore, NewEntity, NewEpisode, NewInsight, NewPageVersion, Page, PageSectionHit,
+    PageSummary, PageVersion, PendingPageVersion, PurgeReport, ReflectBatch, RequestContext,
+    Result, Scope, ScopeSummary, ScoredFact, ScoredInsight, Trust,
 };
 use uuid::Uuid;
 
@@ -420,5 +421,99 @@ impl MemoryStore for Store {
 
     async fn ping(&self) -> Result<()> {
         dispatch!(self, ping())
+    }
+
+    async fn put_insight(&self, ctx: &RequestContext, insight: NewInsight) -> Result<Insight> {
+        dispatch!(self, put_insight(ctx, insight))
+    }
+
+    async fn get_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<InsightDetail> {
+        dispatch!(self, get_insight(ctx, id))
+    }
+
+    async fn list_insights(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        filter: &InsightFilter,
+        limit: i64,
+    ) -> Result<Vec<Insight>> {
+        dispatch!(self, list_insights(ctx, scopes, filter, limit))
+    }
+
+    async fn confirm_insight(
+        &self,
+        ctx: &RequestContext,
+        id: Uuid,
+        sources: &[InsightSourceRef],
+        trust: Trust,
+    ) -> Result<Insight> {
+        dispatch!(self, confirm_insight(ctx, id, sources, trust))
+    }
+
+    async fn retire_insight(
+        &self,
+        ctx: &RequestContext,
+        id: Uuid,
+        reason: &str,
+    ) -> Result<Insight> {
+        dispatch!(self, retire_insight(ctx, id, reason))
+    }
+
+    async fn list_quarantined_insights(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        limit: i64,
+    ) -> Result<Vec<Insight>> {
+        dispatch!(self, list_quarantined_insights(ctx, scopes, limit))
+    }
+
+    async fn approve_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<Insight> {
+        dispatch!(self, approve_insight(ctx, id))
+    }
+
+    async fn reject_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<Insight> {
+        dispatch!(self, reject_insight(ctx, id))
+    }
+
+    async fn reflect_batch(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        limit: i64,
+        min_facts: i64,
+    ) -> Result<ReflectBatch> {
+        dispatch!(self, reflect_batch(ctx, scope, limit, min_facts))
+    }
+
+    async fn decline_topic(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        topic_key: Uuid,
+        fact_set: &str,
+    ) -> Result<()> {
+        dispatch!(self, decline_topic(ctx, scope, topic_key, fact_set))
+    }
+
+    async fn search_insights_vector(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<ScoredInsight>> {
+        dispatch!(self, search_insights_vector(ctx, scopes, embedding, limit))
+    }
+
+    async fn search_insights_text(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<ScoredInsight>> {
+        dispatch!(self, search_insights_text(ctx, scopes, query, limit))
     }
 }

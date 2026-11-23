@@ -50,7 +50,7 @@ impl RunContext {
     }
 
     /// One commit. The idempotency key is unique per run, case and `label`.
-    async fn commit(
+    pub(crate) async fn commit(
         &self,
         trust: Trust,
         (case_id, label): (&str, &str),
@@ -1025,6 +1025,8 @@ mod tests {
             facts: vec![scored(1, "lives in Oslo"), scored(2, "Oslo and Rome")],
             pages: Vec::new(),
             pages_skipped: None,
+            insights: Vec::new(),
+            insights_skipped: None,
         };
         let values = ["oslo".to_owned(), "rome".to_owned()];
         assert_eq!(

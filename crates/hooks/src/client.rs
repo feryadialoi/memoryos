@@ -133,7 +133,7 @@ where
     Ok(())
 }
 
-fn describe(error: Error) -> String {
+pub(crate) fn describe(error: Error) -> String {
     match error {
         Error::Transport(cause) if cause.is_timeout() => {
             "the server did not answer in time. Check MEMORYOS_URL".to_owned()
@@ -383,6 +383,8 @@ mod tests {
             facts: vec![],
             pages: vec![],
             pages_skipped: None,
+            insights: vec![],
+            insights_skipped: None,
         };
         assert_eq!(recall_text(&response), "no memories found");
         let value: Value = serde_json::from_str(&recall_json(&response)).expect("json");
@@ -408,6 +410,8 @@ mod tests {
             facts: vec![],
             pages: vec![hit],
             pages_skipped: None,
+            insights: vec![],
+            insights_skipped: None,
         };
         assert_eq!(
             recall_text(&response),

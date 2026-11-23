@@ -12,7 +12,10 @@ use uuid::Uuid;
 
 mod backend;
 mod facts;
+mod insight_rules;
+mod insights;
 mod pages;
+mod reflect;
 mod rows;
 mod sqlite;
 mod store_impl;
@@ -119,6 +122,7 @@ impl PgStore {
                 .await
                 .map_err(db)?;
         let pages = pages::count_by_scope(&mut tx).await?;
+        let insights = insights::count_by_scope(&mut tx).await?;
         tx.commit().await.map_err(db)?;
 
         fn entry<'a>(
@@ -134,6 +138,7 @@ impl PgStore {
                 entities: 0,
                 blocks: 0,
                 pages: 0,
+                insights: 0,
                 last_recorded_at: None,
             }))
         }
@@ -156,6 +161,9 @@ impl PgStore {
         }
         for (scope, count) in pages {
             entry(&mut all, &scope)?.pages = count;
+        }
+        for (scope, count) in insights {
+            entry(&mut all, &scope)?.insights = count;
         }
         Ok(all.into_values().collect())
     }

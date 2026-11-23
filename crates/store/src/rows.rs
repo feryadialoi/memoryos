@@ -3,8 +3,8 @@
 use std::str::FromStr;
 
 use memoryos_core::{
-    ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, Page, PageSectionHit, PageSummary,
-    PageVersion, Result,
+    ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, Insight, Page, PageSectionHit,
+    PageSummary, PageVersion, Result,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{Decode, Postgres, Row, Type};
@@ -30,6 +30,13 @@ pub(crate) const PAGE_VERSION_COLS: &str = "p.id AS page_id, p.scope, p.slug, v.
     v.base_version, v.title, v.summary, v.trust, v.status, v.edited_by, v.edited_at";
 pub(crate) const PAGE_SECTION_HIT_COLS: &str = "s.id AS section_id, s.page_id, p.scope, p.slug, \
     v.title, s.version, s.heading, s.text";
+
+/// Requires the alias `i` for `insights`. Sources come sorted by kind, then id.
+pub(crate) const INSIGHT_COLS: &str = "i.id, i.scope, i.level, i.statement, i.trust, i.status, \
+    i.stale_reason, i.valid_from, i.valid_to, i.superseded_by, i.pending_supersede_of, \
+    i.written_by, i.recorded_at, (SELECT COALESCE(jsonb_agg(jsonb_build_object( \
+        'kind', s.source_kind, 'id', s.source_id) ORDER BY s.source_kind, s.source_id), \
+        '[]'::jsonb) FROM insight_sources s WHERE s.insight_id = i.id) AS sources";
 
 /// SPEC section 4 visibility for `facts f`, with `$t` the valid time and `$k` the knowledge time.
 /// Both parameters are nullable and default to the transaction's `now()`.
@@ -201,5 +208,32 @@ pub(crate) fn page_section_hit(row: &PgRow) -> Result<PageSectionHit> {
         heading: get(row, "heading")?,
         text: get(row, "text")?,
         score: get(row, "score")?,
+    })
+}
+
+fn from_json<T: serde::de::DeserializeOwned>(value: serde_json::Value, column: &str) -> Result<T> {
+    serde_json::from_value(value)
+        .map_err(|e| Error::Storage(format!("column {column} holds invalid JSON: {e}")))
+}
+
+pub(crate) fn insight(row: &PgRow) -> Result<Insight> {
+    let reason: Option<serde_json::Value> = get(row, "stale_reason")?;
+    Ok(Insight {
+        id: get(row, "id")?,
+        scope: parsed(row, "scope")?,
+        level: parsed(row, "level")?,
+        statement: get(row, "statement")?,
+        trust: parsed(row, "trust")?,
+        status: parsed(row, "status")?,
+        stale_reason: reason
+            .map(|value| from_json(value, "stale_reason"))
+            .transpose()?,
+        sources: from_json(get(row, "sources")?, "sources")?,
+        valid_from: get(row, "valid_from")?,
+        valid_to: get(row, "valid_to")?,
+        superseded_by: get(row, "superseded_by")?,
+        pending_supersede_of: get(row, "pending_supersede_of")?,
+        written_by: get(row, "written_by")?,
+        recorded_at: get(row, "recorded_at")?,
     })
 }

@@ -270,6 +270,9 @@ pub struct ScopeSummary {
     /// Pages with a current version.
     #[serde(default)]
     pub pages: i64,
+    /// Active insights.
+    #[serde(default)]
+    pub insights: i64,
     pub last_recorded_at: Option<DateTime<Utc>>,
 }
 
@@ -537,6 +540,266 @@ pub struct PurgeReport {
     pub entities_deleted: u64,
     #[serde(default)]
     pub pages_deleted: u64,
+    #[serde(default)]
+    pub insights_deleted: u64,
+}
+
+/// Longest insight statement, fewest and most sources, and the reflect batch limits. See
+/// docs/SPEC.md section 8, Insights.
+pub const INSIGHT_STATEMENT_MAX: usize = 1_000;
+pub const INSIGHT_SOURCES_MIN: usize = 2;
+pub const INSIGHT_SOURCES_MAX: usize = 50;
+/// Items in one reflect batch: the default and the most a caller may ask for.
+pub const REFLECT_BATCH_DEFAULT: i64 = 5;
+pub const REFLECT_BATCH_MAX: i64 = 20;
+/// Fewest uncited facts on one subject before it is offered as a topic, unless configured.
+pub const REFLECT_MIN_FACTS_DEFAULT: i64 = 3;
+/// Facts shown per topic, newest first.
+pub const REFLECT_TOPIC_FACTS_MAX: usize = 30;
+
+/// How far an insight is from its evidence. Ordered lowest to highest: an insight may cite only
+/// facts and insights of a lower level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InsightLevel {
+    /// Who or what this is: "Ada is a backend engineer on distributed systems".
+    Context,
+    /// What it means: "Ada values operational simplicity over clever abstractions".
+    Understanding,
+    /// What to do about it: "Before proposing an abstraction, cover failure modes first".
+    Guidance,
+}
+
+impl InsightLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Context => "context",
+            Self::Understanding => "understanding",
+            Self::Guidance => "guidance",
+        }
+    }
+
+    /// Whether an insight of this level may cite an insight of `source`'s level. Facts can be
+    /// cited by every level.
+    pub fn may_cite(self, source: InsightLevel) -> bool {
+        source < self
+    }
+}
+
+impl FromStr for InsightLevel {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "context" => Ok(Self::Context),
+            "understanding" => Ok(Self::Understanding),
+            "guidance" => Ok(Self::Guidance),
+            _ => Err(Error::InvalidInput(format!("invalid insight level: {s}"))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InsightStatus {
+    /// Current: hooks print it and recall returns it.
+    Active,
+    /// A source changed. Waits in the reflect batch until confirmed, superseded or retired.
+    Stale,
+    /// Waiting for an admin.
+    Quarantined,
+    Rejected,
+    /// Withdrawn as no longer true.
+    Retired,
+    /// Replaced by a later insight, named in `superseded_by`.
+    Superseded,
+}
+
+impl InsightStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Stale => "stale",
+            Self::Quarantined => "quarantined",
+            Self::Rejected => "rejected",
+            Self::Retired => "retired",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+impl FromStr for InsightStatus {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "active" => Ok(Self::Active),
+            "stale" => Ok(Self::Stale),
+            "quarantined" => Ok(Self::Quarantined),
+            "rejected" => Ok(Self::Rejected),
+            "retired" => Ok(Self::Retired),
+            "superseded" => Ok(Self::Superseded),
+            _ => Err(Error::InvalidInput(format!("invalid insight status: {s}"))),
+        }
+    }
+}
+
+/// SPEC section 8, Insights: an insight is quarantined when any of its sources would quarantine a
+/// fact, and guidance outside an agent's own scope always waits for review, because it changes
+/// how agents act. `trust` is the insight's trust, the lowest of the writer's and every source's.
+pub fn insight_requires_quarantine(scope: &Scope, level: InsightLevel, trust: Trust) -> bool {
+    source_requires_quarantine(scope, trust)
+        || (level == InsightLevel::Guidance && !matches!(scope, Scope::Agent(_)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InsightSourceKind {
+    Fact,
+    Insight,
+}
+
+impl InsightSourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fact => "fact",
+            Self::Insight => "insight",
+        }
+    }
+}
+
+impl FromStr for InsightSourceKind {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "fact" => Ok(Self::Fact),
+            "insight" => Ok(Self::Insight),
+            _ => Err(Error::InvalidInput(format!(
+                "invalid insight source kind: {s}"
+            ))),
+        }
+    }
+}
+
+/// One piece of evidence an insight cites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct InsightSourceRef {
+    pub kind: InsightSourceKind,
+    pub id: Uuid,
+}
+
+/// What happened to a source that made its insight stale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "change", rename_all = "snake_case")]
+pub enum SourceChange {
+    /// A fact was closed by a later fact, `by`.
+    Superseded {
+        by: Uuid,
+    },
+    Invalidated,
+    Expired,
+    /// The fact was deleted with its last source episode.
+    Purged,
+    /// A cited insight went stale, was retired or was superseded.
+    InsightChanged {
+        status: InsightStatus,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleSource {
+    #[serde(flatten)]
+    pub source: InsightSourceRef,
+    #[serde(flatten)]
+    pub change: SourceChange,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Insight {
+    pub id: Uuid,
+    pub scope: Scope,
+    pub level: InsightLevel,
+    pub statement: String,
+    pub trust: Trust,
+    pub status: InsightStatus,
+    /// Set while `status` is `Stale`: which sources changed and how.
+    pub stale_reason: Option<Vec<StaleSource>>,
+    pub sources: Vec<InsightSourceRef>,
+    pub valid_from: DateTime<Utc>,
+    /// Set when retired or superseded.
+    pub valid_to: Option<DateTime<Utc>>,
+    pub superseded_by: Option<Uuid>,
+    /// Set on a quarantined insight: the insight approval will close.
+    pub pending_supersede_of: Option<Uuid>,
+    pub written_by: String,
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// A source as `insight_read` shows it: the evidence itself and whether it is still current.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InsightSourceView {
+    #[serde(flatten)]
+    pub source: InsightSourceRef,
+    /// The fact's or insight's statement. `None` when the source was purged.
+    pub statement: Option<String>,
+    /// Active and, for a fact, valid now.
+    pub current: bool,
+}
+
+/// An insight with its evidence and the insights it replaced, newest first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InsightDetail {
+    #[serde(flatten)]
+    pub insight: Insight,
+    pub source_views: Vec<InsightSourceView>,
+    pub history: Vec<Insight>,
+}
+
+/// An insight write. The store checks the sources and decides trust and status atomically, see
+/// `MemoryStore::put_insight`.
+#[derive(Debug, Clone)]
+pub struct NewInsight {
+    pub scope: Scope,
+    pub level: InsightLevel,
+    pub statement: String,
+    pub embedding: Vec<f32>,
+    /// The writer's trust, before the sources lower it.
+    pub trust: Trust,
+    pub sources: Vec<InsightSourceRef>,
+    /// An active or stale insight of the same scope that this one replaces.
+    pub supersedes: Option<Uuid>,
+    pub written_by: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InsightFilter {
+    pub level: Option<InsightLevel>,
+    pub status: Option<InsightStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoredInsight {
+    pub insight: Insight,
+    pub score: f64,
+}
+
+/// Uncited current facts sharing one subject, offered for synthesis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReflectTopic {
+    /// The subject entity's id.
+    pub topic_key: Uuid,
+    pub subject: String,
+    /// At most `REFLECT_TOPIC_FACTS_MAX`, newest first.
+    pub facts: Vec<Fact>,
+    /// Hex SHA-256 of the sorted ids of `facts`, passed back by a decline.
+    pub fact_set: String,
+    /// Active insights already citing facts of this subject, to extend rather than duplicate.
+    pub insights: Vec<Insight>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReflectBatch {
+    /// Stale insights with their current evidence, oldest first.
+    pub stale: Vec<InsightDetail>,
+    pub topics: Vec<ReflectTopic>,
 }
 
 #[cfg(test)]
@@ -611,6 +874,98 @@ mod tests {
             );
         }
         assert!("pending".parse::<PageVersionStatus>().is_err());
+    }
+
+    #[test]
+    fn an_insight_cites_only_lower_levels() {
+        use InsightLevel::*;
+        assert!(!Context.may_cite(Context));
+        assert!(Understanding.may_cite(Context));
+        assert!(!Understanding.may_cite(Understanding));
+        assert!(Guidance.may_cite(Context));
+        assert!(Guidance.may_cite(Understanding));
+        assert!(!Guidance.may_cite(Guidance));
+        assert!(!Context.may_cite(Guidance));
+    }
+
+    #[test]
+    fn insight_quarantine_follows_facts_and_holds_guidance_outside_agent_scopes() {
+        use InsightLevel::*;
+        let agent = Scope::agent("a");
+        for level in [Context, Understanding, Guidance] {
+            assert!(
+                !insight_requires_quarantine(&agent, level, Trust::Agent),
+                "{level:?}"
+            );
+            assert!(
+                insight_requires_quarantine(&agent, level, Trust::External),
+                "{level:?}"
+            );
+        }
+        for scope in [Scope::user("u"), Scope::shared("s")] {
+            assert!(insight_requires_quarantine(&scope, Context, Trust::Agent));
+            assert!(!insight_requires_quarantine(
+                &scope,
+                Understanding,
+                Trust::User
+            ));
+            assert!(insight_requires_quarantine(&scope, Guidance, Trust::User));
+            assert!(insight_requires_quarantine(&scope, Guidance, Trust::System));
+        }
+    }
+
+    #[test]
+    fn insight_enums_round_trip() {
+        for level in [
+            InsightLevel::Context,
+            InsightLevel::Understanding,
+            InsightLevel::Guidance,
+        ] {
+            assert_eq!(
+                level.as_str().parse::<InsightLevel>().expect("level"),
+                level
+            );
+        }
+        for status in [
+            InsightStatus::Active,
+            InsightStatus::Stale,
+            InsightStatus::Quarantined,
+            InsightStatus::Rejected,
+            InsightStatus::Retired,
+            InsightStatus::Superseded,
+        ] {
+            assert_eq!(
+                status.as_str().parse::<InsightStatus>().expect("status"),
+                status
+            );
+        }
+        for kind in [InsightSourceKind::Fact, InsightSourceKind::Insight] {
+            assert_eq!(
+                kind.as_str().parse::<InsightSourceKind>().expect("kind"),
+                kind
+            );
+        }
+        assert!("knowledge".parse::<InsightLevel>().is_err());
+        assert!("pending".parse::<InsightStatus>().is_err());
+    }
+
+    #[test]
+    fn a_stale_reason_serializes_flat() {
+        let id = Uuid::nil();
+        let reason = StaleSource {
+            source: InsightSourceRef {
+                kind: InsightSourceKind::Fact,
+                id,
+            },
+            change: SourceChange::Superseded { by: id },
+        };
+        let value = serde_json::to_value(&reason).expect("json");
+        assert_eq!(
+            value,
+            serde_json::json!({"kind": "fact", "id": id, "change": "superseded", "by": id})
+        );
+        let back: StaleSource = serde_json::from_value(value).expect("parse");
+        assert_eq!(back, reason);
     }
 
     #[test]

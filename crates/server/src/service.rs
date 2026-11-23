@@ -6,11 +6,15 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use memoryos_core::{
-    Block, BlockVersion, Entity, Episode, Error, Fact, FactFilter, FactListState, FactView,
-    GraphNeighborhood, MemoryStore, Page, PageSummary, PageVersion, PendingPageVersion,
-    PurgeReport, Scope, ScopeSummary, ScoredFact, Trust,
+    Block, BlockVersion, Embedder, Entity, Episode, Error, Fact, FactFilter, FactListState,
+    FactView, GraphNeighborhood, Insight, InsightDetail, InsightFilter, InsightLevel,
+    InsightSourceRef, MemoryStore, NewInsight, Page, PageSummary, PageVersion, PendingPageVersion,
+    PurgeReport, ReflectBatch, Scope, ScopeSummary, ScoredFact, Trust, INSIGHT_STATEMENT_MAX,
+    REFLECT_BATCH_DEFAULT, REFLECT_BATCH_MAX,
 };
-use memoryos_ingest::{CommitRequest, CommitResponse, HostCommitter, PageWrite, PageWriter};
+use memoryos_ingest::{
+    redact, CommitRequest, CommitResponse, HostCommitter, PageWrite, PageWriter,
+};
 use memoryos_retrieve::{RecallRequest, RecallResponse, Retriever};
 use memoryos_store::Store;
 use serde::{Deserialize, Serialize};
@@ -30,6 +34,10 @@ const MAX_FACT_PAGE: i64 = 500;
 const DEFAULT_PAGE_LIST: i64 = 100;
 const MAX_PAGE_LIST: i64 = 500;
 const MAX_SCOPE_SUMMARIES: usize = 500;
+const DEFAULT_INSIGHT_LIST: i64 = 100;
+const MAX_INSIGHT_LIST: i64 = 500;
+/// Longest retire reason, in characters (docs/openapi.yaml).
+const MAX_RETIRE_REASON: usize = 500;
 const DEFAULT_DEPTH: i32 = 1;
 /// Edges one neighbors request may read. A hub entity would otherwise answer with the store's cap
 /// of 5000, each edge carrying its full statement.
@@ -77,11 +85,52 @@ pub struct PageWriteResponse {
     pub redacted: bool,
 }
 
+/// Body of `POST /v1/insights`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InsightWriteRequest {
+    pub scope: Scope,
+    pub level: InsightLevel,
+    pub statement: String,
+    pub sources: Vec<InsightSourceRef>,
+    #[serde(default)]
+    pub supersedes: Option<Uuid>,
+}
+
+/// The insight written, with whether a secret was masked in its statement first.
+#[derive(Debug, Serialize)]
+pub struct InsightWriteResponse {
+    pub insight: Insight,
+    pub redacted: bool,
+}
+
+/// Body of `POST /v1/reflect/batch`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReflectBatchRequest {
+    pub scope: Scope,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// Body of `POST /v1/reflect/decline`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReflectDeclineRequest {
+    pub scope: Scope,
+    pub topic_key: Uuid,
+    pub fact_set: String,
+}
+
 pub struct Services {
     pub store: Arc<Store>,
     pub retriever: Arc<Retriever>,
     pub committer: HostCommitter,
     pub pages: PageWriter,
+    /// Embeds insight statements with the model facts and pages use.
+    pub embedder: Arc<dyn Embedder>,
+    /// `MEMORYOS_REFLECT_MIN_FACTS`.
+    pub reflect_min_facts: i64,
     pub metrics: Metrics,
 }
 
@@ -566,6 +615,234 @@ impl Services {
             .await?)
     }
 
+    // Insights (SPEC sections 6 and 8, Insights)
+
+    /// The writer's trust of SPEC section 8: `agent`, or `external` for an `external` key, the
+    /// commit trust of section 3. The store lowers it further to the weakest source.
+    fn insight_writer_trust(caller: &Caller) -> Trust {
+        caller.key.max_trust.min(Trust::Agent)
+    }
+
+    /// Masks secrets as commits do, embeds the statement, then lets the store check the sources
+    /// and decide trust and status atomically.
+    pub async fn write_insight(
+        &self,
+        caller: &Caller,
+        req: InsightWriteRequest,
+    ) -> ApiResult<InsightWriteResponse> {
+        caller.require_scope(&req.scope)?;
+        let mut statement = req.statement;
+        let redacted = redact(&mut statement);
+        // Checked after masking, so a refused statement costs no embedder call. The store checks
+        // it again with the sources.
+        validate_statement(&statement)?;
+        let embedding = self.embed_statement(&statement).await?;
+        let insight = self
+            .store
+            .put_insight(
+                &caller.ctx,
+                NewInsight {
+                    scope: req.scope,
+                    level: req.level,
+                    statement,
+                    embedding,
+                    trust: Self::insight_writer_trust(caller),
+                    sources: req.sources,
+                    supersedes: req.supersedes,
+                    written_by: caller.ctx.actor.clone(),
+                },
+            )
+            .await?;
+        Ok(InsightWriteResponse { insight, redacted })
+    }
+
+    async fn embed_statement(&self, statement: &str) -> ApiResult<Vec<f32>> {
+        let mut vectors = self
+            .embedder
+            .embed(&[statement.to_owned()])
+            .await
+            .map_err(|error| match error {
+                Error::Provider(message) => Error::Provider(message),
+                other => Error::Provider(other.to_string()),
+            })?;
+        match (vectors.pop(), vectors.is_empty()) {
+            (Some(vector), true) => Ok(vector),
+            _ => Err(Error::Provider("the embedder did not return one vector".to_owned()).into()),
+        }
+    }
+
+    /// An insight in a scope the key cannot read is 404, as a fact loaded by id is.
+    pub async fn get_insight(&self, caller: &Caller, id: Uuid) -> ApiResult<InsightDetail> {
+        let detail = self.store.get_insight(&caller.ctx, id).await?;
+        caller.require_visible(&detail.insight.scope)?;
+        Ok(detail)
+    }
+
+    pub async fn list_insights(
+        &self,
+        caller: &Caller,
+        scopes: &[Scope],
+        filter: &InsightFilter,
+        limit: Option<i64>,
+    ) -> ApiResult<Vec<Insight>> {
+        caller.require_scopes(scopes)?;
+        let limit = limit.unwrap_or(DEFAULT_INSIGHT_LIST);
+        if !(1..=MAX_INSIGHT_LIST).contains(&limit) {
+            return Err(ApiError::invalid_input(format!(
+                "limit must be in 1..={MAX_INSIGHT_LIST}, got {limit}"
+            )));
+        }
+        Ok(self
+            .store
+            .list_insights(&caller.ctx, scopes, filter, limit)
+            .await?)
+    }
+
+    /// Confirming is a write: the store checks the new sources and recomputes trust from the same
+    /// writer trust as `write_insight`.
+    pub async fn confirm_insight(
+        &self,
+        caller: &Caller,
+        id: Uuid,
+        sources: &[InsightSourceRef],
+    ) -> ApiResult<Insight> {
+        self.get_insight(caller, id).await?;
+        Ok(self
+            .store
+            .confirm_insight(&caller.ctx, id, sources, Self::insight_writer_trust(caller))
+            .await?)
+    }
+
+    /// Retiring withdraws an insight with no review, so it follows fact invalidation: the key must
+    /// reach the insight's trust, and in a user or shared scope it needs user trust. An agent there
+    /// replaces an insight with a superseding write instead, which waits for review.
+    pub async fn retire_insight(
+        &self,
+        caller: &Caller,
+        id: Uuid,
+        reason: &str,
+    ) -> ApiResult<Insight> {
+        if reason.trim().is_empty()
+            || reason.chars().count() > MAX_RETIRE_REASON
+            || reason.contains('\0')
+        {
+            return Err(ApiError::invalid_input(format!(
+                "reason must be 1 to {MAX_RETIRE_REASON} characters, with no NUL"
+            )));
+        }
+        let detail = self.get_insight(caller, id).await?;
+        require_trust(caller, "insight", detail.insight.trust)?;
+        if caller.key.max_trust < Trust::User && !matches!(detail.insight.scope, Scope::Agent(_)) {
+            return Err(ApiError::forbidden(
+                "retiring an insight in a user or shared scope requires user trust",
+            ));
+        }
+        Ok(self.store.retire_insight(&caller.ctx, id, reason).await?)
+    }
+
+    /// Scopes and patterns follow `GET /v1/quarantine`. The store takes exact scopes only, so a
+    /// pattern stands for the tenant's scopes holding an insight that the pattern covers.
+    pub async fn list_insight_quarantine(
+        &self,
+        caller: &Caller,
+        scopes: &[String],
+        limit: Option<i64>,
+    ) -> ApiResult<Vec<Insight>> {
+        caller.require_admin()?;
+        let selection = caller.select_scopes(scopes)?;
+        let limit = limit.unwrap_or(DEFAULT_QUARANTINE_PAGE);
+        if !(1..=MAX_QUARANTINE_PAGE).contains(&limit) {
+            return Err(ApiError::invalid_input(format!(
+                "limit must be in 1..={MAX_QUARANTINE_PAGE}, got {limit}"
+            )));
+        }
+        let mut exact = selection.exact;
+        if !selection.prefixes.is_empty() {
+            // Scope summaries list every scope holding an insight, in any status.
+            for summary in self.store.scope_summaries(&caller.ctx).await? {
+                let name = summary.scope.to_string();
+                let covered = selection
+                    .prefixes
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix.as_str()));
+                if covered && !exact.contains(&summary.scope) {
+                    exact.push(summary.scope);
+                }
+            }
+        }
+        // `select_scopes` already narrowed the list. This holds even if that logic is ever wrong.
+        exact.retain(|scope| caller.may_read(scope));
+        if exact.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut insights = self
+            .store
+            .list_quarantined_insights(&caller.ctx, &exact, limit)
+            .await?;
+        insights.retain(|insight| caller.may_read(&insight.scope));
+        Ok(insights)
+    }
+
+    /// As for facts: approving closes the insight it supersedes, so the key must reach that
+    /// insight's trust too.
+    pub async fn approve_insight(&self, caller: &Caller, id: Uuid) -> ApiResult<Insight> {
+        caller.require_admin()?;
+        let detail = self.get_insight(caller, id).await?;
+        require_trust(caller, "insight", detail.insight.trust)?;
+        if let Some(target) = detail.insight.pending_supersede_of {
+            let target = self.store.get_insight(&caller.ctx, target).await?;
+            require_trust(caller, "superseded insight", target.insight.trust)?;
+        }
+        Ok(self.store.approve_insight(&caller.ctx, id).await?)
+    }
+
+    pub async fn reject_insight(&self, caller: &Caller, id: Uuid) -> ApiResult<Insight> {
+        caller.require_admin()?;
+        let detail = self.get_insight(caller, id).await?;
+        require_trust(caller, "insight", detail.insight.trust)?;
+        Ok(self.store.reject_insight(&caller.ctx, id).await?)
+    }
+
+    pub async fn reflect_batch(
+        &self,
+        caller: &Caller,
+        req: ReflectBatchRequest,
+    ) -> ApiResult<ReflectBatch> {
+        caller.require_scope(&req.scope)?;
+        let limit = req.limit.unwrap_or(REFLECT_BATCH_DEFAULT);
+        if !(1..=REFLECT_BATCH_MAX).contains(&limit) {
+            return Err(ApiError::invalid_input(format!(
+                "limit must be in 1..={REFLECT_BATCH_MAX}, got {limit}"
+            )));
+        }
+        Ok(self
+            .store
+            .reflect_batch(&caller.ctx, &req.scope, limit, self.reflect_min_facts)
+            .await?)
+    }
+
+    pub async fn reflect_decline(
+        &self,
+        caller: &Caller,
+        req: ReflectDeclineRequest,
+    ) -> ApiResult<()> {
+        caller.require_scope(&req.scope)?;
+        let hex = req.fact_set.len() == 64
+            && req
+                .fact_set
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !hex {
+            return Err(ApiError::invalid_input(
+                "fact_set must be 64 lowercase hex characters, as a reflect batch returns it",
+            ));
+        }
+        Ok(self
+            .store
+            .decline_topic(&caller.ctx, &req.scope, req.topic_key, &req.fact_set)
+            .await?)
+    }
+
     // Users
 
     pub async fn delete_user_memory(
@@ -594,6 +871,20 @@ fn require_trust(caller: &Caller, what: &str, trust: Trust) -> ApiResult<()> {
             trust.as_str(),
             caller.key.max_trust.as_str()
         )));
+    }
+    Ok(())
+}
+
+/// SPEC section 8: 1 to `INSIGHT_STATEMENT_MAX` characters after masking. NUL is refused, since
+/// PostgreSQL cannot store it.
+fn validate_statement(statement: &str) -> ApiResult<()> {
+    if statement.trim().is_empty() || statement.chars().count() > INSIGHT_STATEMENT_MAX {
+        return Err(ApiError::invalid_input(format!(
+            "statement must be 1 to {INSIGHT_STATEMENT_MAX} characters"
+        )));
+    }
+    if statement.contains('\0') {
+        return Err(ApiError::invalid_input("statement must not contain NUL"));
     }
     Ok(())
 }

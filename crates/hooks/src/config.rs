@@ -11,6 +11,8 @@ use crate::credentials;
 pub const DEFAULT_URL: &str = "http://localhost:6366";
 const DEFAULT_HOOK_SCOPES: &str = "agent:coding-agent";
 const DEFAULT_STOP_EVERY: u64 = 20;
+/// Stale insights and ready topics in the hook scopes at which `hook stop` asks for a reflect.
+const DEFAULT_REFLECT_BACKLOG: usize = 3;
 
 /// A variable's value. Empty counts as unset.
 pub type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
@@ -168,6 +170,18 @@ pub fn stop_every(env: Env<'_>) -> Result<u64, String> {
     }
 }
 
+/// `MEMORYOS_REFLECT_BACKLOG`: how many stale insights and ready topics make `hook stop` ask for a
+/// reflect instead of the save reminder.
+pub fn reflect_backlog(env: Env<'_>) -> Result<usize, String> {
+    let Some(raw) = env("MEMORYOS_REFLECT_BACKLOG") else {
+        return Ok(DEFAULT_REFLECT_BACKLOG);
+    };
+    match raw.trim().parse() {
+        Ok(backlog) if backlog > 0 => Ok(backlog),
+        _ => Err("MEMORYOS_REFLECT_BACKLOG must be a positive integer".to_owned()),
+    }
+}
+
 pub fn home(env: Env<'_>) -> Result<PathBuf, String> {
     env("HOME")
         .or_else(|| env("USERPROFILE"))
@@ -175,8 +189,8 @@ pub fn home(env: Env<'_>) -> Result<PathBuf, String> {
         .ok_or_else(|| "HOME is not set".to_owned())
 }
 
-/// `memoryos` under `$XDG_STATE_HOME`, or under `~/.local/state`.
-fn state_home(env: Env<'_>) -> Result<PathBuf, String> {
+/// `memoryos` under `$XDG_STATE_HOME`, or under `~/.local/state`. The nightly reflect logs here.
+pub fn state_home(env: Env<'_>) -> Result<PathBuf, String> {
     // The XDG specification says a relative value must be ignored.
     let base = match env("XDG_STATE_HOME").map(PathBuf::from) {
         Some(path) if path.is_absolute() => path,
@@ -208,6 +222,11 @@ pub fn opencode_config_dir(env: Env<'_>) -> Result<PathBuf, String> {
     Ok(config_home(env)?.join("opencode"))
 }
 
+/// Where systemd looks for the user's own units.
+pub fn systemd_user_dir(env: Env<'_>) -> Result<PathBuf, String> {
+    Ok(config_home(env)?.join("systemd").join("user"))
+}
+
 /// Where `memoryos setup` keeps credentials, the Compose file and the database.
 pub fn memoryos_dir(env: Env<'_>) -> Result<PathBuf, String> {
     Ok(config_home(env)?.join("memoryos"))
@@ -223,6 +242,17 @@ mod tests {
                 .iter()
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn reflect_backlog_defaults_to_three_and_must_be_positive() {
+        assert_eq!(reflect_backlog(&with(&[])).expect("default"), 3);
+        let env = with(&[("MEMORYOS_REFLECT_BACKLOG", " 7 ")]);
+        assert_eq!(reflect_backlog(&env).expect("set"), 7);
+        for bad in ["0", "-1", "x"] {
+            let pairs = [("MEMORYOS_REFLECT_BACKLOG", bad)];
+            assert!(reflect_backlog(&with(&pairs)).is_err(), "{bad}");
         }
     }
 

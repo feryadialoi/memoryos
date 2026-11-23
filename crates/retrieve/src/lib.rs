@@ -1,7 +1,8 @@
 //! Hybrid retrieval over facts: vector, text and graph lists merged by reciprocal rank fusion.
-//! Recall also searches sections of current pages, ranked apart from facts.
-//! See docs/SPEC.md sections 2, 7 and 14.
+//! Recall also searches sections of current pages and active insights, each ranked apart from facts.
+//! See docs/SPEC.md sections 2, 7, 8 and 14.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,14 +10,16 @@ use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use memoryos_core::{
     Embedder, Error, Fact, FactFilter, MemoryStore, PageSectionHit, RequestContext, Reranker,
-    Result, Scope, ScoredFact,
+    Result, Scope, ScoredFact, ScoredInsight,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 mod fusion;
+mod insights;
 mod pages;
 
+pub use insights::{DEFAULT_INSIGHT_LIMIT, MAX_INSIGHT_LIMIT};
 pub use pages::{PageHit, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 
 pub const DEFAULT_LIMIT: i64 = 10;
@@ -64,6 +67,9 @@ pub struct RecallRequest {
     /// Most page hits to return, 0 to 10. 0 turns page search off.
     #[serde(default = "default_page_limit")]
     pub page_limit: i64,
+    /// Most insights to return, 0 to 10. 0 turns insight search off.
+    #[serde(default = "default_insight_limit")]
+    pub insight_limit: i64,
 }
 
 fn default_limit() -> i64 {
@@ -74,8 +80,14 @@ fn default_page_limit() -> i64 {
     DEFAULT_PAGE_LIMIT
 }
 
+fn default_insight_limit() -> i64 {
+    DEFAULT_INSIGHT_LIMIT
+}
+
 /// Why recall searched no pages although `page_limit` asked for some.
 pub const PAGES_SKIPPED_TIME_TRAVEL: &str = "time_travel";
+/// Why recall searched no insights although `insight_limit` asked for some.
+pub const INSIGHTS_SKIPPED_TIME_TRAVEL: &str = "time_travel";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RecallResponse {
@@ -84,6 +96,18 @@ pub struct RecallResponse {
     pub pages: Vec<PageHit>,
     /// `time_travel` when `as_of` or `known_at` was set, since pages are searched at the present only.
     pub pages_skipped: Option<&'static str>,
+    /// Active insights with their fused scores, ranked apart from facts and pages.
+    pub insights: Vec<ScoredInsight>,
+    /// `time_travel` when `as_of` or `known_at` was set, since insights are searched at the present
+    /// only.
+    pub insights_skipped: Option<&'static str>,
+}
+
+/// What `ranked` found: facts, and the lists recall returns beside them.
+struct Ranked {
+    facts: Vec<ScoredFact>,
+    pages: Vec<PageHit>,
+    insights: Vec<ScoredInsight>,
 }
 
 pub struct Retriever {
@@ -132,10 +156,12 @@ impl Retriever {
             known_at: req.known_at,
         };
         let page_limit = pages::validate_page_limit(req.page_limit)?;
+        let insight_limit = insights::validate_insight_limit(req.insight_limit)?;
         let time_travel = req.as_of.is_some() || req.known_at.is_some();
         let page_limit = if time_travel { 0 } else { page_limit };
+        let insight_limit = if time_travel { 0 } else { insight_limit };
         let embedding = self.embed_query(&req.query).await;
-        let (facts, pages) = self
+        let ranked = self
             .ranked(
                 ctx,
                 &req.scopes,
@@ -143,13 +169,16 @@ impl Retriever {
                 embedding.as_deref(),
                 limit,
                 page_limit,
+                insight_limit,
                 Purpose::Recall(&filter),
             )
             .await?;
         Ok(RecallResponse {
-            facts,
-            pages,
+            facts: ranked.facts,
+            pages: ranked.pages,
             pages_skipped: time_travel.then_some(PAGES_SKIPPED_TIME_TRAVEL),
+            insights: ranked.insights,
+            insights_skipped: time_travel.then_some(INSIGHTS_SKIPPED_TIME_TRAVEL),
         })
     }
 
@@ -170,10 +199,11 @@ impl Retriever {
             embedding.as_deref(),
             limit,
             0,
+            0,
             Purpose::Candidates,
         )
         .await
-        .map(|(facts, _)| facts)
+        .map(|ranked| ranked.facts)
     }
 
     /// `candidates` for a statement the caller has already embedded, so a commit that embeds its
@@ -194,14 +224,16 @@ impl Retriever {
             Some(embedding),
             limit,
             0,
+            0,
             Purpose::Candidates,
         )
         .await
-        .map(|(facts, _)| facts)
+        .map(|ranked| ranked.facts)
     }
 
-    /// Facts, and with `page_limit` above 0 also page hits. Page searches run alongside the fact
-    /// searches and share the reranker call; a failing page search only logs and returns no pages.
+    /// Facts, and with `page_limit` or `insight_limit` above 0 also page hits or insights. Page and
+    /// insight searches run alongside the fact searches; a failing one only logs and returns an
+    /// empty list. Pages get their own reranker call; insights are fused only and never reranked.
     #[allow(clippy::too_many_arguments)]
     async fn ranked(
         &self,
@@ -211,18 +243,20 @@ impl Retriever {
         embedding: Option<&[f32]>,
         limit: usize,
         page_limit: usize,
+        insight_limit: usize,
         purpose: Purpose<'_>,
-    ) -> Result<(Vec<ScoredFact>, Vec<PageHit>)> {
+    ) -> Result<Ranked> {
         let current = FactFilter::default();
         let filter = match purpose {
             Purpose::Recall(filter) => filter,
             Purpose::Candidates => &current,
         };
-        let (vector, text, (page_vector, page_text)) = tokio::join!(
+        let (vector, text, (page_vector, page_text), (insight_vector, insight_text)) = tokio::join!(
             self.vector_list(ctx, scopes, embedding, filter),
             self.store
                 .search_facts_text(ctx, scopes, query, filter, CANDIDATES_PER_LIST),
             self.page_lists(ctx, scopes, query, embedding, page_limit),
+            self.insight_lists(ctx, scopes, query, embedding, insight_limit),
         );
         // Text search is the fallback for vector search, so nothing is left if it fails too.
         let text = facts_only(text?);
@@ -258,7 +292,12 @@ impl Retriever {
             .take(page_limit)
             .map(|(section, score)| PageHit::new(section, score))
             .collect();
-        Ok((facts, pages))
+        let insights = insights::fuse_insights(&[&insight_vector, &insight_text], insight_limit);
+        Ok(Ranked {
+            facts,
+            pages,
+            insights,
+        })
     }
 
     /// Vector and text section searches for page recall, each logged and empty on failure. Nothing
@@ -274,35 +313,51 @@ impl Retriever {
         if page_limit == 0 {
             return (Vec::new(), Vec::new());
         }
+        let candidates = pages::PAGE_CANDIDATES_PER_LIST;
         let vector = async {
-            let Some(embedding) = embedding else {
-                return Ok(Vec::new());
-            };
-            self.store
-                .search_page_sections_vector(
-                    ctx,
-                    scopes,
-                    embedding,
-                    pages::PAGE_CANDIDATES_PER_LIST,
-                )
-                .await
-        };
-        let text = self.store.search_page_sections_text(
-            ctx,
-            scopes,
-            query,
-            pages::PAGE_CANDIDATES_PER_LIST,
-        );
-        let (vector, text) = tokio::join!(vector, text);
-        let usable = |found: Result<Vec<PageSectionHit>>, list: &'static str| match found {
-            Ok(found) => found,
-            Err(error) => {
-                let kind = fusion::error_kind(&error);
-                tracing::warn!(kind, list, "page search failed, leaving it out");
-                Vec::new()
+            match embedding {
+                Some(embedding) => {
+                    self.store
+                        .search_page_sections_vector(ctx, scopes, embedding, candidates)
+                        .await
+                }
+                None => Ok(Vec::new()),
             }
         };
-        (usable(vector, "vector"), usable(text, "text"))
+        let text = self
+            .store
+            .search_page_sections_text(ctx, scopes, query, candidates);
+        side_lists("page", vector, text).await
+    }
+
+    /// Vector and text insight searches for recall, each logged and empty on failure. Nothing is
+    /// searched when `insight_limit` is 0.
+    async fn insight_lists(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        query: &str,
+        embedding: Option<&[f32]>,
+        insight_limit: usize,
+    ) -> (Vec<ScoredInsight>, Vec<ScoredInsight>) {
+        if insight_limit == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let candidates = insights::INSIGHT_CANDIDATES_PER_LIST;
+        let vector = async {
+            match embedding {
+                Some(embedding) => {
+                    self.store
+                        .search_insights_vector(ctx, scopes, embedding, candidates)
+                        .await
+                }
+                None => Ok(Vec::new()),
+            }
+        };
+        let text = self
+            .store
+            .search_insights_text(ctx, scopes, query, candidates);
+        side_lists("insight", vector, text).await
     }
 
     async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
@@ -501,6 +556,25 @@ impl Rerank {
     }
 }
 
+/// Runs the vector and text searches of a list recall returns beside facts. Either search failing
+/// logs its error kind and leaves that list empty, so facts never fail because of it.
+async fn side_lists<T>(
+    search: &'static str,
+    vector: impl Future<Output = Result<Vec<T>>>,
+    text: impl Future<Output = Result<Vec<T>>>,
+) -> (Vec<T>, Vec<T>) {
+    let (vector, text) = tokio::join!(vector, text);
+    let usable = |found: Result<Vec<T>>, list: &'static str| match found {
+        Ok(found) => found,
+        Err(error) => {
+            let kind = fusion::error_kind(&error);
+            tracing::warn!(kind, search, list, "search failed, leaving it out");
+            Vec::new()
+        }
+    };
+    (usable(vector, "vector"), usable(text, "text"))
+}
+
 fn facts_only(scored: Vec<ScoredFact>) -> Vec<Fact> {
     scored.into_iter().map(|scored| scored.fact).collect()
 }
@@ -598,12 +672,45 @@ mod tests {
             facts: vec![],
             pages: vec![],
             pages_skipped: None,
+            insights: vec![],
+            insights_skipped: Some(INSIGHTS_SKIPPED_TIME_TRAVEL),
         };
         let json = serde_json::to_value(&response).expect("serializes");
         assert_eq!(
             json,
-            serde_json::json!({"facts": [], "pages": [], "pages_skipped": null})
+            serde_json::json!({
+                "facts": [],
+                "pages": [],
+                "pages_skipped": null,
+                "insights": [],
+                "insights_skipped": "time_travel"
+            })
         );
+    }
+
+    #[tokio::test]
+    async fn a_failing_side_search_leaves_only_its_own_list_empty() {
+        let failing = async { Err::<Vec<u32>, _>(Error::Internal("not implemented".into())) };
+        let found = async { Ok(vec![1, 2]) };
+        assert_eq!(
+            side_lists("insight", failing, found).await,
+            (vec![], vec![1, 2])
+        );
+        let found = async { Ok(vec![3]) };
+        let failing = async { Err(Error::Storage("pool timed out".into())) };
+        assert_eq!(
+            side_lists("insight", found, failing).await,
+            (vec![3], vec![])
+        );
+    }
+
+    #[test]
+    fn insight_limit_defaults_to_3_and_parses() {
+        let request = parse(r#"{"scopes":["user:a"],"query":"q"}"#);
+        assert_eq!(request.insight_limit, DEFAULT_INSIGHT_LIMIT);
+        assert_eq!(DEFAULT_INSIGHT_LIMIT, 3);
+        let request = parse(r#"{"scopes":["user:a"],"query":"q","insight_limit":0}"#);
+        assert_eq!(request.insight_limit, 0);
     }
 
     mod rerank {

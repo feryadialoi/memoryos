@@ -31,6 +31,7 @@ change and sources that lie.
 | 🕰️ **Memory over time** | A replaced fact is closed, not deleted, so you can ask what is true now or what was true then |
 | ✍️ **Self-editing agents** | Size-limited, versioned blocks that agents edit through tools, with conflict detection |
 | 📖 **Knowledge pages** | Agents write and read how-to and reference pages, such as runbooks. Pages are split into sections for recall, versioned, and reviewed before an agent's edit reaches a shared scope |
+| 💡 **Insights** | Your agent writes what several facts mean together, from who someone is to how to work with them. Each insight cites its facts and goes stale the moment one of them changes |
 | 🕸️ **Shared knowledge graph** | Every fact is also an edge between entities, shared across agents through scoped access |
 | 🛡️ **Poisoning defense** | Low-trust content is quarantined, and every fact traces back to its source |
 | 🔁 **One-call saving** | A repeated fact is matched on the server and counted as another source, and the response lists `related` facts, so the agent rarely needs a lookup before saving |
@@ -61,6 +62,8 @@ a reboot, the `memoryos mcp` that Claude Code launches starts the server again.
 | Remove it | `memoryos setup --uninstall --global`, add `--delete-data` to delete the database |
 | Read and write knowledge pages | `memoryos page list`, `read`, `write` (markdown from a file or stdin), `edit` (opens your editor, such as `MEMORYOS_EDITOR="code --wait"`), `delete` |
 | Keep knowledge in git | `memoryos page sync docs/knowledge --scope shared:team` writes changed `.md` files, `memoryos page pull` writes MemoryOS edits back. Commit `.memoryos-sync.json` with the pages |
+| See what your agent learned | `memoryos insight list`, `read`, `retire`. See [Insights](#-insights) |
+| Let your agent reflect every night | `memoryos reflect --schedule nightly`, and `--schedule off` to stop |
 | See saves queued during an outage | `memoryos outbox`, and `memoryos outbox --flush` to send them now |
 
 When the server cannot take an agent's `commit_facts` call (it is down, unreachable, or its database
@@ -208,6 +211,43 @@ The page is on your machine only. It never receives an API key: it calls a small
 forwards a fixed list of reads plus approve and reject, and it cannot purge, retract or write facts.
 After upgrading from an older install, update the server with `make docker-upgrade` or `make local-upgrade`.
 
+## 💡 Insights
+
+Facts say what happened. An insight says what several facts mean together. Your agent writes it,
+with its own model, from facts it recalled. MemoryOS never runs a model: it checks each insight,
+keeps it linked to its evidence, and takes it out of use when that evidence changes.
+
+| Level | Answers | Example |
+|---|---|---|
+| `context` | Who or what this is | "Ada is a backend engineer on payment systems." |
+| `understanding` | What it means | "Ada values operational simplicity over clever abstractions." |
+| `guidance` | What to do about it | "Before proposing a new abstraction, cover failure modes." |
+
+- **Evidence.** An insight cites 2 to 50 current facts, or insights of a lower level, all in its own
+  scope. `memoryos insight read` shows them as they are now, and the insights it replaced.
+- **Staleness.** When a cited fact is replaced, retracted, expires or is purged, the insight turns
+  stale in the same write, and so does every insight built on it, up to guidance. A stale insight
+  is never shown to the agent until it confirms it with current facts, rewrites it, or retires it.
+- **Trust.** An insight is never trusted more than its weakest source. Insights in `user:` or
+  `shared:` scopes, guidance included, wait for review as facts do.
+- **Use.** Recall returns the best matching active insights as a separate list (`insight_limit`,
+  default 3). Session start prints guidance first, labelled as learned from memory, which you and
+  `CLAUDE.md` override.
+
+Reflecting is how insights get written, and it runs through your agent:
+
+- The stop hook asks for a reflect instead of the save reminder when there is a backlog: 3 or more
+  stale insights, or subjects with at least 3 facts no insight cites yet
+  (`MEMORYOS_REFLECT_BACKLOG` and `MEMORYOS_REFLECT_MIN_FACTS` change the two numbers).
+- `memoryos reflect --schedule nightly` installs an opt-in job that runs your agent's CLI at 02:00 to
+  work through the backlog, and `--schedule off` removes it. It uses your agent's usage, which is
+  why it is off by default. `memoryos reflect` prints the current batch.
+- `memoryos ui` has an Insights view: insights by level with their sources and history, what changed
+  for the stale ones, and approve or reject for the held ones.
+
+The MCP tools are `reflect_batch`, `insight_write`, `insight_read`, `insight_confirm`,
+`insight_retire` and `reflect_decline`. Design: [`docs/memory-into-knowledge-design.md`](docs/memory-into-knowledge-design.md).
+
 ## 🔍 Example
 
 This uses the Rust SDK. The user says *"I moved to Bandung"* after previously living in Jakarta, and the
@@ -248,6 +288,7 @@ disagree:
 - **Facts:** statements with two timelines, when they were true and when we learned them.
 - **Blocks:** versioned working notes that an agent edits directly.
 - **Pages:** versioned markdown knowledge, such as runbooks, searched by section.
+- **Insights:** what facts mean together, written by the agent, citing those facts.
 
 ## 🛡️ Security
 

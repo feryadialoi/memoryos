@@ -18,6 +18,7 @@ chrono.workspace = true
 pgvector = { version = "=0.4.2", features = ["sqlx"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 # 0.1.10-alpha.4 omits sqlite-vec-diskann.c from its crates.io package and does not build.
 sqlite-vec = "=0.1.9"
 libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }

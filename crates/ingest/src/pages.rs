@@ -410,8 +410,9 @@ mod tests {
     use chrono::Utc;
     use memoryos_core::{
         ApiKey, Block, BlockVersion, Entity, Episode, Fact, FactFilter, FactOp, GraphNeighborhood,
-        NewEntity, NewEpisode, Page, PageSectionHit, PageSummary, PageVersionStatus,
-        PendingPageVersion, PurgeReport, ScoredFact,
+        Insight, InsightDetail, InsightFilter, InsightSourceRef, NewEntity, NewEpisode, NewInsight,
+        Page, PageSectionHit, PageSummary, PageVersionStatus, PendingPageVersion, PurgeReport,
+        ReflectBatch, ScoredFact, ScoredInsight,
     };
     use memoryos_embed::TestEmbedder;
     use uuid::Uuid;
@@ -857,6 +858,83 @@ mod tests {
             unimplemented!()
         }
         async fn ping(&self) -> Result<()> {
+            unimplemented!()
+        }
+        async fn put_insight(&self, _: &RequestContext, _: NewInsight) -> Result<Insight> {
+            unimplemented!()
+        }
+        async fn get_insight(&self, _: &RequestContext, _: Uuid) -> Result<InsightDetail> {
+            unimplemented!()
+        }
+        async fn list_insights(
+            &self,
+            _: &RequestContext,
+            _: &[Scope],
+            _: &InsightFilter,
+            _: i64,
+        ) -> Result<Vec<Insight>> {
+            unimplemented!()
+        }
+        async fn confirm_insight(
+            &self,
+            _: &RequestContext,
+            _: Uuid,
+            _: &[InsightSourceRef],
+            _: Trust,
+        ) -> Result<Insight> {
+            unimplemented!()
+        }
+        async fn retire_insight(&self, _: &RequestContext, _: Uuid, _: &str) -> Result<Insight> {
+            unimplemented!()
+        }
+        async fn list_quarantined_insights(
+            &self,
+            _: &RequestContext,
+            _: &[Scope],
+            _: i64,
+        ) -> Result<Vec<Insight>> {
+            unimplemented!()
+        }
+        async fn approve_insight(&self, _: &RequestContext, _: Uuid) -> Result<Insight> {
+            unimplemented!()
+        }
+        async fn reject_insight(&self, _: &RequestContext, _: Uuid) -> Result<Insight> {
+            unimplemented!()
+        }
+        async fn reflect_batch(
+            &self,
+            _: &RequestContext,
+            _: &Scope,
+            _: i64,
+            _: i64,
+        ) -> Result<ReflectBatch> {
+            unimplemented!()
+        }
+        async fn decline_topic(
+            &self,
+            _: &RequestContext,
+            _: &Scope,
+            _: Uuid,
+            _: &str,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+        async fn search_insights_vector(
+            &self,
+            _: &RequestContext,
+            _: &[Scope],
+            _: &[f32],
+            _: i64,
+        ) -> Result<Vec<ScoredInsight>> {
+            unimplemented!()
+        }
+        async fn search_insights_text(
+            &self,
+            _: &RequestContext,
+            _: &[Scope],
+            _: &str,
+            _: i64,
+        ) -> Result<Vec<ScoredInsight>> {
             unimplemented!()
         }
     }

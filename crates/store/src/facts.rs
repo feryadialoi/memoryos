@@ -499,6 +499,8 @@ fn chain_target(
 pub(crate) struct PurgeOutcome {
     pub(crate) report: PurgeReport,
     pub(crate) facts_requarantined: u64,
+    /// Facts the purge deleted, changed, reopened or relinked, whose citing insights it checks.
+    pub(crate) touched: Vec<Uuid>,
 }
 
 /// `None` when no source remains.
@@ -520,7 +522,7 @@ pub(crate) fn highest_trust(trusts: Vec<String>) -> Result<Option<Trust>> {
 pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<PurgeOutcome> {
     // Lock before deciding: a concurrent corroboration holds these rows until it commits, and the
     // next statement then sees the source it added.
-    sqlx::query(
+    let linked: Vec<Uuid> = sqlx::query_scalar(
         "SELECT f.id FROM facts f JOIN fact_sources s ON s.fact_id = f.id \
          WHERE s.episode_id = $1 ORDER BY f.id FOR UPDATE OF f",
     )
@@ -528,6 +530,8 @@ pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<P
     .fetch_all(&mut *conn)
     .await
     .map_err(db)?;
+    // Read before anything moves: what these facts closed is reopened or relinked below.
+    let touched = crate::insights::chain_neighbours(conn, &linked, Some(id)).await?;
 
     let rows = sqlx::query(
         "SELECT f.id, f.scope, f.status, f.trust, f.valid_from, f.valid_to, f.superseded_by, \
@@ -683,8 +687,10 @@ pub(crate) async fn purge_episode(conn: &mut PgConnection, id: Uuid) -> Result<P
             episodes_deleted,
             entities_deleted,
             pages_deleted: 0,
+            insights_deleted: 0,
         },
         facts_requarantined: requarantined.len() as u64,
+        touched,
     })
 }
 
@@ -948,7 +954,8 @@ async fn delete_orphan_entities(
     Ok(deleted)
 }
 
-/// Hard-deletes a scope's facts, episodes and entities, plus an agent scope's blocks.
+/// Hard-deletes a scope's facts, episodes, entities, pages and insights, plus an agent scope's
+/// blocks.
 pub(crate) async fn purge_scope(conn: &mut PgConnection, scope: &Scope) -> Result<PurgeReport> {
     let scope_text = scope.to_string();
     let mut deleted = [0_u64; 3];
@@ -979,12 +986,14 @@ pub(crate) async fn purge_scope(conn: &mut PgConnection, scope: &Scope) -> Resul
         .await
         .map_err(db)?
         .rows_affected();
+    let insights_deleted = crate::insights::purge_scope(conn, &scope_text).await?;
     let [facts_deleted, episodes_deleted, entities_deleted] = deleted;
     Ok(PurgeReport {
         facts_deleted,
         episodes_deleted,
         entities_deleted,
         pages_deleted,
+        insights_deleted,
     })
 }
 
@@ -995,5 +1004,6 @@ pub(crate) fn purge_detail(report: &PurgeReport) -> Value {
         "episodes_deleted": report.episodes_deleted,
         "entities_deleted": report.entities_deleted,
         "pages_deleted": report.pages_deleted,
+        "insights_deleted": report.insights_deleted,
     })
 }

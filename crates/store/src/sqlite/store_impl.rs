@@ -7,9 +7,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use memoryos_core::{
     normalize_name, ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, FactFilter, FactOp,
-    FactStatus, GraphNeighborhood, MemoryStore, NewEntity, NewEpisode, NewPageVersion, Page,
-    PageSectionHit, PageSummary, PageVersion, PendingPageVersion, PurgeReport, RequestContext,
-    Result, Scope, ScoredFact, Trust,
+    FactStatus, GraphNeighborhood, Insight, InsightDetail, InsightFilter, InsightSourceRef,
+    MemoryStore, NewEntity, NewEpisode, NewInsight, NewPageVersion, Page, PageSectionHit,
+    PageSummary, PageVersion, PendingPageVersion, PurgeReport, RequestContext, Result, Scope,
+    ScoredFact, ScoredInsight, Trust,
 };
 use serde_json::{json, Value};
 use sqlx::sqlite::SqliteRow;
@@ -17,7 +18,9 @@ use sqlx::{AssertSqlSafe, Row, SqliteConnection};
 use uuid::Uuid;
 
 use super::rows::{self, API_KEY_COLS, BLOCK_COLS, ENTITY_COLS, EPISODE_COLS, FACT_COLS};
-use super::{db, embedding, facts, json_array, pages, storable, uuid_strings, SqliteStore};
+use super::{
+    db, embedding, facts, insights, json_array, pages, storable, uuid_strings, SqliteStore,
+};
 
 const MAX_GRAPH_EDGES: i64 = 5000;
 const MAX_SUBJECT_FACTS: i64 = 200;
@@ -199,6 +202,7 @@ impl MemoryStore for SqliteStore {
             .map_err(db)?
             .ok_or_else(|| Error::NotFound(format!("episode {id}")))?;
         let outcome = facts::purge_episode(&mut tx, ctx, id).await?;
+        insights::facts_changed(&mut tx, ctx, &outcome.touched, now).await?;
         let mut detail = facts::purge_detail(&outcome.report);
         detail["facts_requarantined"] = json!(outcome.facts_requarantined);
         facts::audit(&mut tx, ctx, "episode.purge", Some(id), detail, now).await?;
@@ -255,6 +259,8 @@ impl MemoryStore for SqliteStore {
             trust,
         };
         let inserted = facts::apply_ops(&mut tx, ctx, &episode, &ops, now).await?;
+        let named = crate::insight_rules::op_fact_ids(&ops);
+        insights::after_apply(&mut tx, ctx, &named, &inserted, now).await?;
         sqlx::query("UPDATE episodes SET processed_at = ?3 WHERE tenant = ?1 AND id = ?2")
             .bind(&ctx.tenant)
             .bind(episode_id.to_string())
@@ -551,7 +557,10 @@ impl MemoryStore for SqliteStore {
         if updated.rows_affected() == 0 {
             return Err(Error::NotFound(format!("fact {id}")));
         }
+        // What it closed is relinked around it, so it is read first.
+        let touched = insights::chain_neighbours(&mut tx, ctx, &[id], None).await?;
         facts::leave_chain_on_retraction(&mut tx, ctx, id).await?;
+        insights::facts_changed(&mut tx, ctx, &touched, now).await?;
         facts::audit(
             &mut tx,
             ctx,
@@ -798,6 +807,10 @@ impl MemoryStore for SqliteStore {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
+        let named: Vec<Uuid> = std::iter::once(id)
+            .chain(state.pending_supersede_of)
+            .collect();
+        insights::after_apply(&mut tx, ctx, &named, &[], now).await?;
         facts::audit(
             &mut tx,
             ctx,
@@ -1215,6 +1228,80 @@ impl MemoryStore for SqliteStore {
         pages::search_page_sections_text(self, ctx, scopes, query, limit).await
     }
 
+    async fn put_insight(&self, ctx: &RequestContext, insight: NewInsight) -> Result<Insight> {
+        insights::put_insight(self, ctx, insight).await
+    }
+
+    async fn get_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<InsightDetail> {
+        insights::get_insight(self, ctx, id).await
+    }
+
+    async fn list_insights(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        filter: &InsightFilter,
+        limit: i64,
+    ) -> Result<Vec<Insight>> {
+        insights::list_insights(self, ctx, scopes, filter, limit).await
+    }
+
+    async fn confirm_insight(
+        &self,
+        ctx: &RequestContext,
+        id: Uuid,
+        sources: &[InsightSourceRef],
+        trust: Trust,
+    ) -> Result<Insight> {
+        insights::confirm_insight(self, ctx, id, sources, trust).await
+    }
+
+    async fn retire_insight(
+        &self,
+        ctx: &RequestContext,
+        id: Uuid,
+        reason: &str,
+    ) -> Result<Insight> {
+        insights::retire_insight(self, ctx, id, reason).await
+    }
+
+    async fn list_quarantined_insights(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        limit: i64,
+    ) -> Result<Vec<Insight>> {
+        insights::list_quarantined_insights(self, ctx, scopes, limit).await
+    }
+
+    async fn approve_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<Insight> {
+        insights::approve_insight(self, ctx, id).await
+    }
+
+    async fn reject_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<Insight> {
+        insights::reject_insight(self, ctx, id).await
+    }
+
+    async fn search_insights_vector(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<ScoredInsight>> {
+        insights::search_insights_vector(self, ctx, scopes, embedding, limit).await
+    }
+
+    async fn search_insights_text(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<ScoredInsight>> {
+        insights::search_insights_text(self, ctx, scopes, query, limit).await
+    }
+
     async fn find_api_key(&self, key_hash: &str) -> Result<Option<ApiKey>> {
         let sql = format!(
             "SELECT {API_KEY_COLS} FROM api_keys WHERE key_hash = ?1 AND revoked_at IS NULL"
@@ -1292,6 +1379,26 @@ impl MemoryStore for SqliteStore {
             .map_err(db)?;
         tx.commit().await.map_err(db)?;
         Ok(())
+    }
+
+    async fn reflect_batch(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        limit: i64,
+        min_facts: i64,
+    ) -> Result<memoryos_core::ReflectBatch> {
+        super::reflect::reflect_batch(self, ctx, scope, limit, min_facts).await
+    }
+
+    async fn decline_topic(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        topic_key: Uuid,
+        fact_set: &str,
+    ) -> Result<()> {
+        super::reflect::decline_topic(self, ctx, scope, topic_key, fact_set).await
     }
 }
 

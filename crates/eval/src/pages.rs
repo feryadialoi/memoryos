@@ -710,6 +710,8 @@ mod tests {
             facts,
             pages: (0..pages).map(|_| hit("p", "P", 1, "")).collect(),
             pages_skipped: None,
+            insights: Vec::new(),
+            insights_skipped: None,
         }
     }
 

@@ -42,6 +42,9 @@ const SCOPED_TOOLS: &[(&str, &str, Takes)] = &[
     ("page_read", "scope", Takes::First),
     ("page_write", "scope", Takes::First),
     ("page_list", "scope", Takes::First),
+    ("reflect_batch", "scope", Takes::First),
+    ("insight_write", "scope", Takes::First),
+    ("reflect_decline", "scope", Takes::First),
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -551,6 +554,15 @@ mod tests {
             ),
             ("page_list", json!({})),
             ("page_list", json!({"scope": null, "prefix": "d"})),
+            ("reflect_batch", json!({})),
+            (
+                "insight_write",
+                json!({"level": "context", "statement": "s", "sources": []}),
+            ),
+            (
+                "reflect_decline",
+                json!({"topic_key": "k", "fact_set": "f"}),
+            ),
         ] {
             let mut message = call(name, arguments.clone());
             assert!(fill_scopes(&mut message, &defaults()), "{name}");

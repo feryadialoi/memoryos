@@ -4,6 +4,10 @@
 #[path = "pages_shared/mod.rs"]
 mod pages_shared;
 
+#[macro_use]
+#[path = "insights_shared/mod.rs"]
+mod insights_shared;
+
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -243,6 +247,12 @@ mod pages {
     use super::sqlite;
 
     page_scenarios!(sqlite);
+}
+
+mod insights {
+    use super::sqlite;
+
+    insight_scenarios!(sqlite);
 }
 
 #[tokio::test(flavor = "multi_thread")]

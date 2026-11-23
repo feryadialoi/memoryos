@@ -2,7 +2,10 @@
 //! depends on nothing server-side.
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use memoryos_core::{FactStatus, PageVersion, Scope, ScoredFact};
+use memoryos_core::{
+    FactStatus, Insight, InsightLevel, InsightSourceRef, PageVersion, Scope, ScoredFact,
+    ScoredInsight,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -174,6 +177,58 @@ pub struct RecallResponse {
     /// only.
     #[serde(default)]
     pub pages_skipped: Option<String>,
+    /// Active insights with their fused scores, ranked apart from facts and pages. Empty when
+    /// absent, as from an older server.
+    #[serde(default)]
+    pub insights: Vec<ScoredInsight>,
+    /// `time_travel` when `as_of` or `known_at` was set, since insights are searched at the
+    /// present only.
+    #[serde(default)]
+    pub insights_skipped: Option<String>,
+}
+
+/// Input to `MemoryOs::write_insight`.
+#[derive(Debug, Clone, Serialize)]
+pub struct InsightWrite {
+    pub scope: Scope,
+    pub level: InsightLevel,
+    pub statement: String,
+    /// 2 to 50 current facts, or active insights of a lower level, of `scope`.
+    pub sources: Vec<InsightSourceRef>,
+    /// An active or stale insight of `scope` that this one replaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<Uuid>,
+}
+
+impl InsightWrite {
+    pub fn new(
+        scope: Scope,
+        level: InsightLevel,
+        statement: impl Into<String>,
+        sources: Vec<InsightSourceRef>,
+    ) -> Self {
+        Self {
+            scope,
+            level,
+            statement: statement.into(),
+            sources,
+            supersedes: None,
+        }
+    }
+
+    pub fn supersedes(mut self, insight_id: Uuid) -> Self {
+        self.supersedes = Some(insight_id);
+        self
+    }
+}
+
+/// The insight an insight write stored, with its trust and status.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InsightWriteResponse {
+    pub insight: Insight,
+    /// The server masked a secret in the statement.
+    #[serde(default)]
+    pub redacted: bool,
 }
 
 /// A page section that matched a recall query.
@@ -404,6 +459,66 @@ mod tests {
         )
         .expect("skipped");
         assert_eq!(skipped.pages_skipped.as_deref(), Some("time_travel"));
+    }
+
+    #[test]
+    fn recall_response_parses_with_and_without_insights() {
+        let old: RecallResponse = serde_json::from_value(json!({"facts": []})).expect("old shape");
+        assert!(old.insights.is_empty() && old.insights_skipped.is_none());
+
+        let id = Uuid::now_v7();
+        let source = Uuid::now_v7();
+        let new: RecallResponse = serde_json::from_value(json!({
+            "facts": [],
+            "insights": [{
+                "insight": {
+                    "id": id,
+                    "scope": "agent:a",
+                    "level": "understanding",
+                    "statement": "Ada prefers simple systems",
+                    "trust": "agent",
+                    "status": "active",
+                    "stale_reason": null,
+                    "sources": [{"kind": "fact", "id": source}],
+                    "valid_from": "2026-01-01T00:00:00Z",
+                    "valid_to": null,
+                    "superseded_by": null,
+                    "pending_supersede_of": null,
+                    "written_by": "key:x",
+                    "recorded_at": "2026-01-01T00:00:00Z",
+                },
+                "score": 0.03,
+            }],
+            "insights_skipped": null,
+        }))
+        .expect("new shape");
+        assert_eq!(new.insights[0].insight.id, id);
+        assert_eq!(new.insights[0].insight.level, InsightLevel::Understanding);
+        assert_eq!(new.insights[0].insight.sources[0].id, source);
+        let skipped: RecallResponse = serde_json::from_value(
+            json!({"facts": [], "insights": [], "insights_skipped": "time_travel"}),
+        )
+        .expect("skipped");
+        assert_eq!(skipped.insights_skipped.as_deref(), Some("time_travel"));
+    }
+
+    #[test]
+    fn insight_write_sends_supersedes_only_when_set() {
+        let id = Uuid::nil();
+        let sources = vec![
+            InsightSourceRef {
+                kind: memoryos_core::InsightSourceKind::Fact,
+                id,
+            };
+            2
+        ];
+        let write = InsightWrite::new(Scope::agent("a"), InsightLevel::Context, "s", sources);
+        let value = serde_json::to_value(&write).expect("serializes");
+        assert_eq!(value["level"], "context");
+        assert_eq!(value["sources"][0]["kind"], "fact");
+        assert!(value.get("supersedes").is_none());
+        let value = serde_json::to_value(write.supersedes(id)).expect("serializes");
+        assert_eq!(value["supersedes"], id.to_string());
     }
 
     #[test]

@@ -18,24 +18,30 @@ const SOURCE_BOOST_MAX_EXTRA: usize = 3;
 /// A fact counts once per list, at its best rank. Equal scores order by fact id, so the same
 /// inputs always give the same order.
 pub(crate) fn fuse<'a>(lists: &[&'a [Fact]]) -> Vec<(&'a Fact, f64)> {
-    let mut scored: HashMap<Uuid, (&'a Fact, f64)> = HashMap::new();
+    fuse_by(lists, |fact| fact.id)
+}
+
+/// [`fuse`] for any hit with an id: facts, page sections and insights rank the same way. A hit
+/// counts once per list, at its best rank, and equal scores order by `id`.
+pub(crate) fn fuse_by<'a, T>(lists: &[&'a [T]], id: impl Fn(&T) -> Uuid) -> Vec<(&'a T, f64)> {
+    let mut scored: HashMap<Uuid, (&'a T, f64)> = HashMap::new();
     for list in lists {
         let mut seen = HashSet::new();
-        let unique = list.iter().filter(|fact| seen.insert(fact.id));
-        for (index, fact) in unique.enumerate() {
+        let unique = list.iter().filter(|hit| seen.insert(id(hit)));
+        for (index, hit) in unique.enumerate() {
             let contribution = 1.0 / (RRF_K + (index + 1) as f64);
-            scored.entry(fact.id).or_insert((fact, 0.0)).1 += contribution;
+            scored.entry(id(hit)).or_insert((hit, 0.0)).1 += contribution;
         }
     }
     let mut fused: Vec<_> = scored.into_values().collect();
-    sort_by_score(&mut fused);
+    sort_by_score(&mut fused, id);
     fused
 }
 
-/// Highest score first, equal scores by fact id.
-fn sort_by_score(ranked: &mut [(&Fact, f64)]) {
+/// Highest score first, equal scores by `id`.
+fn sort_by_score<T>(ranked: &mut [(&T, f64)], id: impl Fn(&T) -> Uuid) {
     ranked.sort_unstable_by(|(a, a_score), (b, b_score)| {
-        b_score.total_cmp(a_score).then_with(|| a.id.cmp(&b.id))
+        b_score.total_cmp(a_score).then_with(|| id(a).cmp(&id(b)))
     });
 }
 
@@ -51,7 +57,7 @@ pub(crate) fn boost_by_sources(fused: Vec<(&Fact, f64)>) -> Vec<(&Fact, f64)> {
         .into_iter()
         .map(|(fact, score)| (fact, score * source_boost(fact)))
         .collect();
-    sort_by_score(&mut boosted);
+    sort_by_score(&mut boosted, |fact| fact.id);
     boosted
 }
 
@@ -164,6 +170,17 @@ pub(crate) fn interleave(lists: Vec<Vec<Fact>>, cap: usize) -> Vec<Fact> {
         }
     }
     merged
+}
+
+/// Checks the limit of a list recall returns beside facts, such as `page_limit`, and returns it as
+/// a count. 0 turns that list off.
+pub(crate) fn validate_side_limit(field: &str, value: i64, max: i64) -> Result<usize> {
+    if !(0..=max).contains(&value) {
+        return Err(Error::InvalidInput(format!(
+            "{field} must be in 0..={max}, got {value}"
+        )));
+    }
+    Ok(value as usize)
 }
 
 pub(crate) fn error_kind(error: &Error) -> &'static str {

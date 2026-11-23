@@ -284,6 +284,7 @@ async fn the_page_serves_itself_locked_down() {
         "app.js",
         "markdown.js",
         "vendor/mermaid.min.js",
+        "vendor/d3-force.min.js",
         "style.css",
     ] {
         let response = page
@@ -595,5 +596,142 @@ async fn pages_are_read_and_reviewed_through_the_page_and_never_written() {
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let body: Value = response.json().await.expect("json");
     assert_eq!(body["error"]["code"], "version_conflict");
+    server.stop().await.expect("stop");
+}
+
+async fn write_insight(server: &Server, key: &Key, body: Value) -> Value {
+    let (status, value) = server
+        .call("POST", "/v1/insights", Some(key), Some(body))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    value["insight"].clone()
+}
+
+/// Commits facts and returns them as insight sources, approving any that wait for review.
+async fn current_sources(server: &Server, key: &Key, scope: &str, facts: Value) -> Vec<Value> {
+    let committed = commit(server, key, scope, facts).await;
+    let mut sources = Vec::new();
+    for fact in committed["facts"].as_array().expect("facts") {
+        let id = fact["id"].as_str().expect("id");
+        if fact["status"] == "quarantined" {
+            let (status, body) = server
+                .call(
+                    "POST",
+                    &format!("/v1/quarantine/{id}/approve"),
+                    Some(key),
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        sources.push(json!({"kind": "fact", "id": id}));
+    }
+    sources
+}
+
+#[tokio::test]
+async fn insights_are_read_reviewed_and_retired_through_the_page_and_never_written() {
+    let server = Server::start().await;
+    let root = server.root("acme").await;
+    let agent = server
+        .key("acme", &["agent:a", "user:u"], Trust::Agent, false)
+        .await;
+    let sources = current_sources(
+        &server,
+        &root,
+        "agent:a",
+        json!([
+            fact("Ada leads payments", "Ada", "leads", None),
+            fact(
+                "Ada works from Jakarta",
+                "Ada",
+                "works_from",
+                Some("Jakarta")
+            ),
+        ]),
+    )
+    .await;
+    let active = write_insight(
+        &server,
+        &agent,
+        json!({"scope": "agent:a", "level": "context",
+               "statement": "<b>Ada</b> leads payments from Jakarta", "sources": sources}),
+    )
+    .await;
+    assert_eq!(active["status"], "active", "{active}");
+    let id = active["id"].as_str().expect("id").to_owned();
+    let sources = current_sources(
+        &server,
+        &root,
+        "user:u",
+        json!([
+            fact("Ada likes short updates", "Ada", "likes", None),
+            fact("Ada reads email after lunch", "Ada", "reads_email", None),
+        ]),
+    )
+    .await;
+    // Guidance outside an agent scope waits for review.
+    let held = write_insight(
+        &server,
+        &agent,
+        json!({"scope": "user:u", "level": "guidance",
+               "statement": "Keep updates to Ada short", "sources": sources}),
+    )
+    .await;
+    assert_eq!(held["status"], "quarantined", "{held}");
+    let held_id = held["id"].as_str().expect("id").to_owned();
+    let page = Page::start(&server, &root).await;
+
+    let body = page_json(&page, "insights?scopes=agent%3Aa&status=active").await;
+    assert_eq!(body["insights"][0]["id"], id.as_str(), "{body}");
+    assert_eq!(
+        body["insights"][0]["statement"],
+        "<b>Ada</b> leads payments from Jakarta"
+    );
+    let body = page_json(&page, &format!("insights/{id}")).await;
+    assert_eq!(body["source_views"].as_array().expect("views").len(), 2);
+    let body = page_json(&page, "insights/quarantine?scopes=user:u").await;
+    assert_eq!(body["insights"][0]["id"], held_id.as_str(), "{body}");
+
+    for (method, path) in [
+        (reqwest::Method::POST, "insights".to_owned()),
+        (reqwest::Method::POST, format!("insights/{id}/confirm")),
+        (reqwest::Method::DELETE, format!("insights/{id}")),
+        (reqwest::Method::POST, format!("insights%2F{id}%2Fconfirm")),
+        (reqwest::Method::POST, "reflect/batch".to_owned()),
+    ] {
+        let response = page
+            .api(method, &path)
+            .json(
+                &json!({"scope": "agent:a", "level": "context", "statement": "Planted",
+                          "sources": [], "reason": "x"}),
+            )
+            .send()
+            .await
+            .expect("refused");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+
+    let response = page
+        .api(
+            reqwest::Method::POST,
+            &format!("insights/quarantine/{held_id}/approve"),
+        )
+        .send()
+        .await
+        .expect("approve");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["status"], "active", "{body}");
+
+    let response = page
+        .api(reqwest::Method::POST, &format!("insights/{id}/retire"))
+        .json(&json!({"reason": "Ada moved teams"}))
+        .send()
+        .await
+        .expect("retire");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = page_json(&page, &format!("insights/{id}")).await;
+    assert_eq!(body["status"], "retired", "{body}");
     server.stop().await.expect("stop");
 }

@@ -10,7 +10,7 @@
 //!   fragment, which is never sent over the network, and another site can neither read it nor send
 //!   that header without a CORS preflight, which this never approves.
 //!
-//! Fact and page text is untrusted: agents write it, and it can quote hostile pages. `app.js` only ever sets it
+//! Fact, page and insight text is untrusted: agents write it, and it can quote hostile pages. `app.js` only ever sets it
 //! as text, and the content security policy below refuses inline scripts as a second layer.
 
 use std::collections::HashMap;
@@ -49,6 +49,9 @@ const APP_JS: &str = include_str!("assets/app.js");
 const MARKDOWN_JS: &str = include_str!("assets/markdown.js");
 /// Mermaid 11.4.1 (MIT, `assets/vendor/mermaid.LICENSE`), loaded only when a page has a diagram.
 const MERMAID_JS: &str = include_str!("assets/vendor/mermaid.min.js");
+/// d3-force 3.0.0 with d3-quadtree 3.0.1, d3-dispatch 3.0.1 and d3-timer 3.0.1 (ISC,
+/// `assets/vendor/d3-force.LICENSE`), loaded when the Map tab opens.
+const D3_FORCE_JS: &str = include_str!("assets/vendor/d3-force.min.js");
 const STYLE_CSS: &str = include_str!("assets/style.css");
 
 /// Page edits by `scope/slug`: `None` while the editor is open, then the outcome.
@@ -108,6 +111,10 @@ pub fn router(state: UiState) -> Router {
         .route(
             "/vendor/mermaid.min.js",
             get(|| asset(MERMAID_JS, "text/javascript; charset=utf-8")),
+        )
+        .route(
+            "/vendor/d3-force.min.js",
+            get(|| asset(D3_FORCE_JS, "text/javascript; charset=utf-8")),
         )
         .route(
             "/style.css",
@@ -323,7 +330,8 @@ fn token_matches(state: &UiState, headers: &HeaderMap) -> bool {
 
 /// The server path for a page request, or `None` when the page has no business making it. Purge,
 /// user deletion, retraction, commits, block edits and page writes or deletes are not here on
-/// purpose. Knowledge pages are read and reviewed only. `target` is already
+/// purpose. Knowledge pages are read and reviewed only. Insights are read, reviewed and retired,
+/// never written or confirmed: that is the agent's work. `target` is already
 /// percent-decoded, so every variable segment is checked before it goes into a URL.
 pub(crate) fn upstream_path(method: &Method, target: &str) -> Option<String> {
     let segments: Vec<&str> = target.split('/').collect();
@@ -357,6 +365,17 @@ pub(crate) fn upstream_path(method: &Method, target: &str) -> Option<String> {
         }
         ("GET", ["pages", scope, slug, "versions"]) if page_address(scope, slug) => {
             Some(format!("/v1/pages/{scope}/{slug}/versions"))
+        }
+        ("GET", ["insights"]) => Some("/v1/insights".to_owned()),
+        ("GET", ["insights", "quarantine"]) => Some("/v1/insights/quarantine".to_owned()),
+        ("GET", ["insights", insight]) if id(insight) => Some(format!("/v1/insights/{insight}")),
+        ("POST", ["insights", "quarantine", insight, action @ ("approve" | "reject")])
+            if id(insight) =>
+        {
+            Some(format!("/v1/insights/quarantine/{insight}/{action}"))
+        }
+        ("POST", ["insights", insight, "retire"]) if id(insight) => {
+            Some(format!("/v1/insights/{insight}/retire"))
         }
         _ => None,
     }
@@ -569,6 +588,58 @@ mod tests {
         assert!(!allowed(Method::POST, &format!("pages/quarantine/{ID}/2")));
         assert!(!allowed(Method::POST, "pages/shared:team/guide/versions"));
         assert!(!allowed(Method::GET, "pages/shared:team/guide/sections"));
+    }
+
+    #[test]
+    fn the_page_reads_reviews_and_retires_insights() {
+        assert_eq!(
+            upstream_path(&Method::GET, "insights").as_deref(),
+            Some("/v1/insights")
+        );
+        assert_eq!(
+            upstream_path(&Method::GET, "insights/quarantine").as_deref(),
+            Some("/v1/insights/quarantine")
+        );
+        assert_eq!(
+            upstream_path(&Method::GET, &format!("insights/{ID}")),
+            Some(format!("/v1/insights/{ID}"))
+        );
+        for action in ["approve", "reject"] {
+            assert_eq!(
+                upstream_path(&Method::POST, &format!("insights/quarantine/{ID}/{action}")),
+                Some(format!("/v1/insights/quarantine/{ID}/{action}"))
+            );
+        }
+        assert_eq!(
+            upstream_path(&Method::POST, &format!("insights/{ID}/retire")),
+            Some(format!("/v1/insights/{ID}/retire"))
+        );
+    }
+
+    #[test]
+    fn insights_are_never_written_or_confirmed_through_the_page() {
+        assert!(!allowed(Method::POST, "insights"));
+        assert!(!allowed(Method::PUT, &format!("insights/{ID}")));
+        assert!(!allowed(Method::DELETE, &format!("insights/{ID}")));
+        assert!(!allowed(Method::POST, &format!("insights/{ID}/confirm")));
+        assert!(!allowed(Method::GET, &format!("insights/{ID}/retire")));
+        assert!(!allowed(
+            Method::GET,
+            &format!("insights/quarantine/{ID}/approve")
+        ));
+        assert!(!allowed(
+            Method::POST,
+            &format!("insights/quarantine/{ID}/delete")
+        ));
+        assert!(!allowed(Method::POST, "reflect/batch"));
+        assert!(!allowed(Method::GET, "insights/../facts"));
+        assert!(!allowed(Method::POST, "insights/not-a-uuid/retire"));
+        assert!(!allowed(
+            Method::POST,
+            "insights/quarantine/not-a-uuid/approve"
+        ));
+        let decoded = percent_decoded(&format!("insights/{ID}%2fconfirm")).expect("decodes");
+        assert!(!allowed(Method::GET, &decoded));
     }
 
     #[test]

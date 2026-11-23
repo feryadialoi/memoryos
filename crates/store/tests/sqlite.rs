@@ -3370,3 +3370,91 @@ async fn purge_scope_deletes_its_pages_and_scope_summaries_count_them() -> TestR
     assert!(summaries.iter().all(|s| s.scope != doomed));
     Ok(())
 }
+
+// ---- Insights (shared with the PostgreSQL suite) ---------------------------------------------
+
+#[macro_use]
+#[path = "support/insights.rs"]
+mod insight_suite;
+
+impl insight_suite::Harness for Db {
+    fn store(&self) -> &dyn MemoryStore {
+        &*self.store
+    }
+
+    async fn count(&self, sql: &str) -> Res<i64> {
+        count(self, sql).await
+    }
+
+    async fn expire_fact(&self, id: Uuid) -> Res<()> {
+        let options = SqliteConnectOptions::new().filename(&self.path);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        sqlx::query("UPDATE facts SET expires_at = ?1 WHERE id = ?2")
+            .bind((Utc::now() - chrono::Duration::minutes(1)).timestamp_micros())
+            .bind(id.to_string())
+            .execute(&pool)
+            .await?;
+        pool.close().await;
+        Ok(())
+    }
+
+    async fn summaries(&self, ctx: &RequestContext) -> Res<Vec<memoryos_core::ScopeSummary>> {
+        Ok(self.store.scope_summaries(ctx).await?)
+    }
+}
+
+insight_tests!(db());
+
+#[tokio::test]
+async fn insight_rows_keep_their_vector_and_text_index_rows() -> TestResult {
+    let db = db().await?;
+    let c = ctx("t1");
+    let scope = Scope::agent("a1");
+    let subject = entity(&db, &c, &scope, "ada").await?;
+    let (_, f1) = add_fact(&db, &c, new_fact(&scope, subject, "one", date(2020, 1))).await?;
+    let mut second = new_fact(&scope, subject, "two", date(2020, 1));
+    second.predicate = "other".into();
+    let (_, f2) = add_fact(&db, &c, second).await?;
+    let source = |id| memoryos_core::InsightSourceRef {
+        kind: memoryos_core::InsightSourceKind::Fact,
+        id,
+    };
+    db.store
+        .put_insight(
+            &c,
+            memoryos_core::NewInsight {
+                scope: scope.clone(),
+                level: memoryos_core::InsightLevel::Context,
+                statement: "a conclusion".into(),
+                embedding: axis(2),
+                trust: Trust::Agent,
+                sources: vec![source(f1), source(f2)],
+                supersedes: None,
+                written_by: "k".into(),
+            },
+        )
+        .await?;
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM insight_embeddings").await?,
+        1
+    );
+    db.store.purge_scope(&c, &scope).await?;
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM insight_embeddings").await?,
+        0
+    );
+    assert_eq!(count(&db, "SELECT count(*) FROM insight_sources").await?, 0);
+    let options = SqliteConnectOptions::new().filename(&db.path);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    sqlx::query("INSERT INTO insights_fts (insights_fts) VALUES ('integrity-check')")
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
+}

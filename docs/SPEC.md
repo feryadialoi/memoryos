@@ -389,6 +389,71 @@ searched at the present only; older versions are read by version.
   the same edit for its "Open in editor" button through a local route (`/local/edit`), never the
   proxy, which still cannot write pages.
 
+### Insights
+
+Design and reasons: `docs/memory-into-knowledge-design.md`, ADR 0008. Status: the store (T31) and
+recall (T33) are done; the reflect batch, API, MCP tools, hooks and review page follow in T32 and
+T34 to T36.
+
+- An insight is what several facts mean together, written by the agent: MemoryOS never runs a model
+  (ADR 0005). It has a `level`: `context` (who or what this is), `understanding` (what it means) or
+  `guidance` (what to do about it), ordered lowest to highest.
+- Sources. An insight cites 2 to 50 distinct sources in its own scope: facts, or insights of a lower
+  level, so `context` cites facts only, `understanding` facts and `context`, `guidance` anything below
+  it. On every write and confirm, each fact source must be active and valid now, and each insight
+  source active. Statement 1 to 1,000 characters after secret masking, masked as commits are
+  (section 3, Rules).
+- Trust and status. Insight trust is the lowest of the writer's trust (`agent`, or `external` for a
+  key whose `max_trust` is `external`) and every source's trust. The insight is quarantined when the
+  section 5 source rule applies to that trust in its scope, or when it is `guidance` outside an
+  `agent:*` scope, and active otherwise. Statuses: `active`, `stale`, `quarantined`, `rejected`,
+  `retired`, `superseded`.
+- Supersede. A write may name an active or stale insight of the same scope in `supersedes`. When the
+  new insight is active, the old one becomes `superseded` with `valid_to` and `superseded_by`; when it
+  is quarantined, it records `pending_supersede_of` and approval performs the close.
+- Staleness, in the same transaction as the change that causes it:
+
+  | Source event | Every insight citing it |
+  |---|---|
+  | Fact superseded (commit, single-valued replace, or approval closing a head) | `stale`, change `superseded` with the successor |
+  | Fact invalidated | `stale`, change `invalidated` |
+  | Fact deleted by a purge, or reopened or relinked by one | `stale`, change `purged` for a deleted fact; `superseded` or `invalidated` as it now stands otherwise; a fact reopened to current keeps the entry its insights already have |
+  | Fact re-quarantined or lowered in trust by a purge | `stale`, change `purged`, so no insight keeps a trust above its evidence |
+  | Cited insight becomes `stale`, `retired` or `superseded` | `stale`, change `insight_changed`, applied up every level |
+  | Fact corroborated | No change |
+
+  Expiry is a time, not a write: every read that lists or searches insights first marks stale, with
+  change `expired`, the active insights of the scopes it reads whose fact sources have expired.
+  `stale_reason` lists each changed source with its change and is set exactly while the status is
+  `stale`. Stale insights are never printed by hooks or returned by recall.
+- Resolving a stale insight: `confirm` with new sources (checked as a write, with trust recomputed
+  from the confirming writer and the new sources) makes it active again, or quarantined if the gate
+  now says so; a new write with `supersedes` replaces it; `retire` withdraws it and makes insights
+  citing it stale. Only active and stale insights go stale; a quarantined one is checked when it is
+  approved.
+- Reflect batch, for the agent: in one scope, stale insights oldest first with their sources as they
+  are now, then topics, at most 5 items by default and 20 at most. A topic is the current, active facts
+  of one subject entity that no active, stale or quarantined insight cites, offered when there are at
+  least 3 (`MEMORYOS_REFLECT_MIN_FACTS`), at most the newest 30, with the subject's active insights and
+  `fact_set`, the hex SHA-256 of the sorted fact ids. A decline stores `(scope, topic_key, fact_set)`;
+  the topic is offered again once its fact set differs. Ordering is deterministic.
+- Reflect runs through the host, never on the server: `hook stop` asks for it instead of the save
+  reminder when the hook scopes have at least 3 stale insights or ready topics
+  (`MEMORYOS_REFLECT_BACKLOG`), and `memoryos reflect --schedule nightly` installs an opt-in nightly
+  headless run of the host CLI.
+- Recall returns `insights` as a separate list, as pages are: vector and text search over active
+  insights in the request's scopes, fused with `k = 60`, `insight_limit` default 3, maximum 10, `0`
+  off. Facts are ranked as before. With `as_of` or `known_at`, insights are skipped with
+  `insights_skipped: "time_travel"`.
+- Hooks: `hook session-start` prints active guidance of the hook scopes first (at most 1,500
+  characters, labelled as learned from memory and overridden by the user and `CLAUDE.md`), then
+  `context` and `understanding` (at most 2,000), then facts, skipping facts that a printed insight
+  cites, all inside the 9,000 character budget. `hook prompt` adds at most 2 insights the session has
+  not shown.
+- Audit: `insight.write`, `insight.stale`, `insight.confirm`, `insight.retire`, `insight.approve`,
+  `insight.reject`. `purge_scope` and `DELETE /v1/users/{id}/memory` delete the scope's insights and
+  report `insights_deleted`. `GET /v1/scopes` counts active insights in `insights`.
+
 ## 9. API
 
 `docs/openapi.yaml` is the contract. Error body: `{"error": {"code": "...", "message": "..."}}`.
@@ -442,6 +507,7 @@ The environment wins. A missing file is no settings; one that cannot be read sto
 | `MEMORYOS_SINGLE_VALUED_PREDICATES` | the list in section 3, step 6 | Comma list that replaces the default. Names are normalized to lowercase snake case. A value with no names, such as `,`, turns the rule off |
 | `MEMORYOS_RERANKER` | `local` | `local` or `off`. Off saves the 571 MB download and about 1.3 GiB of memory; recall keeps the fused order |
 | `MEMORYOS_RERANK_MODEL` | `bge-reranker-v2-m3` | One of `bge-reranker-v2-m3`, `bge-reranker-base`, `jina-reranker-v1-turbo-en`, `ms-marco-minilm-l6`, each pinned to a Hugging Face revision. `memoryos reranker list` shows sizes and languages |
+| `MEMORYOS_REFLECT_MIN_FACTS` | `3` | Fewest uncited facts on one subject that a reflect batch offers as a topic, 2 to 1000 |
 | `MEMORYOS_RERANK_TOP` | `10` | Most facts one recall sends to the reranker, as `min(limit * 2, this)`. Below 2 nothing is reranked |
 
 The reranker loads after the embedder. It never stops the server from starting: until it has loaded, or

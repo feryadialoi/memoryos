@@ -25,7 +25,7 @@ async-trait.workspace = true
 memoryos-embed = { workspace = true, features = ["test-embedder"] }
 memoryos-store.workspace = true
 serde_json.workspace = true
-sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "uuid"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "sqlite", "runtime-tokio", "uuid"] }
 tempfile = "3"
 testcontainers = "0.28"
 

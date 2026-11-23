@@ -478,6 +478,8 @@ fn chain_target(
 pub(super) struct PurgeOutcome {
     pub(super) report: PurgeReport,
     pub(super) facts_requarantined: u64,
+    /// Facts the purge deleted, changed, reopened or relinked, whose citing insights it checks.
+    pub(super) touched: Vec<Uuid>,
 }
 
 pub(super) fn highest_trust(trusts: Vec<String>) -> Result<Option<Trust>> {
@@ -496,6 +498,22 @@ pub(super) async fn purge_episode(
     ctx: &RequestContext,
     id: Uuid,
 ) -> Result<PurgeOutcome> {
+    let linked: Vec<String> = sqlx::query_scalar(
+        "SELECT fact_id FROM fact_sources WHERE tenant = ?1 AND episode_id = ?2",
+    )
+    .bind(&ctx.tenant)
+    .bind(id.to_string())
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db)?;
+    let linked = linked
+        .iter()
+        .map(|text| {
+            Uuid::parse_str(text).map_err(|_| Error::Storage("fact_id is not a UUID".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Read before anything moves: what these facts closed is reopened or relinked below.
+    let touched = super::insights::chain_neighbours(conn, ctx, &linked, Some(id)).await?;
     let found = sqlx::query(
         "SELECT f.id, f.scope, f.status, f.trust, f.valid_from, f.valid_to, f.superseded_by, \
              f.closed_by_episode, f.subject_id, f.object_id, \
@@ -661,8 +679,10 @@ pub(super) async fn purge_episode(
             episodes_deleted,
             entities_deleted,
             pages_deleted: 0,
+            insights_deleted: 0,
         },
         facts_requarantined: requarantined.len() as u64,
+        touched,
     })
 }
 
@@ -1040,11 +1060,13 @@ pub(super) async fn purge_scope(
         .await
         .map_err(db)?
         .rows_affected();
+    let insights_deleted = super::insights::purge_scope(conn, ctx, &scope_text).await?;
     Ok(PurgeReport {
         facts_deleted,
         episodes_deleted,
         entities_deleted,
         pages_deleted,
+        insights_deleted,
     })
 }
 
@@ -1054,6 +1076,7 @@ pub(super) fn purge_detail(report: &PurgeReport) -> Value {
         "episodes_deleted": report.episodes_deleted,
         "entities_deleted": report.entities_deleted,
         "pages_deleted": report.pages_deleted,
+        "insights_deleted": report.insights_deleted,
     })
 }
 
