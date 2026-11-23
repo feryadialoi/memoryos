@@ -284,6 +284,7 @@ async fn the_page_serves_itself_locked_down() {
         "app.js",
         "markdown.js",
         "vendor/mermaid.min.js",
+        "vendor/d3-force.min.js",
         "style.css",
     ] {
         let response = page

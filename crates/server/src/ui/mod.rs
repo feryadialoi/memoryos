@@ -49,6 +49,9 @@ const APP_JS: &str = include_str!("assets/app.js");
 const MARKDOWN_JS: &str = include_str!("assets/markdown.js");
 /// Mermaid 11.4.1 (MIT, `assets/vendor/mermaid.LICENSE`), loaded only when a page has a diagram.
 const MERMAID_JS: &str = include_str!("assets/vendor/mermaid.min.js");
+/// d3-force 3.0.0 with d3-quadtree 3.0.1, d3-dispatch 3.0.1 and d3-timer 3.0.1 (ISC,
+/// `assets/vendor/d3-force.LICENSE`), loaded when the Map tab opens.
+const D3_FORCE_JS: &str = include_str!("assets/vendor/d3-force.min.js");
 const STYLE_CSS: &str = include_str!("assets/style.css");
 
 /// Page edits by `scope/slug`: `None` while the editor is open, then the outcome.
@@ -108,6 +111,10 @@ pub fn router(state: UiState) -> Router {
         .route(
             "/vendor/mermaid.min.js",
             get(|| asset(MERMAID_JS, "text/javascript; charset=utf-8")),
+        )
+        .route(
+            "/vendor/d3-force.min.js",
+            get(|| asset(D3_FORCE_JS, "text/javascript; charset=utf-8")),
         )
         .route(
             "/style.css",
