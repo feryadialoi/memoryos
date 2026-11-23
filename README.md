@@ -237,7 +237,8 @@ keeps it linked to its evidence, and takes it out of use when that evidence chan
 Reflecting is how insights get written, and it runs through your agent:
 
 - The stop hook asks for a reflect instead of the save reminder when there is a backlog: 3 or more
-  stale insights, or subjects with at least 3 facts no insight cites yet.
+  stale insights, or subjects with at least 3 facts no insight cites yet
+  (`MEMORYOS_REFLECT_BACKLOG` and `MEMORYOS_REFLECT_MIN_FACTS` change the two numbers).
 - `memoryos reflect --schedule nightly` installs an opt-in job that runs your agent's CLI at 02:00 to
   work through the backlog, and `--schedule off` removes it. It uses your agent's usage, which is
   why it is off by default. `memoryos reflect` prints the current batch.

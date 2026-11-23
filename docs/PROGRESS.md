@@ -41,6 +41,7 @@ actually run. States: `todo`, `doing`, `done`, `blocked`, `removed`.
 | T35 Insights in hooks and CLI | done | Merged f5557c3; lead fix 413cc5e (the MCP proxy fills a missing scope for the insight tools). Agent: hooks 283 unit and 43 integration, workspace 632. Nightly schedule tested with fake launchctl, systemctl and claude in a temp HOME; host command forms checked against each CLI's --help only |
 | T36 Insights on the review page | done | Merged 9f4fd14. Agent's Playwright check on a throwaway SQLite server: every level, status and stale change, approve, reject, retire, planted HTML shown as text, light, dark, 390 px, no console errors. Lead viewed the stale drawer screenshot |
 | Map rework | done | Merged 2e8dcee. Live d3-force layout on a canvas. Agent measured in headless Chromium: settles in 1.7 s, no frame over 16.7 ms at 34 real nodes and at 300 and 450 synthetic nodes |
+| T37 Insights eval, live run, README | done | Merged. Insights suite: 23 scripted cases, 131 checks, plus 34 fact-equality cases. Agent's live run on SQLite with the real e5-small embedder and bge-reranker-v2-m3: recall 28/34 (same as before), staleness 32/32, poisoning 30/30, pages 73/80 (74 before; 53 reranker timeouts logged at concurrency 8), insights 57/57, all gates pass. Recall p50 / p95 156.2 / 194.8 ms with insight_limit 0 and 157.8 / 198.5 ms with 3 |
 
 ## Production gates (SPEC section 12)
 
