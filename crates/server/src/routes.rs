@@ -12,7 +12,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put, MethodRouter};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
-use memoryos_core::{FactListState, MemoryStore, Scope};
+use memoryos_core::{
+    FactListState, InsightFilter, InsightLevel, InsightSourceRef, InsightStatus, MemoryStore, Scope,
+};
 use memoryos_ingest::CommitRequest;
 use memoryos_retrieve::RecallRequest;
 use serde::de::DeserializeOwned;
@@ -24,7 +26,10 @@ use crate::app::AppState;
 use crate::auth::Caller;
 use crate::error::{ApiError, ApiResult};
 use crate::mcp;
-use crate::service::{CandidatesRequest, PageWriteRequest, PutBlockRequest};
+use crate::service::{
+    CandidatesRequest, InsightWriteRequest, PageWriteRequest, PutBlockRequest, ReflectBatchRequest,
+    ReflectDeclineRequest,
+};
 
 const READY_DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -111,6 +116,28 @@ pub fn route_table() -> Vec<Route> {
             get(page_versions),
         ),
         bearer("DELETE", "/v1/users/{user_id}/memory", delete(delete_user)),
+        bearer("GET", "/v1/insights", get(list_insights)),
+        bearer("POST", "/v1/insights", post(write_insight)),
+        bearer(
+            "GET",
+            "/v1/insights/quarantine",
+            get(list_insight_quarantine),
+        ),
+        bearer(
+            "POST",
+            "/v1/insights/quarantine/{id}/approve",
+            post(approve_insight),
+        ),
+        bearer(
+            "POST",
+            "/v1/insights/quarantine/{id}/reject",
+            post(reject_insight),
+        ),
+        bearer("GET", "/v1/insights/{id}", get(get_insight)),
+        bearer("POST", "/v1/insights/{id}/confirm", post(confirm_insight)),
+        bearer("POST", "/v1/insights/{id}/retire", post(retire_insight)),
+        bearer("POST", "/v1/reflect/batch", post(reflect_batch)),
+        bearer("POST", "/v1/reflect/decline", post(reflect_decline)),
         bearer("POST", "/mcp", post(mcp::handle)),
     ]
 }
@@ -629,6 +656,133 @@ async fn delete_user(
     Ok(Json(
         state.services.delete_user_memory(&caller, &user_id).await?,
     ))
+}
+
+#[derive(Deserialize)]
+struct InsightsQuery {
+    scopes: String,
+    level: Option<InsightLevel>,
+    status: Option<InsightStatus>,
+    limit: Option<i64>,
+}
+
+async fn list_insights(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiQuery(query): ApiQuery<InsightsQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let scopes = parse_scopes(&query.scopes)?;
+    let filter = InsightFilter {
+        level: query.level,
+        status: query.status,
+    };
+    let insights = state
+        .services
+        .list_insights(&caller, &scopes, &filter, query.limit)
+        .await?;
+    Ok(Json(json!({"insights": insights})))
+}
+
+async fn write_insight(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiJson(body): ApiJson<InsightWriteRequest>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(state.services.write_insight(&caller, body).await?))
+}
+
+async fn list_insight_quarantine(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiQuery(query): ApiQuery<QuarantineQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let scopes = parse_scope_patterns(&query.scopes);
+    let insights = state
+        .services
+        .list_insight_quarantine(&caller, &scopes, query.limit)
+        .await?;
+    Ok(Json(json!({"insights": insights})))
+}
+
+async fn approve_insight(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(state.services.approve_insight(&caller, id).await?))
+}
+
+async fn reject_insight(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(state.services.reject_insight(&caller, id).await?))
+}
+
+async fn get_insight(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(state.services.get_insight(&caller, id).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmBody {
+    sources: Vec<InsightSourceRef>,
+}
+
+async fn confirm_insight(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(body): ApiJson<ConfirmBody>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(
+        state
+            .services
+            .confirm_insight(&caller, id, &body.sources)
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetireBody {
+    reason: String,
+}
+
+async fn retire_insight(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(body): ApiJson<RetireBody>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(
+        state
+            .services
+            .retire_insight(&caller, id, &body.reason)
+            .await?,
+    ))
+}
+
+async fn reflect_batch(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiJson(body): ApiJson<ReflectBatchRequest>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(state.services.reflect_batch(&caller, body).await?))
+}
+
+async fn reflect_decline(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    ApiJson(body): ApiJson<ReflectDeclineRequest>,
+) -> ApiResult<impl IntoResponse> {
+    state.services.reflect_decline(&caller, body).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

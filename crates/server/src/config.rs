@@ -318,7 +318,10 @@ mod tests {
         }
         for bad in ["1", "1001", "three"] {
             let result = load(&[DB, ("MEMORYOS_REFLECT_MIN_FACTS", bad)]);
-            assert!(message(result).contains("MEMORYOS_REFLECT_MIN_FACTS"), "{bad}");
+            assert!(
+                message(result).contains("MEMORYOS_REFLECT_MIN_FACTS"),
+                "{bad}"
+            );
         }
     }
 
