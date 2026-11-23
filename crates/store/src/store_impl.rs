@@ -7,9 +7,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use memoryos_core::{
     normalize_name, ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, FactFilter, FactOp,
-    FactStatus, GraphNeighborhood, MemoryStore, NewEntity, NewEpisode, NewPageVersion, Page,
-    PageSectionHit, PageSummary, PageVersion, PendingPageVersion, PurgeReport, RequestContext,
-    Result, Scope, ScoredFact, Trust,
+    FactStatus, GraphNeighborhood, Insight, InsightDetail, InsightFilter, InsightSourceRef,
+    MemoryStore, NewEntity, NewEpisode, NewInsight, NewPageVersion, Page, PageSectionHit,
+    PageSummary, PageVersion, PendingPageVersion, PurgeReport, RequestContext, Result, Scope,
+    ScoredFact, ScoredInsight, Trust,
 };
 use pgvector::Vector;
 use serde_json::{json, Value};
@@ -17,7 +18,7 @@ use sqlx::{AssertSqlSafe, PgConnection, Row};
 use uuid::Uuid;
 
 use crate::rows::{self, visible, API_KEY_COLS, BLOCK_COLS, ENTITY_COLS, EPISODE_COLS, FACT_COLS};
-use crate::{db, facts, pages, validate, PgStore};
+use crate::{db, facts, insight_rules, insights, pages, validate, PgStore};
 
 /// Hard cap on `neighbors`, so a depth-5 walk through a hub cannot load an unbounded graph, whatever
 /// limit the caller asks for.
@@ -189,6 +190,7 @@ impl MemoryStore for PgStore {
             .map_err(db)?
             .ok_or_else(|| Error::NotFound(format!("episode {id}")))?;
         let outcome = facts::purge_episode(&mut tx, id).await?;
+        insights::facts_changed(&mut tx, ctx, &outcome.touched).await?;
         let mut detail = facts::purge_detail(&outcome.report);
         detail["facts_requarantined"] = json!(outcome.facts_requarantined);
         facts::audit(&mut tx, ctx, "episode.purge", Some(id), detail).await?;
@@ -244,6 +246,7 @@ impl MemoryStore for PgStore {
             trust,
         };
         let inserted = facts::apply_ops(&mut tx, ctx, &episode, &ops).await?;
+        insights::after_apply(&mut tx, ctx, &insight_rules::op_fact_ids(&ops), &inserted).await?;
 
         sqlx::query("UPDATE episodes SET processed_at = now() WHERE id = $1")
             .bind(episode_id)
@@ -505,7 +508,10 @@ impl MemoryStore for PgStore {
         if updated.rows_affected() == 0 {
             return Err(Error::NotFound(format!("fact {id}")));
         }
+        // What it closed is relinked around it, so it is read first.
+        let touched = insights::chain_neighbours(&mut tx, &[id], None).await?;
         facts::leave_chain_on_retraction(&mut tx, id).await?;
+        insights::facts_changed(&mut tx, ctx, &touched).await?;
         facts::audit(
             &mut tx,
             ctx,
@@ -724,6 +730,10 @@ impl MemoryStore for PgStore {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
+        let named: Vec<Uuid> = std::iter::once(id)
+            .chain(state.pending_supersede_of)
+            .collect();
+        insights::after_apply(&mut tx, ctx, &named, &[]).await?;
         facts::audit(
             &mut tx,
             ctx,
@@ -1117,6 +1127,79 @@ impl MemoryStore for PgStore {
         limit: i64,
     ) -> Result<Vec<PageSectionHit>> {
         pages::search_page_sections_text(self, ctx, scopes, query, limit).await
+    }
+
+    async fn put_insight(&self, ctx: &RequestContext, insight: NewInsight) -> Result<Insight> {
+        insights::put_insight(self, ctx, insight).await
+    }
+
+    async fn get_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<InsightDetail> {
+        insights::get_insight(self, ctx, id).await
+    }
+
+    async fn list_insights(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        filter: &InsightFilter,
+        limit: i64,
+    ) -> Result<Vec<Insight>> {
+        insights::list_insights(self, ctx, scopes, filter, limit).await
+    }
+
+    async fn confirm_insight(
+        &self,
+        ctx: &RequestContext,
+        id: Uuid,
+        sources: &[InsightSourceRef],
+    ) -> Result<Insight> {
+        insights::confirm_insight(self, ctx, id, sources).await
+    }
+
+    async fn retire_insight(
+        &self,
+        ctx: &RequestContext,
+        id: Uuid,
+        reason: &str,
+    ) -> Result<Insight> {
+        insights::retire_insight(self, ctx, id, reason).await
+    }
+
+    async fn list_quarantined_insights(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        limit: i64,
+    ) -> Result<Vec<Insight>> {
+        insights::list_quarantined_insights(self, ctx, scopes, limit).await
+    }
+
+    async fn approve_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<Insight> {
+        insights::approve_insight(self, ctx, id).await
+    }
+
+    async fn reject_insight(&self, ctx: &RequestContext, id: Uuid) -> Result<Insight> {
+        insights::reject_insight(self, ctx, id).await
+    }
+
+    async fn search_insights_vector(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        embedding: &[f32],
+        limit: i64,
+    ) -> Result<Vec<ScoredInsight>> {
+        insights::search_insights_vector(self, ctx, scopes, embedding, limit).await
+    }
+
+    async fn search_insights_text(
+        &self,
+        ctx: &RequestContext,
+        scopes: &[Scope],
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<ScoredInsight>> {
+        insights::search_insights_text(self, ctx, scopes, query, limit).await
     }
 
     async fn find_api_key(&self, key_hash: &str) -> Result<Option<ApiKey>> {

@@ -4740,3 +4740,108 @@ async fn purge_scope_deletes_its_pages_and_scope_summaries_count_them() -> TestR
     assert!(summaries.iter().all(|s| s.scope != doomed));
     Ok(())
 }
+
+// ---- Insights (shared with the SQLite suite) -------------------------------------------------
+
+#[macro_use]
+#[path = "support/insights.rs"]
+mod insight_suite;
+
+impl insight_suite::Harness for Db {
+    fn store(&self) -> &dyn MemoryStore {
+        &*self.store
+    }
+
+    async fn count(&self, sql: &str) -> Res<i64> {
+        count(self, sql).await
+    }
+
+    async fn expire_fact(&self, id: Uuid) -> Res<()> {
+        sqlx::query("UPDATE facts SET expires_at = now() - interval '1 minute' WHERE id = $1")
+            .bind(id)
+            .execute(&self.admin)
+            .await?;
+        Ok(())
+    }
+
+    async fn summaries(&self, ctx: &RequestContext) -> Res<Vec<memoryos_core::ScopeSummary>> {
+        Ok(self.store.scope_summaries(ctx).await?)
+    }
+}
+
+async fn insight_db() -> Res<Db> {
+    Ok(db().await)
+}
+
+insight_tests!(insight_db());
+
+/// The text search function behind `search_insights_text` returns nothing for another tenant or
+/// with no tenant set, like the fact and page functions.
+#[tokio::test]
+async fn insight_text_function_returns_nothing_for_another_or_unset_tenant() -> TestResult {
+    let db = db().await;
+    let a = ctx("t1");
+    let scope = agent_scope();
+    let subject = entity(&db, &a, &scope, "ada").await?;
+    let (_, f1) = add_fact(&db, &a, new_fact(&scope, subject, "one", date(2020, 1))).await?;
+    let (_, f2) = add_fact(
+        &db,
+        &a,
+        NewFact {
+            predicate: "other".into(),
+            ..new_fact(&scope, subject, "two", date(2020, 1))
+        },
+    )
+    .await?;
+    let sources = vec![
+        memoryos_core::InsightSourceRef {
+            kind: memoryos_core::InsightSourceKind::Fact,
+            id: f1,
+        },
+        memoryos_core::InsightSourceRef {
+            kind: memoryos_core::InsightSourceKind::Fact,
+            id: f2,
+        },
+    ];
+    db.store
+        .put_insight(
+            &a,
+            memoryos_core::NewInsight {
+                scope: scope.clone(),
+                level: memoryos_core::InsightLevel::Context,
+                statement: "secret conclusion".into(),
+                embedding: axis(2),
+                trust: Trust::Agent,
+                sources,
+                supersedes: None,
+                written_by: "k".into(),
+            },
+        )
+        .await?;
+    for tenant in [Some("t1"), Some("t2"), None] {
+        let mut tx = db.admin.begin().await?;
+        sqlx::query("SET LOCAL ROLE memoryos_app")
+            .execute(&mut *tx)
+            .await?;
+        if let Some(tenant) = tenant {
+            sqlx::query("SELECT set_config('app.tenant', $1, true)")
+                .bind(tenant)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let found: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM search_insight_ids_text(ARRAY['agent:a1'], 'secret', 10)",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM insights")
+            .fetch_one(&mut *tx)
+            .await?;
+        assert_eq!(
+            (found, rows),
+            if tenant == Some("t1") { (1, 1) } else { (0, 0) }
+        );
+        tx.rollback().await?;
+    }
+    Ok(())
+}

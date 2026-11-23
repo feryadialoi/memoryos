@@ -5,8 +5,8 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use memoryos_core::{
-    ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, Page, PageSectionHit, PageSummary,
-    PageVersion, Result,
+    ApiKey, Block, BlockVersion, Entity, Episode, Error, Fact, Insight, Page, PageSectionHit,
+    PageSummary, PageVersion, Result,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Decode, Row, Sqlite, Type};
@@ -35,6 +35,15 @@ pub(super) const PAGE_VERSION_COLS: &str = "p.id AS page_id, p.scope, p.slug, v.
     v.base_version, v.title, v.summary, v.trust, v.status, v.edited_by, v.edited_at";
 pub(super) const PAGE_SECTION_HIT_COLS: &str = "s.id AS section_id, s.page_id, p.scope, p.slug, \
     v.title, s.version, s.heading, s.text";
+
+/// Requires the alias `i` for `insights`. Sources come sorted by kind, then id.
+pub(super) const INSIGHT_COLS: &str = "i.id, i.scope, i.level, i.statement, i.trust, i.status, \
+    i.stale_reason, i.valid_from, i.valid_to, i.superseded_by, i.pending_supersede_of, \
+    i.written_by, i.recorded_at, \
+    (SELECT json_group_array(json_object('kind', source_kind, 'id', source_id)) FROM (\
+        SELECT s.source_kind, s.source_id FROM insight_sources s \
+        WHERE s.tenant = i.tenant AND s.insight_id = i.id ORDER BY s.source_kind, s.source_id\
+    )) AS sources";
 
 /// SPEC section 4 visibility for `facts f`. Callers bind concrete transaction-stable Unix
 /// microsecond timestamps at positions `t` and `k` (defaults are resolved in Rust).
@@ -237,5 +246,31 @@ pub(super) fn page_section_hit(row: &SqliteRow, score: f64) -> Result<PageSectio
         heading: get(row, "heading")?,
         text: get(row, "text")?,
         score,
+    })
+}
+
+pub(super) fn insight(row: &SqliteRow) -> Result<Insight> {
+    let reason: Option<String> = get(row, "stale_reason")?;
+    Ok(Insight {
+        id: uuid(row, "id")?,
+        scope: parsed(row, "scope")?,
+        level: parsed(row, "level")?,
+        statement: get(row, "statement")?,
+        trust: parsed(row, "trust")?,
+        status: parsed(row, "status")?,
+        stale_reason: reason
+            .map(|text| {
+                serde_json::from_str(&text).map_err(|e| {
+                    Error::Storage(format!("column stale_reason holds invalid JSON: {e}"))
+                })
+            })
+            .transpose()?,
+        sources: json(row, "sources")?,
+        valid_from: time(row, "valid_from")?,
+        valid_to: optional_time(row, "valid_to")?,
+        superseded_by: optional_uuid(row, "superseded_by")?,
+        pending_supersede_of: optional_uuid(row, "pending_supersede_of")?,
+        written_by: get(row, "written_by")?,
+        recorded_at: time(row, "recorded_at")?,
     })
 }
