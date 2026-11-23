@@ -454,6 +454,25 @@ async fn insights_are_recalled_apart_and_only_active() {
 }
 
 #[tokio::test]
+async fn failing_insight_searches_leave_facts_and_pages() {
+    let f = fixture().await;
+    let break_insights = async {
+        sqlx::query("ALTER TABLE insights RENAME TO gone")
+            .execute(&f.admin)
+            .await
+            .expect("rename insights");
+    };
+    common::Scenario::new(
+        f.store.clone(),
+        f.embedder.clone(),
+        f.ctx.clone(),
+        f.scope.clone(),
+    )
+    .recall_survives_failing_insight_searches(break_insights)
+    .await;
+}
+
+#[tokio::test]
 async fn finds_a_fact_only_by_text() {
     let f = fixture().await;
     f.add_fillers(50).await;

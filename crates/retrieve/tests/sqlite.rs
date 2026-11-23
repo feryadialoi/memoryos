@@ -104,6 +104,25 @@ async fn sqlite_pages_are_ranked_apart_and_only_current() {
 }
 
 #[tokio::test]
+async fn sqlite_failing_insight_searches_leave_facts_and_pages() {
+    let fixture = fixture().await;
+    let path = fixture._dir.path().join("recall.sqlite");
+    let break_insights = async {
+        let url = format!("sqlite://{}", path.display());
+        let pool = sqlx::SqlitePool::connect(&url).await.expect("connect");
+        sqlx::query("ALTER TABLE insights RENAME TO gone")
+            .execute(&pool)
+            .await
+            .expect("rename insights");
+        pool.close().await;
+    };
+    fixture
+        .scenario()
+        .recall_survives_failing_insight_searches(break_insights)
+        .await;
+}
+
+#[tokio::test]
 async fn sqlite_insights_are_recalled_apart_and_only_active() {
     let fixture = fixture().await;
     fixture

@@ -410,6 +410,33 @@ impl Scenario {
     }
 }
 
+impl Scenario {
+    /// After `break_insights` makes both insight searches fail, recall still returns facts and
+    /// pages, with no insights.
+    pub async fn recall_survives_failing_insight_searches(
+        &self,
+        break_insights: impl std::future::Future<Output = ()>,
+    ) {
+        let subject = self.entity("a").await;
+        let facts = [
+            self.add(subject, "a zebra was seen", 1.0).await,
+            self.add(subject, "a zebra ran", 2.0).await,
+        ];
+        self.insight(InsightLevel::Context, "the zebra lives nearby", 0.0, &facts)
+            .await;
+        self.page("zebra-care", "feed the zebra", 0.0, Trust::User)
+            .await;
+        assert_eq!(self.recall(QUERY).await.insights.len(), 1);
+
+        break_insights.await;
+        let response = self.recall(QUERY).await;
+        assert!(response.insights.is_empty());
+        assert_eq!(response.insights_skipped, None);
+        assert_eq!(ids(&response.facts), BTreeSet::from(facts));
+        assert_eq!(response.pages.len(), 1);
+    }
+}
+
 fn insight_ids(insights: &[ScoredInsight]) -> BTreeSet<Uuid> {
     insights.iter().map(|hit| hit.insight.id).collect()
 }
