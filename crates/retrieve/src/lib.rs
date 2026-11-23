@@ -9,8 +9,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use memoryos_core::{
-    Embedder, Error, Fact, FactFilter, Insight, MemoryStore, PageSectionHit, RequestContext,
-    Reranker, Result, Scope, ScoredFact, ScoredInsight,
+    Embedder, Error, Fact, FactFilter, MemoryStore, PageSectionHit, RequestContext, Reranker,
+    Result, Scope, ScoredFact, ScoredInsight,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -96,8 +96,8 @@ pub struct RecallResponse {
     pub pages: Vec<PageHit>,
     /// `time_travel` when `as_of` or `known_at` was set, since pages are searched at the present only.
     pub pages_skipped: Option<&'static str>,
-    /// Active insights, ranked apart from facts and pages.
-    pub insights: Vec<Insight>,
+    /// Active insights with their fused scores, ranked apart from facts and pages.
+    pub insights: Vec<ScoredInsight>,
     /// `time_travel` when `as_of` or `known_at` was set, since insights are searched at the present
     /// only.
     pub insights_skipped: Option<&'static str>,
@@ -107,7 +107,7 @@ pub struct RecallResponse {
 struct Ranked {
     facts: Vec<ScoredFact>,
     pages: Vec<PageHit>,
-    insights: Vec<Insight>,
+    insights: Vec<ScoredInsight>,
 }
 
 pub struct Retriever {

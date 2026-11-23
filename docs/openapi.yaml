@@ -973,7 +973,12 @@ components:
         insights:
           type: array
           description: Active insights in the request's scopes, vector and text search fused. Ranked apart from facts and pages
-          items: { $ref: "#/components/schemas/Insight" }
+          items:
+            type: object
+            required: [insight, score]
+            properties:
+              insight: { $ref: "#/components/schemas/Insight" }
+              score: { type: number, description: Fused reciprocal rank score, k = 60 }
         insights_skipped:
           type: [string, "null"]
           enum: [time_travel, null]

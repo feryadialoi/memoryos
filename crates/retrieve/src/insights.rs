@@ -1,7 +1,7 @@
 //! Insight search for recall: active insights of the request's scopes, fused like facts and returned
 //! as their own list. See docs/SPEC.md section 8, Insights.
 
-use memoryos_core::{Insight, Result, ScoredInsight};
+use memoryos_core::{Result, ScoredInsight};
 
 use crate::fusion;
 
@@ -10,14 +10,18 @@ pub const MAX_INSIGHT_LIMIT: i64 = 10;
 /// Candidates per search list, vector and text.
 pub(crate) const INSIGHT_CANDIDATES_PER_LIST: i64 = 20;
 
-/// Reciprocal rank fusion over insight lists with `k = 60`, highest score first, at most `limit`.
-/// Equal scores order by insight id, so the result is deterministic. No reranker reads insights:
-/// the SPEC fuses them only, and the facts' reranker call stays exactly as without insights.
-pub(crate) fn fuse_insights(lists: &[&[ScoredInsight]], limit: usize) -> Vec<Insight> {
+/// Reciprocal rank fusion over insight lists with `k = 60`, highest score first, at most `limit`,
+/// each with its fused score in place of the store's. Equal scores order by insight id, so the
+/// result is deterministic. No reranker reads insights: the SPEC fuses them only, and the facts'
+/// reranker call stays exactly as without insights.
+pub(crate) fn fuse_insights(lists: &[&[ScoredInsight]], limit: usize) -> Vec<ScoredInsight> {
     fusion::fuse_by(lists, |hit| hit.insight.id)
         .into_iter()
         .take(limit)
-        .map(|(hit, _)| hit.insight.clone())
+        .map(|(hit, score)| ScoredInsight {
+            insight: hit.insight.clone(),
+            score,
+        })
         .collect()
 }
 
@@ -29,7 +33,7 @@ pub(crate) fn validate_insight_limit(insight_limit: i64) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use memoryos_core::{InsightLevel, InsightStatus, Scope, Trust};
+    use memoryos_core::{Insight, InsightLevel, InsightStatus, Scope, Trust};
     use uuid::Uuid;
 
     use super::*;
@@ -60,14 +64,17 @@ mod tests {
         ids.iter().map(|&id| hit(id)).collect()
     }
 
-    fn ids(fused: &[Insight]) -> Vec<u128> {
-        fused.iter().map(|insight| insight.id.as_u128()).collect()
+    fn ids(fused: &[ScoredInsight]) -> Vec<u128> {
+        fused.iter().map(|hit| hit.insight.id.as_u128()).collect()
     }
 
     #[test]
-    fn an_insight_in_both_lists_ranks_first() {
+    fn an_insight_in_both_lists_ranks_first_with_its_fused_score() {
         let (vector, text) = (hits(&[1, 2]), hits(&[2]));
-        assert_eq!(ids(&fuse_insights(&[&vector, &text], 10)), [2, 1]);
+        let fused = fuse_insights(&[&vector, &text], 10);
+        assert_eq!(ids(&fused), [2, 1]);
+        assert_eq!(fused[0].score, 1.0 / 62.0 + 1.0 / 61.0);
+        assert_eq!(fused[1].score, 1.0 / 61.0);
     }
 
     #[test]
