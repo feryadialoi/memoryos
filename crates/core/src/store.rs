@@ -316,30 +316,22 @@ pub trait MemoryStore: Send + Sync {
     /// insights oldest first, then topics, at most `limit` items in all. A topic is the current,
     /// active facts of one subject that no active, stale or quarantined insight cites, offered
     /// when there are at least `min_facts` and no decline matches their current fact set.
-    /// The default body exists only until T32 implements it on both backends.
     async fn reflect_batch(
         &self,
         ctx: &RequestContext,
         scope: &Scope,
         limit: i64,
         min_facts: i64,
-    ) -> Result<ReflectBatch> {
-        let _ = (ctx, scope, limit, min_facts);
-        Err(insights_not_implemented())
-    }
+    ) -> Result<ReflectBatch>;
     /// Records that the agent chose not to synthesize this topic's facts, identified by the
     /// `fact_set` a batch returned. The topic is offered again once its fact set differs.
-    /// The default body exists only until T32 implements it on both backends.
     async fn decline_topic(
         &self,
         ctx: &RequestContext,
         scope: &Scope,
         topic_key: Uuid,
         fact_set: &str,
-    ) -> Result<()> {
-        let _ = (ctx, scope, topic_key, fact_set);
-        Err(insights_not_implemented())
-    }
+    ) -> Result<()>;
     /// Vector search over active insights in `scopes`, nearest first.
     async fn search_insights_vector(
         &self,
@@ -373,8 +365,4 @@ pub trait MemoryStore: Send + Sync {
 
     /// Verifies database connectivity for `/readyz`.
     async fn ping(&self) -> Result<()>;
-}
-
-fn insights_not_implemented() -> crate::Error {
-    crate::Error::Internal("insights are not implemented by this store".to_owned())
 }
