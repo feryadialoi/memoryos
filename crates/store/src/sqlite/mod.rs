@@ -18,6 +18,7 @@ use uuid::Uuid;
 mod facts;
 mod insights;
 mod pages;
+mod reflect;
 mod rows;
 mod store_impl;
 
