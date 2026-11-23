@@ -135,6 +135,86 @@ sections of up to 1,000 characters. That cost is inferred from the design, not t
   author, and pages are short.
 - `memoryos page`, the MCP page tools and the hooks' page lines. The suite uses REST only.
 
+## Insights
+
+Date: 2026-11-23. Server under test: `911ade3` (branch `feat/insights`, T31 to T34), with the eval
+suite of T37 on top. No server code changed in T37.
+
+Server: `memoryos serve` built in release mode, SQLite in a fresh temp database, bound to a free
+loopback port (`127.0.0.1:59225`), config from the environment only (`XDG_CONFIG_HOME` pointed at
+the temp directory). Real embedder (`intfloat/multilingual-e5-small`) and real reranker
+(`bge-reranker-v2-m3`, int8 ONNX) from the model cache, `MEMORYOS_RERANK_TOP` 10,
+`MEMORYOS_RATE_LIMIT_RPS` 1000, `MEMORYOS_REFLECT_MIN_FACTS` at its default of 3. Keys: the host
+(`max_trust` agent), an external key, and an admin key with `max_trust` system. Machine: Apple M1
+Pro, 10 cores, 16 GiB, macOS 27.0.1, client and server on the same machine.
+
+### The suite
+
+`memoryos-eval --suite insights` scripts every insight, so no model is called. 23 cases each run in
+their own scope and score 131 checks against SPEC section 8; 34 more compare fact results.
+
+| Class | Cases | What a pass shows |
+|---|---|---|
+| Staleness | 12 | A commit supersede, a single-valued replace, an approval closing a head, an invalidation, a purge that deletes, reopens, relinks or re-quarantines a cited fact, a retire, an insight supersede, and lazy expiry each make exactly the citing insights stale, with the right change (and `by` for a supersede), carried up from context to understanding to guidance. A control insight on other facts stays active. Corroboration and changes to uncited facts change nothing |
+| Trust | 4 | The host's insights in a shared scope are held (guidance too), an external key's insight is held with trust `external`, an insight citing an approved external fact drops to `external` and is held, and writes citing one source, a quarantined, superseded or other-scope fact, or a same-level insight are refused with 400. Held insights stay out of recall; approved ones are recalled and rejected ones are not |
+| Confirm | 1 | Confirm with a changed fact is refused and changes nothing; confirm with current facts returns the insight to active with the new sources and no stale reason, and recall returns it again |
+| Recall | 3 | Only active insights are recalled (not stale, held or retired); `insight_limit` 2, default, 0 and 10 return 2, 3, 0 and all 5; with `as_of` or `known_at` the list is empty with `insights_skipped: time_travel` |
+| Reflect | 3 | A subject is offered at 3 uncited facts and not at 2, with the right facts and `fact_set` digest; a decline holds until a fourth fact arrives, then the topic returns with a new `fact_set`; stale insights come first, oldest first, a batch of 1 holds only the oldest, facts cited by stale insights are no topic, and two identical calls agree |
+| Facts unchanged | 34 | The 34 recall queries return the same fact ids in the same order with `insight_limit` 0 and 3, in a scope holding the 176 corpus facts and 34 insights over them; `insight_limit` 0 returns no insights |
+
+The WireMock tests in `crates/eval/tests/harness.rs` check that the suite fails a server that
+leaves an insight active after its fact is invalidated, names the wrong change in `stale_reason`, or
+returns insights with `as_of`.
+
+### All suites, concurrency 8
+
+`memoryos-eval --suite all --latency-calls 200`, the default concurrency of 8, on the fresh database:
+
+| Suite | Cases | Pass | Fail | Metrics |
+|---|---|---|---|---|
+| Recall | 34 | 28 | 6 | recall@5 0.824, MRR 0.794, 176 facts |
+| Staleness | 32 | 32 | 0 | Every rate 1.0 |
+| Poisoning | 30 | 30 | 0 | 0 leaks, 30 quarantined, 30 purges restored the truth |
+| Pages | 80 | 73 | 7 | Page in the top 3 for 45 of 45, section on top for 36 of 43, facts unchanged in 34 of 34, 0 leaks |
+| Insights | 57 | 57 | 0 | 23 of 23 scripted cases, 131 checks; facts unchanged in 34 of 34 |
+
+Every gate passed. The server logged 53 `reranking timed out, keeping the fused order` warnings
+during this run (26 for facts, 27 for page sections), so some recall and page answers used the fused
+order. The pages suite's `page_limit` 3 timings in this run also include the default
+`insight_limit` 3, since that suite does not set it: p50 / p95 162.1 / 221.4 ms with pages off and
+421.7 / 522.7 ms with pages on.
+
+### Insights suite, one case at a time
+
+`memoryos-eval --suite insights --concurrency 1 --latency-calls 200` on the same server: 57 of 57,
+and no reranker timeout logged.
+
+`POST /v1/recall`, limit 10, `page_limit` 0, one request at a time, the 34 recall queries cycled in
+the scope holding 176 facts and 34 insights. One untimed warm-up call per query and setting (68
+calls), then 200 timed calls per setting, alternating which goes first. 0 errors. Every call with
+`insight_limit` 3 returned 3 insights.
+
+| `insight_limit` | Calls | p50 | p95 |
+|---|---|---|---|
+| 0 (insights off) | 200 | 156.2 ms | 194.8 ms |
+| 3 (the default) | 200 | 157.8 ms | 198.5 ms |
+
+The concurrency 8 run measured 149.6 / 195.1 ms with insights off and 152.3 / 196.5 ms with them on.
+Insight search adds about 2 ms at p50 here. It has no reranker call of its own, unlike pages; that
+is why it is cheap, inferred from SPEC section 8 rather than timed on its own.
+
+### Not measured
+
+- How well a model writes insights. Every insight here is scripted. The design's recorded live run
+  with Claude Code has not been done.
+- The guidance rule on its own. Writer trust is at most `agent`, which the shared scope rule already
+  holds, so the suite cannot tell the two apart.
+- The hooks and CLI (`hook session-start` and `hook stop` with insights, `memoryos reflect`,
+  `--schedule`, `memoryos insight`) and the Insights view of `memoryos ui`. They were built in
+  parallel (T35, T36), and the suite uses REST only.
+- PostgreSQL. Only SQLite was run.
+- Insight latency at scale. The scope held 34 insights.
+
 ## Real-host results
 
 Date: 2026-11-06. Commit under test: `89e81e0`. Task: T9b.
