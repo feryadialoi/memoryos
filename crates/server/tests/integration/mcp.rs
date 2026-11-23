@@ -217,11 +217,17 @@ async fn tools_list_differs_by_mode() {
             "block_replace",
             "commit_facts",
             "graph_neighbors",
+            "insight_confirm",
+            "insight_read",
+            "insight_retire",
+            "insight_write",
             "page_list",
             "page_read",
             "page_write",
             "recall",
-            "recall_candidates"
+            "recall_candidates",
+            "reflect_batch",
+            "reflect_decline",
         ]
     );
     for tool in reply["result"]["tools"].as_array().expect("tools") {

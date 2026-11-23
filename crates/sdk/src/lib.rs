@@ -32,10 +32,14 @@ mod types;
 pub use client::{MemoryOs, Options, RecallBuilder};
 pub use error::{Error, Result};
 pub use memoryos_core::{
-    Block, BlockVersion, Entity, Episode, Fact, FactStatus, GraphNeighborhood, Page, PageSummary,
-    PageVersion, PageVersionStatus, PendingPageVersion, PurgeReport, Scope, ScoredFact, Trust,
+    Block, BlockVersion, Entity, Episode, Fact, FactStatus, GraphNeighborhood, Insight,
+    InsightDetail, InsightLevel, InsightSourceKind, InsightSourceRef, InsightSourceView,
+    InsightStatus, Page, PageSummary, PageVersion, PageVersionStatus, PendingPageVersion,
+    PurgeReport, ReflectBatch, ReflectTopic, Scope, ScoredFact, ScoredInsight, SourceChange,
+    StaleSource, Trust,
 };
 pub use types::{
-    date, Commit, CommitFact, CommitResponse, CommittedFact, EntityRef, PageHit, PageWrite,
-    PageWriteResponse, PutBlock, RecallResponse, RelatedFact,
+    date, Commit, CommitFact, CommitResponse, CommittedFact, EntityRef, InsightWrite,
+    InsightWriteResponse, PageHit, PageWrite, PageWriteResponse, PutBlock, RecallResponse,
+    RelatedFact,
 };

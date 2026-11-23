@@ -35,8 +35,9 @@ static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     .collect()
 });
 
-/// Masks every secret in `text`. Returns whether anything was masked.
-pub(crate) fn redact(text: &mut String) -> bool {
+/// Masks every secret in `text`. Returns whether anything was masked. Public so that other writes,
+/// such as insight statements in the server, mask exactly as commits do.
+pub fn redact(text: &mut String) -> bool {
     let mut changed = false;
     for pattern in PATTERNS.iter() {
         if !pattern.is_match(text) {

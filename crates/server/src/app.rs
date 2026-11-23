@@ -107,6 +107,8 @@ pub async fn serve(
         committer: HostCommitter::new(memory_store.clone(), embedder.clone())
             .with_single_valued(config.single_valued.clone()),
         pages: PageWriter::new(memory_store, embedder.clone()),
+        embedder: embedder.clone(),
+        reflect_min_facts: config.reflect_min_facts,
         metrics: metrics.clone(),
     };
 

@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use memoryos_core::{
-    Block, BlockVersion, Entity, Episode, Fact, GraphNeighborhood, Page, PageSummary, PageVersion,
-    PendingPageVersion, PurgeReport, Scope, ScoredFact,
+    Block, BlockVersion, Entity, Episode, Fact, GraphNeighborhood, Insight, InsightDetail,
+    InsightLevel, InsightSourceRef, InsightStatus, Page, PageSummary, PageVersion,
+    PendingPageVersion, PurgeReport, ReflectBatch, Scope, ScoredFact,
 };
 use reqwest::header::RETRY_AFTER;
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url};
@@ -17,7 +18,8 @@ use uuid::Uuid;
 
 use crate::error::{from_response, Error, Result};
 use crate::types::{
-    Commit, CommitResponse, PageWrite, PageWriteResponse, PutBlock, RecallResponse,
+    Commit, CommitResponse, InsightWrite, InsightWriteResponse, PageWrite, PageWriteResponse,
+    PutBlock, RecallResponse,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -162,6 +164,7 @@ impl MemoryOs {
                 as_of: None,
                 known_at: None,
                 page_limit: None,
+                insight_limit: None,
             },
         }
     }
@@ -419,6 +422,132 @@ impl MemoryOs {
         self.send(request, Retry::No).await
     }
 
+    // ---- Insights -----------------------------------------------------------------------------
+
+    /// Writes an insight. Check `status` in the response: one that needs review is quarantined.
+    pub async fn write_insight(&self, insight: &InsightWrite) -> Result<InsightWriteResponse> {
+        let request = self
+            .request(Method::POST, &["v1", "insights"])
+            .json(insight);
+        self.send(request, Retry::No).await
+    }
+
+    /// Insights in `scopes`, newest first. `limit` is 1 to 500, default 100.
+    pub async fn list_insights(
+        &self,
+        scopes: &[Scope],
+        level: Option<InsightLevel>,
+        status: Option<InsightStatus>,
+        limit: Option<i64>,
+    ) -> Result<Vec<Insight>> {
+        let mut query = vec![("scopes", join_scopes(scopes))];
+        if let Some(level) = level {
+            query.push(("level", level.as_str().to_owned()));
+        }
+        if let Some(status) = status {
+            query.push(("status", status.as_str().to_owned()));
+        }
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        let request = self.request(Method::GET, &["v1", "insights"]).query(&query);
+        let response: Insights = self.send(request, Retry::Yes).await?;
+        Ok(response.insights)
+    }
+
+    /// The insight in any status, its sources as they are now, and the insights it replaced.
+    pub async fn get_insight(&self, id: Uuid) -> Result<InsightDetail> {
+        let request = self.request(Method::GET, &["v1", "insights", &id.to_string()]);
+        self.send(request, Retry::Yes).await
+    }
+
+    /// Makes a stale insight current again with new sources, checked as a write.
+    pub async fn confirm_insight(&self, id: Uuid, sources: &[InsightSourceRef]) -> Result<Insight> {
+        let request = self
+            .request(
+                Method::POST,
+                &["v1", "insights", &id.to_string(), "confirm"],
+            )
+            .json(&json!({"sources": sources}));
+        self.send(request, Retry::No).await
+    }
+
+    /// Withdraws an active or stale insight. Insights citing it become stale.
+    pub async fn retire_insight(&self, id: Uuid, reason: impl Into<String>) -> Result<Insight> {
+        let request = self
+            .request(Method::POST, &["v1", "insights", &id.to_string(), "retire"])
+            .json(&json!({"reason": reason.into()}));
+        self.send(request, Retry::No).await
+    }
+
+    /// Quarantined insights, oldest first. Admin only. `scopes` holds exact scopes or patterns
+    /// such as `shared:*`, with the rules of `quarantine`.
+    pub async fn insight_quarantine<S: ToString>(
+        &self,
+        scopes: &[S],
+        limit: Option<i64>,
+    ) -> Result<Vec<Insight>> {
+        let scopes = scopes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut query = vec![("scopes", scopes)];
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        let request = self
+            .request(Method::GET, &["v1", "insights", "quarantine"])
+            .query(&query);
+        let response: Insights = self.send(request, Retry::Yes).await?;
+        Ok(response.insights)
+    }
+
+    /// Admin only. The insight becomes stale instead when a source is no longer current.
+    pub async fn approve_insight(&self, id: Uuid) -> Result<Insight> {
+        let request = self.request(
+            Method::POST,
+            &["v1", "insights", "quarantine", &id.to_string(), "approve"],
+        );
+        self.send(request, Retry::No).await
+    }
+
+    /// Admin only.
+    pub async fn reject_insight(&self, id: Uuid) -> Result<Insight> {
+        let request = self.request(
+            Method::POST,
+            &["v1", "insights", "quarantine", &id.to_string(), "reject"],
+        );
+        self.send(request, Retry::No).await
+    }
+
+    /// What to synthesize next in `scope`: stale insights, then topics. `limit` is 1 to 20,
+    /// default 5.
+    pub async fn reflect_batch(&self, scope: &Scope, limit: Option<i64>) -> Result<ReflectBatch> {
+        let mut body = json!({"scope": scope});
+        if let Some(limit) = limit {
+            body["limit"] = json!(limit);
+        }
+        let request = self
+            .request(Method::POST, &["v1", "reflect", "batch"])
+            .json(&body);
+        // A POST, but a read: it changes nothing, so it can be retried.
+        self.send(request, Retry::Yes).await
+    }
+
+    /// Stops offering a topic until its facts change. `fact_set` is the one the batch returned.
+    pub async fn reflect_decline(
+        &self,
+        scope: &Scope,
+        topic_key: Uuid,
+        fact_set: &str,
+    ) -> Result<()> {
+        let request = self
+            .request(Method::POST, &["v1", "reflect", "decline"])
+            .json(&json!({"scope": scope, "topic_key": topic_key, "fact_set": fact_set}));
+        self.send_empty(request, Retry::No).await
+    }
+
     // ---- Users --------------------------------------------------------------------------------
 
     /// Hard-deletes everything under `user:{user_id}`. Admin only.
@@ -523,6 +652,8 @@ struct RecallBody {
     known_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     page_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    insight_limit: Option<i64>,
 }
 
 /// A recall that has not been sent. Await it to send.
@@ -552,6 +683,13 @@ impl RecallBuilder<'_> {
     /// Most page hits to return, 0 to 10, default 3. 0 turns page search off.
     pub fn page_limit(mut self, page_limit: i64) -> Self {
         self.body.page_limit = Some(page_limit);
+        self
+    }
+
+    /// Most insights to return, 0 to 10, default 3. 0 turns insight search off. An older server
+    /// ignores it and returns no insights.
+    pub fn insight_limit(mut self, insight_limit: i64) -> Self {
+        self.body.insight_limit = Some(insight_limit);
         self
     }
 
@@ -613,6 +751,11 @@ struct PendingPageVersions {
     versions: Vec<PendingPageVersion>,
 }
 
+#[derive(Deserialize)]
+struct Insights {
+    insights: Vec<Insight>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,6 +800,7 @@ mod tests {
             as_of: None,
             known_at: None,
             page_limit: None,
+            insight_limit: None,
         };
         assert_eq!(
             serde_json::to_value(&body).expect("serializes"),
@@ -667,6 +811,89 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&with_pages.body).expect("serializes")["page_limit"],
             0
+        );
+        let with_insights = client.recall(Scope::user("u"), "q").insight_limit(7);
+        assert_eq!(
+            serde_json::to_value(&with_insights.body).expect("serializes")["insight_limit"],
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn insight_calls_use_the_documented_paths_and_writes_are_not_retried() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Records each request line and answers 503, which a read retries and a write does not.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0u8; 4096];
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&request[..read]).into_owned();
+                let line = text.lines().next().unwrap_or_default().to_owned();
+                record.lock().expect("lock").push(line);
+                let reply = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\
+                             connection: close\r\n\r\n";
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let options = Options {
+            read_retries: 1,
+            ..Options::default()
+        };
+        let mem = MemoryOs::new(format!("http://{address}"), "k", options).expect("client");
+        let scope = Scope::agent("a1");
+        let id = Uuid::nil();
+        let write = InsightWrite::new(scope.clone(), InsightLevel::Context, "s", Vec::new());
+        assert!(mem.write_insight(&write).await.is_err());
+        assert!(mem
+            .list_insights(
+                std::slice::from_ref(&scope),
+                Some(InsightLevel::Guidance),
+                Some(InsightStatus::Stale),
+                Some(5)
+            )
+            .await
+            .is_err());
+        assert!(mem.get_insight(id).await.is_err());
+        assert!(mem.confirm_insight(id, &[]).await.is_err());
+        assert!(mem.retire_insight(id, "r").await.is_err());
+        assert!(mem.insight_quarantine(&["shared:*"], None).await.is_err());
+        assert!(mem.approve_insight(id).await.is_err());
+        assert!(mem.reject_insight(id).await.is_err());
+        assert!(mem.reflect_batch(&scope, Some(2)).await.is_err());
+        assert!(mem.reflect_decline(&scope, id, "ab").await.is_err());
+        let nil = "00000000-0000-0000-0000-000000000000";
+        let list =
+            "GET /v1/insights?scopes=agent%3Aa1&level=guidance&status=stale&limit=5 HTTP/1.1";
+        let quarantine = "GET /v1/insights/quarantine?scopes=shared%3A* HTTP/1.1";
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            [
+                "POST /v1/insights HTTP/1.1".to_owned(),
+                list.to_owned(),
+                list.to_owned(),
+                format!("GET /v1/insights/{nil} HTTP/1.1"),
+                format!("GET /v1/insights/{nil} HTTP/1.1"),
+                format!("POST /v1/insights/{nil}/confirm HTTP/1.1"),
+                format!("POST /v1/insights/{nil}/retire HTTP/1.1"),
+                quarantine.to_owned(),
+                quarantine.to_owned(),
+                format!("POST /v1/insights/quarantine/{nil}/approve HTTP/1.1"),
+                format!("POST /v1/insights/quarantine/{nil}/reject HTTP/1.1"),
+                "POST /v1/reflect/batch HTTP/1.1".to_owned(),
+                "POST /v1/reflect/batch HTTP/1.1".to_owned(),
+                "POST /v1/reflect/decline HTTP/1.1".to_owned(),
+            ]
         );
     }
 

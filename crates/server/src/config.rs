@@ -4,6 +4,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use memoryos_core::REFLECT_MIN_FACTS_DEFAULT;
 use memoryos_embed::RerankModel;
 use memoryos_ingest::SingleValued;
 use memoryos_retrieve::DEFAULT_RERANK_TOP;
@@ -28,6 +29,9 @@ pub struct Config {
     pub rerank_model: RerankModel,
     /// `MEMORYOS_RERANK_TOP`: the most fused facts one recall sends to the reranker.
     pub rerank_top: usize,
+    /// `MEMORYOS_REFLECT_MIN_FACTS`: the fewest uncited facts on one subject that a reflect batch
+    /// offers as a topic.
+    pub reflect_min_facts: i64,
     /// `MEMORYOS_TEST_EMBEDDER`, in milliseconds per call: use the test embedder, not the model.
     #[cfg(feature = "test-embedder")]
     pub test_embedder_delay: Option<Duration>,
@@ -48,6 +52,9 @@ impl fmt::Debug for Config {
             .finish_non_exhaustive()
     }
 }
+
+const REFLECT_MIN_FACTS_LOWEST: i64 = 2;
+const REFLECT_MIN_FACTS_HIGHEST: i64 = 1000;
 
 pub type ConfigResult<T> = std::result::Result<T, String>;
 
@@ -113,6 +120,7 @@ impl Config {
             reranker: rerank.mode,
             rerank_model: rerank.model,
             rerank_top: rerank.top,
+            reflect_min_facts: reflect_min_facts(&get)?,
             #[cfg(feature = "test-embedder")]
             test_embedder_delay: get("MEMORYOS_TEST_EMBEDDER")
                 .map(|millis| {
@@ -153,6 +161,22 @@ fn reranker_mode(get: &impl Fn(&str) -> Option<String>) -> ConfigResult<Reranker
         "local" => Ok(RerankerMode::Local),
         "off" => Ok(RerankerMode::Off),
         _ => Err("MEMORYOS_RERANKER must be local or off".to_owned()),
+    }
+}
+
+/// The store accepts 2 to 1000: one fact is no topic to synthesize.
+fn reflect_min_facts(get: &impl Fn(&str) -> Option<String>) -> ConfigResult<i64> {
+    let Some(text) = get("MEMORYOS_REFLECT_MIN_FACTS") else {
+        return Ok(REFLECT_MIN_FACTS_DEFAULT);
+    };
+    match text.trim().parse::<i64>() {
+        Ok(value) if (REFLECT_MIN_FACTS_LOWEST..=REFLECT_MIN_FACTS_HIGHEST).contains(&value) => {
+            Ok(value)
+        }
+        _ => Err(format!(
+            "MEMORYOS_REFLECT_MIN_FACTS must be an integer from {REFLECT_MIN_FACTS_LOWEST} to \
+             {REFLECT_MIN_FACTS_HIGHEST}"
+        )),
     }
 }
 
@@ -283,6 +307,22 @@ mod tests {
         assert!(message(bad_mode).contains("MEMORYOS_RERANKER"));
         let bad_top = load(&[DB, ("MEMORYOS_RERANK_TOP", "0")]);
         assert!(message(bad_top).contains("MEMORYOS_RERANK_TOP"));
+    }
+
+    #[test]
+    fn reflect_min_facts_defaults_to_3_and_accepts_2_to_1000() {
+        assert_eq!(load(&[DB]).expect("valid").reflect_min_facts, 3);
+        for (text, expected) in [("2", 2), (" 1000 ", 1000)] {
+            let config = load(&[DB, ("MEMORYOS_REFLECT_MIN_FACTS", text)]).expect("valid");
+            assert_eq!(config.reflect_min_facts, expected);
+        }
+        for bad in ["1", "1001", "three"] {
+            let result = load(&[DB, ("MEMORYOS_REFLECT_MIN_FACTS", bad)]);
+            assert!(
+                message(result).contains("MEMORYOS_REFLECT_MIN_FACTS"),
+                "{bad}"
+            );
+        }
     }
 
     #[cfg(feature = "test-embedder")]
