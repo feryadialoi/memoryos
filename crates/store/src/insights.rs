@@ -325,7 +325,11 @@ pub(crate) async fn chain_neighbours(
 
 /// Lazy expiry: marks stale, with change `expired`, the active insights of `scopes` citing a fact
 /// that has expired. Expiry is a time, so no write marks it.
-async fn expire(conn: &mut PgConnection, ctx: &RequestContext, scopes: &[String]) -> Result<()> {
+pub(crate) async fn expire(
+    conn: &mut PgConnection,
+    ctx: &RequestContext,
+    scopes: &[String],
+) -> Result<()> {
     let found = sqlx::query(
         "SELECT s.insight_id, s.source_id FROM insights i \
          JOIN insight_sources s ON s.insight_id = i.id AND s.source_kind = 'fact' \

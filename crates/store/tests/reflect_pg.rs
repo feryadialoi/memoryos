@@ -213,6 +213,14 @@ impl Harness for Db {
         tx.commit().await?;
         Ok(id)
     }
+
+    async fn expire_fact(&self, id: Uuid) -> Res<()> {
+        sqlx::query("UPDATE facts SET expires_at = now() - interval '1 minute' WHERE id = $1")
+            .bind(id)
+            .execute(&self.admin)
+            .await?;
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -253,4 +261,14 @@ async fn inputs_are_validated() -> TestResult {
 #[tokio::test]
 async fn tenants_are_isolated() -> TestResult {
     reflect_common::tenants_are_isolated(&db().await).await
+}
+
+#[tokio::test]
+async fn stale_insights_come_first_oldest_first_with_current_sources() -> TestResult {
+    reflect_common::stale_insights_come_first_oldest_first_with_current_sources(&db().await).await
+}
+
+#[tokio::test]
+async fn the_batch_marks_expired_sources_stale_first() -> TestResult {
+    reflect_common::the_batch_marks_expired_sources_stale_first(&db().await).await
 }

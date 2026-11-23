@@ -90,6 +90,20 @@ impl Harness for Db {
         pool.close().await;
         Ok(id)
     }
+
+    async fn expire_fact(&self, id: Uuid) -> Res<()> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&self.path))
+            .await?;
+        sqlx::query("UPDATE facts SET expires_at = ?1 WHERE id = ?2")
+            .bind((Utc::now() - chrono::Duration::minutes(1)).timestamp_micros())
+            .bind(id.to_string())
+            .execute(&pool)
+            .await?;
+        pool.close().await;
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -130,4 +144,14 @@ async fn inputs_are_validated() -> TestResult {
 #[tokio::test]
 async fn tenants_are_isolated() -> TestResult {
     reflect_common::tenants_are_isolated(&db().await?).await
+}
+
+#[tokio::test]
+async fn stale_insights_come_first_oldest_first_with_current_sources() -> TestResult {
+    reflect_common::stale_insights_come_first_oldest_first_with_current_sources(&db().await?).await
+}
+
+#[tokio::test]
+async fn the_batch_marks_expired_sources_stale_first() -> TestResult {
+    reflect_common::the_batch_marks_expired_sources_stale_first(&db().await?).await
 }

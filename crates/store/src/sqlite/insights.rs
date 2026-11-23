@@ -375,7 +375,7 @@ pub(super) async fn chain_neighbours(
 }
 
 /// Lazy expiry, as on PostgreSQL.
-async fn expire(
+pub(crate) async fn expire(
     conn: &mut SqliteConnection,
     ctx: &RequestContext,
     scopes: &[String],

@@ -6,15 +6,14 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use memoryos_core::{
-    Error, Insight, InsightSourceRef, ReflectBatch, ReflectTopic, RequestContext, Result, Scope,
-    StaleSource, REFLECT_TOPIC_FACTS_MAX,
+    Error, InsightDetail, ReflectBatch, ReflectTopic, RequestContext, Result, Scope,
+    REFLECT_TOPIC_FACTS_MAX,
 };
-use sqlx::sqlite::SqliteRow;
-use sqlx::{AssertSqlSafe, Row, SqliteConnection};
+use sqlx::{AssertSqlSafe, SqliteConnection};
 use uuid::Uuid;
 
-use super::rows::{self, FACT_COLS};
-use super::{db, json_array, uuid_strings, SqliteStore};
+use super::rows::{self, FACT_COLS, INSIGHT_COLS};
+use super::{db, insights, json_array, uuid_strings, SqliteStore};
 use crate::reflect::{
     batch_limit, chunk_topics, fact_set, min_facts as check_min_facts, SUBJECT_CHUNK,
     TOPIC_INSIGHTS_MAX,
@@ -26,83 +25,6 @@ const UNCITED: &str = "NOT EXISTS (SELECT 1 FROM insight_sources s \
     WHERE s.tenant = f.tenant AND s.source_kind = 'fact' AND s.source_id = f.id \
       AND i.status IN ('active', 'stale', 'quarantined'))";
 
-/// Insight columns for `insights i`, with its sources ordered as `InsightSourceRef` orders them.
-const INSIGHT_COLS: &str = "i.id, i.scope, i.level, i.statement, i.trust, i.status, \
-    i.stale_reason, i.valid_from, i.valid_to, i.superseded_by, i.pending_supersede_of, \
-    i.written_by, i.recorded_at, \
-    (SELECT json_group_array(json_object('kind', x.source_kind, 'id', x.source_id)) FROM ( \
-        SELECT s.source_kind, s.source_id FROM insight_sources s \
-        WHERE s.tenant = i.tenant AND s.insight_id = i.id \
-        ORDER BY s.source_kind, s.source_id) x) AS sources";
-
-fn get<'r, T>(row: &'r SqliteRow, column: &str) -> Result<T>
-where
-    T: sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite>,
-{
-    row.try_get(column).map_err(db)
-}
-
-fn parsed<T: std::str::FromStr>(row: &SqliteRow, column: &str) -> Result<T> {
-    let text: String = get(row, column)?;
-    text.parse()
-        .map_err(|_| Error::Storage(format!("column {column} holds an invalid value")))
-}
-
-fn optional_uuid(row: &SqliteRow, column: &str) -> Result<Option<Uuid>> {
-    let text: Option<String> = get(row, column)?;
-    text.map(|value| {
-        Uuid::parse_str(&value)
-            .map_err(|_| Error::Storage(format!("column {column} holds an invalid UUID")))
-    })
-    .transpose()
-}
-
-fn uuid(row: &SqliteRow, column: &str) -> Result<Uuid> {
-    optional_uuid(row, column)?.ok_or_else(|| Error::Storage(format!("column {column} is null")))
-}
-
-fn optional_time(row: &SqliteRow, column: &str) -> Result<Option<DateTime<Utc>>> {
-    let micros: Option<i64> = get(row, column)?;
-    micros
-        .map(|value| {
-            DateTime::from_timestamp_micros(value).ok_or_else(|| {
-                Error::Storage(format!("column {column} holds an invalid timestamp"))
-            })
-        })
-        .transpose()
-}
-
-fn time(row: &SqliteRow, column: &str) -> Result<DateTime<Utc>> {
-    optional_time(row, column)?.ok_or_else(|| Error::Storage(format!("column {column} is null")))
-}
-
-fn insight(row: &SqliteRow) -> Result<Insight> {
-    let sources: String = get(row, "sources")?;
-    let sources: Vec<InsightSourceRef> = serde_json::from_str(&sources)
-        .map_err(|e| Error::Storage(format!("insight sources: {e}")))?;
-    let stale_reason: Option<String> = get(row, "stale_reason")?;
-    let stale_reason = stale_reason
-        .map(|text| serde_json::from_str::<Vec<StaleSource>>(&text))
-        .transpose()
-        .map_err(|e| Error::Storage(format!("insight stale_reason: {e}")))?;
-    Ok(Insight {
-        id: uuid(row, "id")?,
-        scope: parsed(row, "scope")?,
-        level: parsed(row, "level")?,
-        statement: get(row, "statement")?,
-        trust: parsed(row, "trust")?,
-        status: parsed(row, "status")?,
-        stale_reason,
-        sources,
-        valid_from: time(row, "valid_from")?,
-        valid_to: optional_time(row, "valid_to")?,
-        superseded_by: optional_uuid(row, "superseded_by")?,
-        pending_supersede_of: optional_uuid(row, "pending_supersede_of")?,
-        written_by: get(row, "written_by")?,
-        recorded_at: time(row, "recorded_at")?,
-    })
-}
-
 pub(super) async fn reflect_batch(
     store: &SqliteStore,
     ctx: &RequestContext,
@@ -112,14 +34,56 @@ pub(super) async fn reflect_batch(
 ) -> Result<ReflectBatch> {
     let limit = batch_limit(limit)?;
     let min_facts = check_min_facts(min_facts)?;
-    let now = rows::timestamp(Utc::now());
-    let mut tx = store.tenant_tx(ctx).await?;
-    let topics = topics(&mut tx, ctx, scope, now, limit, min_facts).await?;
+    let now = Utc::now();
+    // A write transaction, because lazy expiry may mark insights stale.
+    let mut tx = store.write_tx(ctx).await?;
+    insights::expire(&mut tx, ctx, &[scope.to_string()], now).await?;
+    let stale = stale(&mut tx, ctx, scope, now, limit).await?;
+    let topics = topics(
+        &mut tx,
+        ctx,
+        scope,
+        rows::timestamp(now),
+        limit - stale.len(),
+        min_facts,
+    )
+    .await?;
     tx.commit().await.map_err(db)?;
-    Ok(ReflectBatch {
-        stale: Vec::new(),
-        topics,
-    })
+    Ok(ReflectBatch { stale, topics })
+}
+
+/// Up to `limit` stale insights of `scope`, oldest recorded first, each with its sources as they
+/// are now. `history` is left empty, as on PostgreSQL.
+async fn stale(
+    conn: &mut SqliteConnection,
+    ctx: &RequestContext,
+    scope: &Scope,
+    now: DateTime<Utc>,
+    limit: usize,
+) -> Result<Vec<InsightDetail>> {
+    let sql = format!(
+        "SELECT {INSIGHT_COLS} FROM insights i \
+         WHERE i.tenant = ?1 AND i.scope = ?2 AND i.status = 'stale' \
+         ORDER BY i.recorded_at, i.id LIMIT ?3"
+    );
+    let found = sqlx::query(AssertSqlSafe(sql))
+        .bind(&ctx.tenant)
+        .bind(scope.to_string())
+        .bind(limit as i64)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db)?;
+    let mut details = Vec::with_capacity(found.len());
+    for row in &found {
+        let insight = rows::insight(row)?;
+        let source_views = insights::source_views(&mut *conn, ctx, &insight.sources, now).await?;
+        details.push(InsightDetail {
+            insight,
+            source_views,
+            history: Vec::new(),
+        });
+    }
+    Ok(details)
 }
 
 /// Up to `room` topics of `scope`: subjects ordered by their oldest uncited current fact, so the
@@ -262,7 +226,7 @@ async fn attach_insights(
             .fetch_all(&mut *conn)
             .await
             .map_err(db)?;
-        topic.insights = found.iter().map(insight).collect::<Result<_>>()?;
+        topic.insights = found.iter().map(rows::insight).collect::<Result<_>>()?;
     }
     Ok(())
 }

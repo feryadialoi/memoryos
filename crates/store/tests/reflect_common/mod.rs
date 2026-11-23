@@ -4,9 +4,10 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 use memoryos_core::{
-    Error, FactOp, FactStatus, InsightSourceKind, InsightSourceRef, InsightStatus, MemoryStore,
-    NewEntity, NewEpisode, NewFact, ReflectBatch, RequestContext, Scope, Trust, EMBEDDING_DIMS,
-    REFLECT_BATCH_MAX, REFLECT_MIN_FACTS_DEFAULT, REFLECT_TOPIC_FACTS_MAX,
+    Error, FactOp, FactStatus, Insight, InsightLevel, InsightSourceKind, InsightSourceRef,
+    InsightStatus, MemoryStore, NewEntity, NewEpisode, NewFact, NewInsight, ReflectBatch,
+    RequestContext, Scope, SourceChange, StaleSource, Trust, EMBEDDING_DIMS, REFLECT_BATCH_MAX,
+    REFLECT_MIN_FACTS_DEFAULT, REFLECT_TOPIC_FACTS_MAX,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -29,6 +30,8 @@ pub trait Harness {
         status: InsightStatus,
         facts: &[Uuid],
     ) -> Res<Uuid>;
+    /// Moves the fact's `expires_at` a minute into the past.
+    async fn expire_fact(&self, id: Uuid) -> Res<()>;
 }
 
 pub fn ctx(tenant: &str) -> RequestContext {
@@ -472,5 +475,142 @@ pub async fn tenants_are_isolated<H: Harness>(h: &H) -> TestResult {
         topic_keys(&store.reflect_batch(&a, &s, 5, MIN).await?),
         vec![subject_a]
     );
+    Ok(())
+}
+
+fn fact_ref(id: Uuid) -> InsightSourceRef {
+    InsightSourceRef {
+        kind: InsightSourceKind::Fact,
+        id,
+    }
+}
+
+/// Writes an active context insight in an agent scope through `put_insight`.
+async fn write<S: MemoryStore>(
+    store: &S,
+    c: &RequestContext,
+    s: &Scope,
+    facts: &[Uuid],
+) -> Res<Insight> {
+    let insight = store
+        .put_insight(
+            c,
+            NewInsight {
+                scope: s.clone(),
+                level: InsightLevel::Context,
+                statement: "what it means".into(),
+                embedding: axis(2),
+                trust: Trust::Agent,
+                sources: facts.iter().copied().map(fact_ref).collect(),
+                supersedes: None,
+                written_by: "agent-key".into(),
+            },
+        )
+        .await?;
+    assert_eq!(insight.status, InsightStatus::Active);
+    Ok(insight)
+}
+
+fn stale_ids(batch: &ReflectBatch) -> Vec<Uuid> {
+    batch.stale.iter().map(|d| d.insight.id).collect()
+}
+
+pub async fn stale_insights_come_first_oldest_first_with_current_sources<H: Harness>(
+    h: &H,
+) -> TestResult {
+    let store = h.store();
+    let c = ctx("t1");
+    let s = Scope::agent("a1");
+    let subject = entity(store, &c, &s, "subject").await?;
+    let f = add_n(store, &c, &s, subject, 7).await?;
+    let older = write(store, &c, &s, &f[0..2]).await?;
+    let newer = write(store, &c, &s, &f[2..4]).await?;
+    let fine = write(store, &c, &s, &f[4..6]).await?;
+    // The newer one goes stale first: the order is by when each was written.
+    store.invalidate_fact(&c, f[3], "wrong").await?;
+    store.invalidate_fact(&c, f[0], "wrong").await?;
+    // A stale insight of another scope is not offered here.
+    let other = Scope::agent("a2");
+    let other_subject = entity(store, &c, &other, "subject").await?;
+    let o = add_n(store, &c, &other, other_subject, 2).await?;
+    write(store, &c, &other, &o).await?;
+    store.invalidate_fact(&c, o[0], "wrong").await?;
+
+    let batch = store.reflect_batch(&c, &s, 5, 2).await?;
+    assert_eq!(stale_ids(&batch), vec![older.id, newer.id]);
+    let first = &batch.stale[0];
+    assert_eq!(first.insight.status, InsightStatus::Stale);
+    assert_eq!(
+        first.insight.stale_reason,
+        Some(vec![StaleSource {
+            source: fact_ref(f[0]),
+            change: SourceChange::Invalidated,
+        }])
+    );
+    let mut views: Vec<(Uuid, Option<String>, bool)> = first
+        .source_views
+        .iter()
+        .map(|v| (v.source.id, v.statement.clone(), v.current))
+        .collect();
+    views.sort();
+    let mut expected = vec![
+        (f[0], Some(format!("{subject} fact 0")), false),
+        (f[1], Some(format!("{subject} fact 1")), true),
+    ];
+    expected.sort();
+    assert_eq!(views, expected);
+    assert!(first.history.is_empty());
+
+    // Stale insights still cite their facts, so only f[6] is uncited: no topic at 2.
+    assert!(batch.topics.is_empty());
+    add(store, &c, new_fact(&s, subject, "more")).await?;
+    let batch = store.reflect_batch(&c, &s, 5, 2).await?;
+    assert_eq!(topic_keys(&batch), vec![subject]);
+    // The active insight citing the subject's facts comes with the topic.
+    let carried: Vec<Uuid> = batch.topics[0].insights.iter().map(|i| i.id).collect();
+    assert_eq!(carried, vec![fine.id]);
+
+    // Stale insights fill the limit before topics.
+    let batch = store.reflect_batch(&c, &s, 1, 2).await?;
+    assert_eq!(stale_ids(&batch), vec![older.id]);
+    assert!(batch.topics.is_empty());
+    let batch = store.reflect_batch(&c, &s, 2, 2).await?;
+    assert_eq!(stale_ids(&batch), vec![older.id, newer.id]);
+    assert!(batch.topics.is_empty());
+    let batch = store.reflect_batch(&c, &s, 3, 2).await?;
+    assert_eq!(batch.stale.len(), 2);
+    assert_eq!(topic_keys(&batch), vec![subject]);
+
+    // Another tenant sees none of it.
+    let batch = store.reflect_batch(&ctx("t2"), &s, 5, 2).await?;
+    assert!(batch.stale.is_empty() && batch.topics.is_empty());
+    Ok(())
+}
+
+pub async fn the_batch_marks_expired_sources_stale_first<H: Harness>(h: &H) -> TestResult {
+    let store = h.store();
+    let c = ctx("t1");
+    let s = Scope::agent("a1");
+    let subject = entity(store, &c, &s, "subject").await?;
+    let f = add_n(store, &c, &s, subject, 2).await?;
+    let insight = write(store, &c, &s, &f).await?;
+    assert!(store.reflect_batch(&c, &s, 5, 2).await?.stale.is_empty());
+
+    h.expire_fact(f[1]).await?;
+    let batch = store.reflect_batch(&c, &s, 5, 2).await?;
+    assert_eq!(stale_ids(&batch), vec![insight.id]);
+    assert_eq!(
+        batch.stale[0].insight.stale_reason,
+        Some(vec![StaleSource {
+            source: fact_ref(f[1]),
+            change: SourceChange::Expired,
+        }])
+    );
+    let expired = batch.stale[0]
+        .source_views
+        .iter()
+        .find(|v| v.source.id == f[1])
+        .expect("expired source");
+    assert!(!expired.current);
     Ok(())
 }

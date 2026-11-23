@@ -5,16 +5,15 @@
 use std::collections::{BTreeMap, HashMap};
 
 use memoryos_core::{
-    Error, Fact, Insight, InsightSourceRef, ReflectBatch, ReflectTopic, RequestContext, Result,
-    Scope, StaleSource, INSIGHT_SOURCES_MIN, REFLECT_BATCH_MAX, REFLECT_TOPIC_FACTS_MAX,
+    Error, Fact, Insight, InsightDetail, ReflectBatch, ReflectTopic, RequestContext, Result, Scope,
+    INSIGHT_SOURCES_MIN, REFLECT_BATCH_MAX, REFLECT_TOPIC_FACTS_MAX,
 };
 use sha2::{Digest, Sha256};
-use sqlx::postgres::PgRow;
 use sqlx::{AssertSqlSafe, PgConnection, Row};
 use uuid::Uuid;
 
-use crate::rows::{self, FACT_COLS};
-use crate::{db, PgStore};
+use crate::rows::{self, FACT_COLS, INSIGHT_COLS};
+use crate::{db, insights, PgStore};
 
 /// Most active insights shown with one topic, newest first, so a subject with many insights
 /// cannot crowd the batch.
@@ -131,46 +130,6 @@ const UNCITED: &str = "NOT EXISTS (SELECT 1 FROM insight_sources s \
     WHERE s.source_kind = 'fact' AND s.source_id = f.id \
       AND i.status IN ('active', 'stale', 'quarantined'))";
 
-/// Insight columns for `insights i`, with its sources ordered as `InsightSourceRef` orders them.
-const INSIGHT_COLS: &str = "i.id, i.scope, i.level, i.statement, i.trust, i.status, \
-    i.stale_reason, i.valid_from, i.valid_to, i.superseded_by, i.pending_supersede_of, \
-    i.written_by, i.recorded_at, \
-    (SELECT COALESCE(json_agg(json_build_object('kind', s.source_kind, 'id', s.source_id) \
-        ORDER BY s.source_kind, s.source_id), '[]'::json) \
-     FROM insight_sources s WHERE s.insight_id = i.id) AS sources";
-
-fn insight(row: &PgRow) -> Result<Insight> {
-    fn parsed<T: std::str::FromStr>(row: &PgRow, column: &str) -> Result<T> {
-        let text: String = row.try_get(column).map_err(db)?;
-        text.parse()
-            .map_err(|_| Error::Storage(format!("column {column} holds an invalid value")))
-    }
-    let sources: serde_json::Value = row.try_get("sources").map_err(db)?;
-    let sources: Vec<InsightSourceRef> = serde_json::from_value(sources)
-        .map_err(|e| Error::Storage(format!("insight sources: {e}")))?;
-    let stale_reason: Option<serde_json::Value> = row.try_get("stale_reason").map_err(db)?;
-    let stale_reason = stale_reason
-        .map(serde_json::from_value::<Vec<StaleSource>>)
-        .transpose()
-        .map_err(|e| Error::Storage(format!("insight stale_reason: {e}")))?;
-    Ok(Insight {
-        id: row.try_get("id").map_err(db)?,
-        scope: parsed(row, "scope")?,
-        level: parsed(row, "level")?,
-        statement: row.try_get("statement").map_err(db)?,
-        trust: parsed(row, "trust")?,
-        status: parsed(row, "status")?,
-        stale_reason,
-        sources,
-        valid_from: row.try_get("valid_from").map_err(db)?,
-        valid_to: row.try_get("valid_to").map_err(db)?,
-        superseded_by: row.try_get("superseded_by").map_err(db)?,
-        pending_supersede_of: row.try_get("pending_supersede_of").map_err(db)?,
-        written_by: row.try_get("written_by").map_err(db)?,
-        recorded_at: row.try_get("recorded_at").map_err(db)?,
-    })
-}
-
 pub(crate) async fn reflect_batch(
     store: &PgStore,
     ctx: &RequestContext,
@@ -181,12 +140,38 @@ pub(crate) async fn reflect_batch(
     let limit = batch_limit(limit)?;
     let min_facts = self::min_facts(min_facts)?;
     let mut tx = store.tenant_tx(ctx).await?;
-    let topics = topics(&mut tx, scope, limit, min_facts).await?;
+    insights::expire(&mut tx, ctx, &[scope.to_string()]).await?;
+    let stale = stale(&mut tx, scope, limit).await?;
+    let topics = topics(&mut tx, scope, limit - stale.len(), min_facts).await?;
     tx.commit().await.map_err(db)?;
-    Ok(ReflectBatch {
-        stale: Vec::new(),
-        topics,
-    })
+    Ok(ReflectBatch { stale, topics })
+}
+
+/// Up to `limit` stale insights of `scope`, oldest recorded first, each with its sources as they
+/// are now. `history` is left empty: the batch is for resolving the insight, and `get_insight`
+/// returns the history.
+async fn stale(conn: &mut PgConnection, scope: &Scope, limit: usize) -> Result<Vec<InsightDetail>> {
+    let sql = format!(
+        "SELECT {INSIGHT_COLS} FROM insights i WHERE i.scope = $1 AND i.status = 'stale' \
+         ORDER BY i.recorded_at, i.id LIMIT $2"
+    );
+    let found = sqlx::query(AssertSqlSafe(sql))
+        .bind(scope.to_string())
+        .bind(limit as i64)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db)?;
+    let mut details = Vec::with_capacity(found.len());
+    for row in &found {
+        let insight = rows::insight(row)?;
+        let source_views = insights::source_views(&mut *conn, &insight.sources).await?;
+        details.push(InsightDetail {
+            insight,
+            source_views,
+            history: Vec::new(),
+        });
+    }
+    Ok(details)
 }
 
 /// Up to `room` topics of `scope`: subjects ordered by their oldest uncited current fact, so the
@@ -304,7 +289,10 @@ async fn attach_insights(
     let mut by_subject: HashMap<Uuid, Vec<Insight>> = HashMap::new();
     for row in &found {
         let subject: Uuid = row.try_get("topic_subject").map_err(db)?;
-        by_subject.entry(subject).or_default().push(insight(row)?);
+        by_subject
+            .entry(subject)
+            .or_default()
+            .push(rows::insight(row)?);
     }
     for topic in topics {
         topic.insights = by_subject.remove(&topic.topic_key).unwrap_or_default();
