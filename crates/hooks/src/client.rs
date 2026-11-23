@@ -383,6 +383,8 @@ mod tests {
             facts: vec![],
             pages: vec![],
             pages_skipped: None,
+            insights: vec![],
+            insights_skipped: None,
         };
         assert_eq!(recall_text(&response), "no memories found");
         let value: Value = serde_json::from_str(&recall_json(&response)).expect("json");
@@ -408,6 +410,8 @@ mod tests {
             facts: vec![],
             pages: vec![hit],
             pages_skipped: None,
+            insights: vec![],
+            insights_skipped: None,
         };
         assert_eq!(
             recall_text(&response),
