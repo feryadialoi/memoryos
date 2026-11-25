@@ -917,7 +917,8 @@ function renderAsk() {
 
 // The map is a live force layout like Obsidian's graph view: d3-force (Barnes-Hut repulsion) moves
 // the nodes, a canvas draws them, and the simulation cools down and stops by itself. Nodes linked by
-// facts pull together near the centre; nodes with no link sit on a loose ring around them.
+// facts pull together; every node, linked or not, feels the same pull to the centre, so nodes with no
+// link float loosely around the clusters in one cloud.
 
 let forceLoad = null;
 let mapTeardown = null;
@@ -960,25 +961,20 @@ function buildGraph(facts) {
     links.get(key).facts.push(fact);
   }
   const list = [...nodes.values()];
-  const ring = ringRadius(list);
   let kept = 0;
-  let linked = 0;
-  let alone = 0;
+  let placed = 0;
   const golden = Math.PI * (3 - Math.sqrt(5));
-  for (const node of list) {
+  // New nodes start on a filled sunflower disk, linked ones nearest the middle.
+  for (const node of [...list].sort((a, b) => b.degree - a.degree)) {
     const old = previous.get(node.id);
     if (old && Number.isFinite(old.x)) {
       node.x = old.x;
       node.y = old.y;
       kept++;
-    } else if (node.degree) {
-      const radius = 12 * Math.sqrt(++linked);
-      node.x = radius * Math.cos(linked * golden);
-      node.y = radius * Math.sin(linked * golden);
     } else {
-      const angle = ++alone * golden;
-      node.x = ring * Math.cos(angle);
-      node.y = ring * Math.sin(angle);
+      const radius = 16 * Math.sqrt(++placed);
+      node.x = radius * Math.cos(placed * golden);
+      node.y = radius * Math.sin(placed * golden);
     }
   }
   const kinds = [...new Set(list.map((node) => node.kind))];
@@ -987,7 +983,6 @@ function buildGraph(facts) {
     edges,
     links: [...links.values()],
     kinds,
-    ring,
     total: facts.length,
     limited: facts.length >= GRAPH_LIMIT,
     // The same scope keeps its zoom and position too.
@@ -996,13 +991,6 @@ function buildGraph(facts) {
     alpha: kept === list.length ? 0 : kept ? 0.4 : 1,
     stats: { started: 0, settledMs: null, ticks: 0, draws: 0, drawMs: 0, maxDrawMs: 0 },
   };
-}
-
-// The ring for unlinked nodes: outside the linked clusters, and long enough to hold every one.
-function ringRadius(nodes) {
-  const linked = nodes.filter((node) => node.degree).length;
-  const alone = nodes.length - linked;
-  return Math.max(110, 24 * Math.sqrt(linked) + 60, (alone * 28) / (2 * Math.PI));
 }
 
 const nodeRadius = (node) => 5 + 2.6 * Math.sqrt(node.degree);
@@ -1064,9 +1052,6 @@ function renderMap() {
   // Pan speed in px per ms after the pointer lets go.
   let glide = null;
 
-  const linked = graph.nodes.some((node) => node.degree);
-  const alone = graph.nodes.some((node) => !node.degree);
-  const ringed = (node) => linked && alone && !node.degree;
   // The simulation is stepped by the draw loop below, one tick per frame, never by its own timer.
   const sim = d3.forceSimulation(graph.nodes)
     .stop()
@@ -1075,9 +1060,8 @@ function renderMap() {
     .velocityDecay(0.4)
     .force("link", d3.forceLink(graph.links).distance((link) => 38 + 4 * Math.sqrt(link.source.degree + link.target.degree)))
     .force("charge", d3.forceManyBody().strength((node) => -70 - 30 * Math.sqrt(node.degree)).theta(0.9).distanceMax(500))
-    .force("x", d3.forceX(0).strength((node) => (ringed(node) ? 0 : 0.07)))
-    .force("y", d3.forceY(0).strength((node) => (ringed(node) ? 0 : 0.07)))
-    .force("ring", d3.forceRadial(graph.ring).strength((node) => (ringed(node) ? 0.1 : 0)))
+    .force("x", d3.forceX(0).strength(0.06))
+    .force("y", d3.forceY(0).strength(0.06))
     .force("collide", d3.forceCollide((node) => nodeRadius(node) + 4).strength(0.7));
   const hot = () => sim.alpha() >= sim.alphaMin() || sim.alphaTarget() > 0;
   if (hot() && !graph.stats.started) {
@@ -1258,14 +1242,16 @@ function renderMap() {
     for (const node of graph.nodes) {
       node.fade = ease(node.fade, focus && !near.has(node) ? 0.18 : 1);
       ctx.globalAlpha = node.fade;
-      ctx.fillStyle = colors.nodes[graph.kinds.indexOf(node.kind) % 6];
+      // Like Obsidian: the hovered or selected node fills with the accent colour, with no outline.
+      // Only keyboard focus keeps an outline, so it stays visible without a pointer.
+      const lit = node === hover || node.id === S.selectedNode;
+      ctx.fillStyle = lit ? colors.accent : colors.nodes[graph.kinds.indexOf(node.kind) % 6];
       ctx.beginPath();
       ctx.arc(node.x, node.y, nodeRadius(node), 0, 2 * Math.PI);
       ctx.fill();
-      const ring = node === keyFocus ? colors.accent : node.id === S.selectedNode || node === hover ? colors.ink : null;
-      if (ring) {
+      if (node === keyFocus) {
         ctx.lineWidth = 2 / k;
-        ctx.strokeStyle = ring;
+        ctx.strokeStyle = colors.accent;
         ctx.stroke();
       }
     }
