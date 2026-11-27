@@ -917,11 +917,15 @@ function renderAsk() {
 
 // The map is a live force layout like Obsidian's graph view: d3-force (Barnes-Hut repulsion) moves
 // the nodes, a canvas draws them, and the simulation cools down and stops by itself. Nodes linked by
-// facts pull together; every node, linked or not, feels the same pull to the centre, so nodes with no
-// link float loosely around the clusters in one cloud.
+// facts pull together; every node feels the same pull to the centre, so nodes with no link float
+// loosely around the clusters in one cloud. One engine, `mapEngine`, draws both the Map tab and the
+// local graph in the drawer.
 
 let forceLoad = null;
-let mapTeardown = null;
+// The running engines: the Map tab's and the drawer's local graph. Each has `teardown` and `wake`.
+let mainMap = null;
+let localMap = null;
+let mapPanelOpen = false;
 
 function loadForce() {
   forceLoad ??= new Promise((resolve, reject) => {
@@ -934,57 +938,105 @@ function loadForce() {
   return forceLoad;
 }
 
+// What the map shows, how it draws it and the layout forces, kept in this browser. The search text
+// is kept only until the page reloads.
+const MAP_DEFAULTS = {
+  search: "",
+  unlinked: true,
+  hidden: [],
+  arrows: true,
+  nodeSize: 1,
+  linkWidth: 1,
+  labels: 1,
+  center: 0.06,
+  repel: 1,
+  linkStrength: 1,
+  linkDistance: 1,
+  depth: 1,
+};
+let mapSettings = null;
+
+function getMapSettings() {
+  if (!mapSettings) {
+    let saved = {};
+    try { saved = JSON.parse(storageGet(localStorage, "memoryos-map") || "{}") || {}; } catch { saved = {}; }
+    mapSettings = { ...MAP_DEFAULTS };
+    for (const [key, value] of Object.entries(saved)) {
+      const fallback = MAP_DEFAULTS[key];
+      if (key === "search" || fallback === undefined) continue;
+      if (Array.isArray(fallback) ? Array.isArray(value) && value.every((item) => typeof item === "string") : typeof value === typeof fallback && (typeof value !== "number" || Number.isFinite(value))) {
+        mapSettings[key] = value;
+      }
+    }
+  }
+  return mapSettings;
+}
+
+function setMapSettings(changes) {
+  Object.assign(getMapSettings(), changes);
+  const { search, ...kept } = mapSettings;
+  storageSet(localStorage, "memoryos-map", JSON.stringify(kept));
+}
+
+const factTime = (fact) => {
+  const time = new Date(fact.valid_from || fact.recorded_at).getTime();
+  return Number.isFinite(time) ? time : 0;
+};
+
 function buildGraph(facts) {
   // A refresh of the same scope keeps where the nodes already are, so the map does not jump.
   const previous = new Map((S.graph?.nodes || []).map((node) => [node.id, node]));
   const nodes = new Map();
   const touch = (id, name, kind) => {
-    if (!nodes.has(id)) nodes.set(id, { id, name, kind, x: NaN, y: NaN, degree: 0, facts: [], neighbors: new Set() });
+    if (!nodes.has(id)) nodes.set(id, { id, name, kind, x: NaN, y: NaN, degree: 0, born: Infinity, facts: [], neighbors: new Set() });
     return nodes.get(id);
   };
   const edges = [];
   const links = new Map();
   for (const fact of facts) {
+    const time = factTime(fact);
     const from = touch(fact.subject_id, fact.subject_name, fact.subject_kind);
     from.facts.push(fact);
+    from.born = Math.min(from.born, time);
     if (!fact.object_id) continue;
     const to = touch(fact.object_id, fact.object_name, fact.object_kind);
     if (to === from) continue;
     to.facts.push(fact);
+    to.born = Math.min(to.born, time);
     from.degree++;
     to.degree++;
     from.neighbors.add(to);
     to.neighbors.add(from);
     edges.push({ fact, from, to });
     const key = from.id < to.id ? `${from.id} ${to.id}` : `${to.id} ${from.id}`;
-    if (!links.has(key)) links.set(key, { source: from, target: to, facts: [] });
-    links.get(key).facts.push(fact);
+    if (!links.has(key)) links.set(key, { source: from, target: to, facts: [], forward: false, backward: false, born: Infinity });
+    const link = links.get(key);
+    link.facts.push(fact);
+    link.born = Math.min(link.born, time);
+    // Arrows point from the subject of a fact to its object; a pair with facts both ways gets two.
+    if (link.source === from) link.forward = true;
+    else link.backward = true;
   }
   const list = [...nodes.values()];
   let kept = 0;
-  let placed = 0;
-  const golden = Math.PI * (3 - Math.sqrt(5));
-  // New nodes start on a filled sunflower disk, linked ones nearest the middle.
-  for (const node of [...list].sort((a, b) => b.degree - a.degree)) {
+  for (const node of list) {
     const old = previous.get(node.id);
     if (old && Number.isFinite(old.x)) {
       node.x = old.x;
       node.y = old.y;
       kept++;
-    } else {
-      const radius = 16 * Math.sqrt(++placed);
-      node.x = radius * Math.cos(placed * golden);
-      node.y = radius * Math.sin(placed * golden);
     }
   }
-  const kinds = [...new Set(list.map((node) => node.kind))];
+  sunflower(list.filter((node) => !Number.isFinite(node.x)).sort((a, b) => b.degree - a.degree));
+  const times = list.map((node) => node.born).filter(Number.isFinite);
   return {
     nodes: list,
     edges,
     links: [...links.values()],
-    kinds,
+    kinds: [...new Set(list.map((node) => node.kind))],
     total: facts.length,
     limited: facts.length >= GRAPH_LIMIT,
+    span: times.length ? { start: Math.min(...times), end: Math.max(...times) } : null,
     // The same scope keeps its zoom and position too.
     view: previous.size ? S.graph.view : null,
     // How hot the layout still is: 1 is a fresh start, 0 is settled.
@@ -993,9 +1045,56 @@ function buildGraph(facts) {
   };
 }
 
-const nodeRadius = (node) => 5 + 2.6 * Math.sqrt(node.degree);
+// New nodes start on a filled sunflower disk, in the order given, so the first sit in the middle.
+function sunflower(nodes) {
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  nodes.forEach((node, index) => {
+    const radius = 16 * Math.sqrt(index + 1);
+    node.x = radius * Math.cos((index + 1) * golden);
+    node.y = radius * Math.sin((index + 1) * golden);
+  });
+}
+
+// The local graph: `center` and everything within `depth` links of it, as copies, so its layout
+// never moves the nodes of the Map tab. `global` points back to the node on the Map tab.
+function localGraph(center, depth) {
+  const reached = new Map([[center, 0]]);
+  let ring = [center];
+  for (let step = 1; step <= depth; step++) {
+    const next = [];
+    for (const node of ring) {
+      for (const neighbor of node.neighbors) {
+        if (reached.has(neighbor)) continue;
+        reached.set(neighbor, step);
+        next.push(neighbor);
+      }
+    }
+    ring = next;
+  }
+  const copies = new Map();
+  for (const [node, distance] of reached) {
+    copies.set(node, { id: node.id, name: node.name, kind: node.kind, degree: node.degree, born: node.born, facts: node.facts, distance, global: node, neighbors: new Set(), x: NaN, y: NaN });
+  }
+  const links = [];
+  for (const link of S.graph.links) {
+    const a = copies.get(link.source);
+    const b = copies.get(link.target);
+    if (!a || !b) continue;
+    a.neighbors.add(b);
+    b.neighbors.add(a);
+    links.push({ source: a, target: b, facts: link.facts, forward: link.forward, backward: link.backward, born: link.born });
+  }
+  const nodes = [...copies.values()];
+  sunflower([...nodes].sort((a, b) => a.distance - b.distance || b.degree - a.degree));
+  return {
+    nodes, links, kinds: S.graph.kinds, center: copies.get(center), total: 0, limited: false, span: null, view: null, alpha: 1,
+    stats: { started: 0, settledMs: null, ticks: 0, draws: 0, drawMs: 0, maxDrawMs: 0 },
+  };
+}
+
 const shorten = (text, size) => (text.length > size ? `${text.slice(0, size - 1)}…` : text);
-// Labels fade in as the map zooms in. A node with more links gets its label sooner.
+// Labels fade in as the map zooms in. A node with more links gets its label sooner, and the Labels
+// setting moves the whole threshold.
 const labelAlpha = (node, k) => Math.max(0, Math.min(1, (k * (1 + 0.6 * Math.log2(1 + node.degree)) - 0.95) / 0.35));
 
 function mapColors() {
@@ -1004,6 +1103,7 @@ function mapColors() {
   return {
     nodes: [1, 2, 3, 4, 5, 6].map((i) => get(`--node-${i}`)),
     bg: get("--bg"),
+    panel: get("--panel"),
     line: get("--line-strong"),
     accent: get("--accent"),
     accentInk: get("--accent-ink"),
@@ -1020,6 +1120,8 @@ const approach = (value, target, dt, tau) => {
   return Math.abs(target - next) < 0.004 ? target : next;
 };
 
+const dayLabel = (time) => date(new Date(time).toISOString());
+
 function renderMap() {
   const graph = S.graph;
   if (!graph) return loading();
@@ -1030,13 +1132,140 @@ function renderMap() {
       (error) => toast(error.message, true));
     return loading();
   }
-  mapTeardown?.();
+  mainMap?.teardown();
+  const settings = getMapSettings();
 
+  const readout = h("div", { class: "map-time", hidden: true });
+  const playButton = h("button", { "aria-label": "Play how the map grew", title: "Play how the map grew", onclick: () => (engine.playing() ? engine.stop() : engine.play()) }, "▶");
+  const showPlaying = (playing) => {
+    playButton.textContent = playing ? "■" : "▶";
+    playButton.setAttribute("aria-label", playing ? "Stop" : "Play how the map grew");
+    playButton.title = playing ? "Stop" : "Play how the map grew";
+    readout.hidden = !playing;
+  };
+  const count = h("span", { class: "map-count" });
+  const showCount = (shown) => {
+    count.textContent = shown === graph.nodes.length ? "" : `${shown} of ${graph.nodes.length} shown`;
+  };
+  const engine = mapEngine(graph, { readout, onPlay: showPlaying, onShown: showCount });
+  mainMap = engine;
+
+  const legend = h("div", { class: "map-legend" });
+  const drawLegend = () => {
+    legend.replaceChildren(...graph.kinds.slice(0, 6).map((kind, index) => {
+      const off = settings.hidden.includes(kind);
+      return h("button", {
+        class: `legend-item${off ? " off" : ""}`, "aria-pressed": off ? "false" : "true",
+        title: off ? `Show ${humanize(kind)}` : `Hide ${humanize(kind)}`,
+        onclick: () => {
+          setMapSettings({ hidden: off ? settings.hidden.filter((item) => item !== kind) : [...settings.hidden, kind] });
+          drawLegend();
+          engine.refilter();
+        },
+      }, h("span", { class: "legend-swatch", css: { background: `var(--node-${index + 1})` } }), humanize(kind));
+    }), count);
+  };
+  drawLegend();
+
+  const panel = h("div", { class: "map-panel", hidden: !mapPanelOpen });
+  const drawPanel = () => {
+    const slider = (label, key, min, max, step, then) => h("label", { class: "map-slider" },
+      h("span", {}, label),
+      h("input", {
+        type: "range", min, max, step, value: String(settings[key]),
+        oninput: (event) => { setMapSettings({ [key]: Number(event.target.value) }); then(); },
+      }));
+    const check = (label, key, then) => h("label", { class: "map-check" },
+      h("input", { type: "checkbox", checked: settings[key], onchange: (event) => { setMapSettings({ [key]: event.target.checked }); then(); } }),
+      h("span", {}, label));
+    panel.replaceChildren(
+      h("div", { class: "map-panel-group" }, h("h3", {}, "Filters"),
+        h("input", {
+          class: "map-search", type: "search", placeholder: "Search names", "aria-label": "Show only names that match", value: settings.search,
+          oninput: (event) => { setMapSettings({ search: event.target.value }); engine.refilter(); },
+        }),
+        check("Unlinked", "unlinked", () => engine.refilter())),
+      h("div", { class: "map-panel-group" }, h("h3", {}, "Display"),
+        check("Arrows", "arrows", () => engine.wake()),
+        slider("Labels", "labels", 0.4, 2.5, 0.05, () => engine.wake()),
+        slider("Node size", "nodeSize", 0.5, 2.5, 0.05, () => engine.relayout()),
+        slider("Link thickness", "linkWidth", 0.3, 3, 0.05, () => engine.wake())),
+      h("div", { class: "map-panel-group" }, h("h3", {}, "Forces"),
+        slider("Centre", "center", 0, 0.25, 0.005, () => engine.relayout()),
+        slider("Repel", "repel", 0, 3, 0.05, () => engine.relayout()),
+        slider("Link force", "linkStrength", 0, 2, 0.05, () => engine.relayout()),
+        slider("Link distance", "linkDistance", 0.3, 3, 0.05, () => engine.relayout())),
+      h("button", {
+        class: "link-btn", onclick: () => {
+          const { search, hidden } = settings;
+          setMapSettings({ ...MAP_DEFAULTS, search, hidden });
+          drawPanel();
+          engine.relayout();
+          engine.refilter();
+        },
+      }, "Reset display and forces"));
+  };
+  drawPanel();
+  const settingsButton = h("button", {
+    "aria-label": "Map settings", title: "Filters, display and forces", "aria-expanded": mapPanelOpen ? "true" : "false",
+    onclick: () => {
+      mapPanelOpen = !mapPanelOpen;
+      panel.hidden = !mapPanelOpen;
+      settingsButton.setAttribute("aria-expanded", mapPanelOpen ? "true" : "false");
+    },
+  }, "⚙");
+
+  return h("div", {},
+    engine.canvas,
+    engine.keys,
+    legend,
+    panel,
+    readout,
+    h("div", { class: "map-note" }, graph.limited ? `Newest ${GRAPH_LIMIT} facts. Click anything for detail.` : "Click anything for detail. Drag to move, scroll to zoom."),
+    h("div", { class: "map-controls" },
+      settingsButton,
+      graph.span && graph.span.end > graph.span.start && playButton,
+      h("button", { "aria-label": "Zoom in", title: "Zoom in", onclick: () => engine.zoom(1.25) }, "+"),
+      h("button", { "aria-label": "Zoom out", title: "Zoom out", onclick: () => engine.zoom(0.8) }, "−"),
+      h("button", { "aria-label": "Fit to window", title: "Fit to window", onclick: () => engine.fit() }, "⤢")));
+}
+
+// Opens a person or thing in the drawer, from the Map tab or from the local graph.
+function selectEntity(node) {
+  S.selectedNode = node.id;
+  S.drawer = { type: "entity", node };
+  renderDrawer();
+  mainMap?.wake();
+}
+
+// The drawer's small map of the node and what is near it.
+function renderLocalMap(node) {
+  localMap?.teardown();
+  localMap = null;
+  if (!window.d3?.forceSimulation || !S.graph?.nodes.includes(node)) return null;
+  const settings = getMapSettings();
+  const engine = mapEngine(localGraph(node, settings.depth), { local: true });
+  localMap = engine;
+  const depths = [1, 2, 3].map((depth) => h("button", {
+    "aria-pressed": settings.depth === depth ? "true" : "false",
+    title: `Show what is up to ${depth} link${depth === 1 ? "" : "s"} away`,
+    onclick: () => { setMapSettings({ depth }); renderDrawer(); },
+  }, String(depth)));
+  return h("div", { class: "section" },
+    h("div", { class: "local-head" }, h("h3", {}, "Nearby"), h("span", { class: "spacer" }), h("span", { class: "local-depth" }, "Depth", h("span", { class: "segmented", role: "group", "aria-label": "Links away" }, depths))),
+    h("div", { class: "local-map" }, engine.canvas, engine.keys));
+}
+
+// The engine behind both maps. `options.local` draws the local graph: always fitted, every label on,
+// no wheel zoom (so the drawer still scrolls), no filters and no timelapse.
+function mapEngine(graph, options = {}) {
+  const local = !!options.local;
+  const settings = getMapSettings();
   const d3 = window.d3;
-  const canvas = h("canvas", { class: "map", role: "img", "aria-label": `Map of ${graph.nodes.length} people and things` });
+  const canvas = h("canvas", { class: local ? "map local" : "map", role: "img", "aria-label": local ? `Map of ${graph.nodes.length} people and things near ${graph.center.name}` : `Map of ${graph.nodes.length} people and things` });
   const ctx = canvas.getContext("2d");
   const view = graph.view || { x: 0, y: 0, k: 1 };
-  let autoFit = !graph.view;
+  let autoFit = local || !graph.view;
   let colors = null;
   let hover = null;
   let hoverLink = null;
@@ -1051,18 +1280,30 @@ function renderMap() {
   let viewTo = null;
   // Pan speed in px per ms after the pointer lets go.
   let glide = null;
+  // The timelapse: when it started, and the newest fact time shown so far.
+  let play = null;
+  let cutoff = Infinity;
+  let shown = { nodes: graph.nodes, links: graph.links };
+  let shownKey = "";
+  // A filter or a force changed: frame the map again once it settles, unless the view is moved first.
+  let refit = false;
+
+  const radius = (node) => (5 + 2.6 * Math.sqrt(node.degree)) * settings.nodeSize;
 
   // The simulation is stepped by the draw loop below, one tick per frame, never by its own timer.
-  const sim = d3.forceSimulation(graph.nodes)
+  const linkForce = d3.forceLink([]);
+  const sim = d3.forceSimulation([])
     .stop()
-    .alpha(graph.alpha)
     .alphaDecay(0.03)
     .velocityDecay(0.4)
-    .force("link", d3.forceLink(graph.links).distance((link) => 38 + 4 * Math.sqrt(link.source.degree + link.target.degree)))
-    .force("charge", d3.forceManyBody().strength((node) => -70 - 30 * Math.sqrt(node.degree)).theta(0.9).distanceMax(500))
-    .force("x", d3.forceX(0).strength(0.06))
-    .force("y", d3.forceY(0).strength(0.06))
-    .force("collide", d3.forceCollide((node) => nodeRadius(node) + 4).strength(0.7));
+    .force("link", linkForce)
+    .force("charge", d3.forceManyBody().theta(0.9).distanceMax(500))
+    .force("x", d3.forceX(0))
+    .force("y", d3.forceY(0))
+    .force("collide", d3.forceCollide().strength(0.7));
+  applyForces();
+  refilter(true);
+  sim.alpha(graph.alpha);
   const hot = () => sim.alpha() >= sim.alphaMin() || sim.alphaTarget() > 0;
   if (hot() && !graph.stats.started) {
     graph.stats.started = performance.now();
@@ -1070,6 +1311,67 @@ function renderMap() {
     sim.tick(30);
     graph.stats.ticks += 30;
     graph.alpha = sim.alpha();
+  }
+
+  // The forces read the settings each time they are set, so a slider applies at once.
+  function applyForces() {
+    linkForce
+      .distance((link) => (38 + 4 * Math.sqrt(link.source.degree + link.target.degree)) * settings.linkDistance)
+      // d3's own default strength, scaled: weaker for links of busy nodes, so hubs do not collapse.
+      .strength((link) => Math.min(1, settings.linkStrength / Math.max(1, Math.min(link.source.neighbors.size, link.target.neighbors.size))));
+    sim.force("charge").strength((node) => (-70 - 30 * Math.sqrt(node.degree)) * settings.repel);
+    sim.force("x").strength(settings.center);
+    sim.force("y").strength(settings.center);
+    sim.force("collide").radius((node) => radius(node) + 4);
+  }
+
+  // Which nodes and links pass the filters. Only those are laid out, drawn and hit by the pointer.
+  function visible(node) {
+    if (local) return true;
+    if (node.born > cutoff) return false;
+    if (settings.hidden.includes(node.kind)) return false;
+    if (!settings.unlinked && !node.degree) return false;
+    const query = settings.search.trim().toLowerCase();
+    return !query || node.name.toLowerCase().includes(query);
+  }
+
+  function refilter(first) {
+    const nodes = graph.nodes.filter(visible);
+    const keep = new Set(nodes);
+    const links = graph.links.filter((link) => link.born <= cutoff && keep.has(link.source) && keep.has(link.target));
+    const key = `${nodes.length} ${links.length} ${nodes.map((node) => node.id).join(",")}`;
+    if (!first && key === shownKey) return;
+    // During the timelapse a node appears beside a neighbour that is already there.
+    if (play) {
+      for (const node of nodes) {
+        if (shown.nodes.includes(node)) continue;
+        const near = [...node.neighbors].find((other) => shown.nodes.includes(other));
+        if (near) {
+          node.x = near.x + (Math.random() - 0.5) * 20;
+          node.y = near.y + (Math.random() - 0.5) * 20;
+          node.vx = node.vy = 0;
+        }
+      }
+    }
+    shownKey = key;
+    shown = { nodes, links };
+    sim.nodes(nodes);
+    linkForce.links(links);
+    options.onShown?.(nodes.length);
+    if (!first) {
+      if (!play) refit = true;
+      sim.alpha(Math.max(sim.alpha(), play ? 0.5 : 0.3));
+      if (!graph.stats.started) graph.stats.started = performance.now();
+      drawKeys();
+      wake();
+    }
+  }
+
+  function relayout() {
+    refit = true;
+    applyForces();
+    sim.alpha(Math.max(sim.alpha(), 0.3));
+    wake();
   }
 
   // Leaving the tab or drawing the map again stops the loop and the layout: nothing runs in the background.
@@ -1080,9 +1382,9 @@ function renderMap() {
     resize.disconnect();
     theme.disconnect();
     dark.removeEventListener("change", recolor);
-    if (mapTeardown === teardown) mapTeardown = null;
+    if (mainMap === engine) mainMap = null;
+    if (localMap === engine) localMap = null;
   }
-  mapTeardown = teardown;
 
   function recolor() {
     if (!canvas.isConnected) { teardown(); return; }
@@ -1122,8 +1424,8 @@ function renderMap() {
   });
   resize.observe(canvas);
 
-  // One requestAnimationFrame loop does everything: a layout tick, the view easing, the fades and the
-  // draw. It runs only while something moves, and `wake` starts it again.
+  // One requestAnimationFrame loop does everything: the timelapse, a layout tick, the view easing,
+  // the fades and the draw. It runs only while something moves, and `wake` starts it again.
   function wake() {
     if (!frame && canvas.isConnected) {
       last = 0;
@@ -1140,6 +1442,15 @@ function renderMap() {
     last = now;
     let moving = false;
 
+    if (play) {
+      const progress = Math.min(1, (now - play.started) / play.duration);
+      cutoff = graph.span.start + (graph.span.end - graph.span.start) * progress;
+      const day = dayLabel(cutoff);
+      if (options.readout && options.readout.textContent !== day) options.readout.textContent = day;
+      refilter();
+      if (progress >= 1) stop();
+      else moving = true;
+    }
     if (hot()) {
       sim.tick();
       graph.stats.ticks++;
@@ -1188,10 +1499,34 @@ function renderMap() {
   function settle() {
     graph.alpha = 0;
     if (graph.stats.started && graph.stats.settledMs === null) graph.stats.settledMs = Math.round(performance.now() - graph.stats.started);
-    if (autoFit) viewTo = fitView();
+    if (autoFit || refit) viewTo = fitView();
+    refit = false;
   }
 
-  const focused = () => hover || keyFocus || graph.nodes.find((node) => node.id === S.selectedNode) || null;
+  // The timelapse replays the map in the order facts became true, over about eight seconds. It
+  // starts from an empty map and ends with every node the filters allow.
+  function startPlay() {
+    if (!graph.span || local) return;
+    stopViewMotion();
+    zoomTo = null;
+    play = { started: performance.now(), duration: 8000 };
+    cutoff = graph.span.start;
+    refilter();
+    options.onPlay?.(true);
+    wake();
+  }
+  function stop() {
+    if (!play) return;
+    play = null;
+    cutoff = Infinity;
+    refilter();
+    options.onPlay?.(false);
+    wake();
+  }
+
+  const selectedId = () => (local ? graph.center.id : S.selectedNode);
+  // On the local graph the centre is lit but is not a focus, so nodes two links away stay clear.
+  const focused = () => hover || keyFocus || (local ? null : shown.nodes.find((node) => node.id === selectedId())) || null;
 
   // Draws one frame and moves every fade a step. Returns true while a fade is still on its way.
   function draw(dt) {
@@ -1212,42 +1547,44 @@ function renderMap() {
     ctx.setTransform(ratio * k, 0, 0, ratio * k, ratio * view.x, ratio * view.y);
     ctx.lineCap = "round";
 
-    // Links: faded unless they touch the focused node, accent coloured when they do.
-    const thin = Math.max(1.1, 0.7 / k);
-    const thick = Math.max(1.8, 1.1 / k);
-    for (const link of graph.links) {
+    // Links: faded unless they touch the focused node, accent coloured when they do. Arrows show
+    // once the map is zoomed in far enough to read them, like Obsidian.
+    const thin = Math.max(1.1, 0.7 / k) * settings.linkWidth;
+    const thick = Math.max(1.8, 1.1 / k) * settings.linkWidth;
+    const arrows = settings.arrows ? Math.max(0, Math.min(1, (k - 0.55) / 0.35)) : 0;
+    const stroke = (link, color, lineWidth, alpha) => {
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = lineWidth;
+      ctx.beginPath();
+      ctx.moveTo(link.source.x, link.source.y);
+      ctx.lineTo(link.target.x, link.target.y);
+      ctx.stroke();
+      if (alpha * arrows > 0.01) {
+        ctx.globalAlpha = alpha * arrows;
+        if (link.forward) arrowHead(link.source, link.target, lineWidth);
+        if (link.backward) arrowHead(link.target, link.source, lineWidth);
+      }
+    };
+    for (const link of shown.links) {
       const on = link === hoverLink || (focus && (link.source === focus || link.target === focus));
       link.fade = ease(link.fade, focus && !on ? 0.12 : 1);
       link.glow = ease(link.glow, on ? 1 : 0);
-      ctx.globalAlpha = link.fade * (1 - link.glow);
-      if (ctx.globalAlpha > 0.01) {
-        ctx.strokeStyle = colors.line;
-        ctx.lineWidth = thin;
-        ctx.beginPath();
-        ctx.moveTo(link.source.x, link.source.y);
-        ctx.lineTo(link.target.x, link.target.y);
-        ctx.stroke();
-      }
-      if (link.glow > 0.01) {
-        ctx.globalAlpha = link.glow;
-        ctx.strokeStyle = colors.accent;
-        ctx.lineWidth = thick;
-        ctx.beginPath();
-        ctx.moveTo(link.source.x, link.source.y);
-        ctx.lineTo(link.target.x, link.target.y);
-        ctx.stroke();
-      }
+      const plain = link.fade * (1 - link.glow);
+      if (plain > 0.01) stroke(link, colors.line, thin, plain);
+      if (link.glow > 0.01) stroke(link, colors.accent, thick, link.glow);
     }
 
-    for (const node of graph.nodes) {
+    for (const node of shown.nodes) {
       node.fade = ease(node.fade, focus && !near.has(node) ? 0.18 : 1);
       ctx.globalAlpha = node.fade;
       // Like Obsidian: the hovered or selected node fills with the accent colour, with no outline.
       // Only keyboard focus keeps an outline, so it stays visible without a pointer.
-      const lit = node === hover || node.id === S.selectedNode;
+      const lit = node === hover || node.id === selectedId();
       ctx.fillStyle = lit ? colors.accent : colors.nodes[graph.kinds.indexOf(node.kind) % 6];
       ctx.beginPath();
-      ctx.arc(node.x, node.y, nodeRadius(node), 0, 2 * Math.PI);
+      ctx.arc(node.x, node.y, radius(node), 0, 2 * Math.PI);
       ctx.fill();
       if (node === keyFocus) {
         ctx.lineWidth = 2 / k;
@@ -1260,6 +1597,27 @@ function renderMap() {
     return fading;
   }
 
+  // A small filled triangle whose tip touches the edge of `to`, pointing along the link.
+  function arrowHead(from, to, lineWidth) {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const length = Math.hypot(dx, dy);
+    if (length < 1) return;
+    const ux = dx / length;
+    const uy = dy / length;
+    const tipX = to.x - ux * (radius(to) + 1);
+    const tipY = to.y - uy * (radius(to) + 1);
+    const size = Math.max(5, lineWidth * 3.2);
+    const backX = tipX - ux * size;
+    const backY = tipY - uy * size;
+    ctx.beginPath();
+    ctx.moveTo(tipX, tipY);
+    ctx.lineTo(backX - uy * size * 0.5, backY + ux * size * 0.5);
+    ctx.lineTo(backX + uy * size * 0.5, backY - ux * size * 0.5);
+    ctx.closePath();
+    ctx.fill();
+  }
+
   // Labels are drawn on screen at a fixed size: the focused node and its neighbours first, then the
   // best linked nodes. A label that would overlap one already placed fades out instead.
   function drawLabels(focus, near, ease) {
@@ -1270,7 +1628,7 @@ function renderMap() {
     ctx.textBaseline = "top";
     ctx.lineJoin = "round";
     ctx.lineWidth = 3.5;
-    ctx.strokeStyle = colors.bg;
+    ctx.strokeStyle = local ? colors.panel : colors.bg;
     const placed = [];
     const fits = (box) => !placed.some((o) => box.x < o.x + o.w && o.x < box.x + box.w && box.y < o.y + o.h && o.y < box.y + box.h);
     const label = (item, text, x, y, want, color, bold) => {
@@ -1284,51 +1642,54 @@ function renderMap() {
       const w = item.labelWidth;
       const box = { x: x - w / 2, y: y - 1, w, h: 16 };
       const seen = box.x < width && box.x + w > 0 && box.y < height && box.y + 16 > 0;
-      const shown = want > 0.05 && seen && fits(box);
-      if (shown) placed.push(box);
-      item.labelFade = ease(item.labelFade ?? 0, shown ? want : 0);
+      const shownNow = want > 0.05 && seen && fits(box);
+      if (shownNow) placed.push(box);
+      item.labelFade = ease(item.labelFade ?? 0, shownNow ? want : 0);
       if (item.labelFade < 0.02 || !seen) return;
       ctx.globalAlpha = item.labelFade;
       ctx.strokeText(text, x, y);
       ctx.fillStyle = color;
       ctx.fillText(text, x, y);
     };
-    const order = [...graph.nodes].sort((a, b) => (near.has(b) - near.has(a)) || (b.degree - a.degree) || (b.facts.length - a.facts.length));
+    const order = [...shown.nodes].sort((a, b) => (near.has(b) - near.has(a)) || (b.degree - a.degree) || (b.facts.length - a.facts.length));
     for (const node of order) {
       const forced = near.has(node);
-      const want = forced ? 1 : labelAlpha(node, k) * (focus ? 0.25 : 1);
+      const want = forced || local ? 1 : labelAlpha(node, k * settings.labels) * (focus ? 0.25 : 1);
       const x = view.x + node.x * k;
-      const y = view.y + (node.y + nodeRadius(node)) * k + 4;
-      label(node, shorten(node.name, 28), x, y, want, forced || !focus ? colors.ink : colors.ink2, node === focus);
+      const y = view.y + (node.y + radius(node)) * k + 4;
+      label(node, shorten(node.name, local ? 22 : 28), x, y, want, forced || !focus ? colors.ink : colors.ink2, node === focus);
     }
-    for (const link of graph.links) {
+    for (const link of shown.links) {
       const on = focus && (link.source === focus || link.target === focus);
       if (!on && !link.labelFade) continue;
       const more = link.facts.length > 1 ? ` +${link.facts.length - 1}` : "";
       const x = view.x + ((link.source.x + link.target.x) / 2) * k;
       const y = view.y + ((link.source.y + link.target.y) / 2) * k - 8;
-      label(link, `${humanize(link.facts[0].predicate)}${more}`, x, y, on ? 1 : 0, colors.accentInk, false);
+      label(link, `${humanize(link.facts[0].predicate)}${more}`, x, y, on && !local ? 1 : 0, colors.accentInk, false);
     }
     ctx.globalAlpha = 1;
   }
 
-  // The view that frames every node.
+  // The view that frames every shown node, or every node when the filters leave none.
   function fitView() {
+    const nodes = shown.nodes.length ? shown.nodes : graph.nodes;
     let [minX, maxX, minY, maxY] = [Infinity, -Infinity, Infinity, -Infinity];
-    for (const node of graph.nodes) {
-      const r = nodeRadius(node);
+    for (const node of nodes) {
+      const r = radius(node);
       minX = Math.min(minX, node.x - r);
       maxX = Math.max(maxX, node.x + r);
       minY = Math.min(minY, node.y - r);
       maxY = Math.max(maxY, node.y + r);
     }
-    const pad = Math.min(60, width * 0.08);
-    const k = Math.max(0.1, Math.min(1.6, (width - 2 * pad) / Math.max(maxX - minX, 1), (height - 2 * pad - 40) / Math.max(maxY - minY, 1)));
-    return { k, x: width / 2 - ((minX + maxX) / 2) * k, y: height / 2 + 10 - ((minY + maxY) / 2) * k };
+    const pad = local ? 28 : Math.min(60, width * 0.08);
+    const top = local ? 0 : 40;
+    const k = Math.max(0.1, Math.min(1.6, (width - 2 * pad) / Math.max(maxX - minX, 1), (height - 2 * pad - top) / Math.max(maxY - minY, 1)));
+    return { k, x: width / 2 - ((minX + maxX) / 2) * k, y: height / 2 + top / 4 - ((minY + maxY) / 2) * k };
   }
 
   function stopViewMotion() {
     autoFit = false;
+    refit = false;
     viewTo = null;
     glide = null;
   }
@@ -1358,9 +1719,9 @@ function renderMap() {
   function nodeAt({ x, y }) {
     let best = null;
     let bestDistance = Infinity;
-    for (const node of graph.nodes) {
+    for (const node of shown.nodes) {
       const distance = Math.hypot(node.x - x, node.y - y);
-      if (distance < nodeRadius(node) + 5 / view.k && distance < bestDistance) {
+      if (distance < radius(node) + 5 / view.k && distance < bestDistance) {
         best = node;
         bestDistance = distance;
       }
@@ -1370,7 +1731,7 @@ function renderMap() {
 
   function linkAt({ x, y }) {
     const reach = 5 / view.k;
-    for (const link of graph.links) {
+    for (const link of shown.links) {
       const { source: a, target: b } = link;
       const dx = b.x - a.x;
       const dy = b.y - a.y;
@@ -1391,13 +1752,15 @@ function renderMap() {
     wake();
   }
 
-  canvas.addEventListener("wheel", (event) => {
-    event.preventDefault();
-    const { sx, sy } = toWorld(event);
-    // Pixel deltas from a trackpad, lines from a mouse wheel.
-    const delta = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaY;
-    zoom(Math.exp(-Math.max(-120, Math.min(120, delta)) * 0.0018), sx, sy);
-  }, { passive: false });
+  if (!local) {
+    canvas.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const { sx, sy } = toWorld(event);
+      // Pixel deltas from a trackpad, lines from a mouse wheel.
+      const delta = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaY;
+      zoom(Math.exp(-Math.max(-120, Math.min(120, delta)) * 0.0018), sx, sy);
+    }, { passive: false });
+  }
 
   let drag = null;
   canvas.addEventListener("pointerdown", (event) => {
@@ -1457,10 +1820,10 @@ function renderMap() {
       // No glide when the pointer stopped before letting go.
       if (event.timeStamp - drag.t < 80) glide = { vx: drag.speed.x, vy: drag.speed.y };
     } else if (drag.node) {
-      selectNode(drag.node);
+      selectEntity(drag.node.global || drag.node);
     } else if (drag.link) {
       openFact(drag.link.facts[0].id);
-    } else if (S.selectedNode) {
+    } else if (!local && S.selectedNode) {
       closeSelection();
     }
     drag = null;
@@ -1470,12 +1833,6 @@ function renderMap() {
   canvas.addEventListener("pointercancel", release);
   canvas.addEventListener("pointerleave", () => { if (!drag) point(null, null); });
 
-  function selectNode(node) {
-    S.selectedNode = node.id;
-    S.drawer = { type: "entity", node };
-    renderDrawer();
-    wake();
-  }
   function closeSelection() {
     S.selectedNode = null;
     S.drawer = null;
@@ -1484,14 +1841,17 @@ function renderMap() {
   }
 
   // The canvas is one picture to a screen reader. These buttons, hidden until focused, give each
-  // node a name, a place in the tab order, and Enter to open it.
-  const keys = h("div", { class: "map-keys", "aria-label": "People and things on the map" },
-    [...graph.nodes].sort((a, b) => b.degree - a.degree || a.name.localeCompare(b.name)).map((node) => h("button", {
+  // shown node a name, a place in the tab order, and Enter to open it.
+  const keys = h("div", { class: "map-keys", "aria-label": local ? "People and things nearby" : "People and things on the map" });
+  function drawKeys() {
+    keys.replaceChildren(...[...shown.nodes].sort((a, b) => b.degree - a.degree || a.name.localeCompare(b.name)).map((node) => h("button", {
       "aria-label": `${node.name}, ${node.facts.length} fact${node.facts.length === 1 ? "" : "s"}`,
       onfocus: () => { keyFocus = node; bringIntoView(node); wake(); },
       onblur: () => { if (keyFocus === node) keyFocus = null; wake(); },
-      onclick: () => selectNode(node),
+      onclick: () => selectEntity(node.global || node),
     }, node.name)));
+  }
+  drawKeys();
 
   function bringIntoView(node) {
     const x = view.x + node.x * view.k;
@@ -1502,16 +1862,8 @@ function renderMap() {
     viewTo = { k: view.k, x: width / 2 - node.x * view.k, y: height / 2 - node.y * view.k };
   }
 
-  return h("div", {},
-    canvas,
-    keys,
-    h("div", { class: "map-legend" }, graph.kinds.slice(0, 6).map((kind, index) => h("span", { class: "legend-item" },
-      h("span", { class: "legend-swatch", css: { background: `var(--node-${index + 1})` } }), humanize(kind)))),
-    h("div", { class: "map-note" }, graph.limited ? `Newest ${GRAPH_LIMIT} facts. Click anything for detail.` : "Click anything for detail. Drag to move, scroll to zoom."),
-    h("div", { class: "map-controls" },
-      h("button", { "aria-label": "Zoom in", title: "Zoom in", onclick: () => zoom(1.25) }, "+"),
-      h("button", { "aria-label": "Zoom out", title: "Zoom out", onclick: () => zoom(0.8) }, "−"),
-      h("button", { "aria-label": "Fit to window", title: "Fit to window", onclick: fit }, "⤢")));
+  const engine = { canvas, keys, teardown, wake, refilter: () => refilter(), relayout, zoom: (factor) => zoom(factor), fit, play: startPlay, stop, playing: () => !!play };
+  return engine;
 }
 
 // ---- Timeline ---------------------------------------------------------------------------------
@@ -1979,6 +2331,7 @@ function renderNotes() {
 // ---- Drawer -----------------------------------------------------------------------------------
 
 function renderDrawer() {
+  localMap?.teardown();
   document.getElementById("drawer")?.remove();
   if (!S.drawer || !S.token) return;
   const { type } = S.drawer;
@@ -1996,6 +2349,7 @@ function renderEntityDrawer(node) {
   return h("div", {},
     h("div", { class: "drawer-title" }, node.name),
     h("div", { class: "meta" }, `${node.facts.length} fact${node.facts.length === 1 ? "" : "s"} known now`),
+    renderLocalMap(node),
     h("div", { class: "section" }, h("h3", {}, "What is known"),
       node.facts.map((fact) => h("button", { class: "mini-row", onclick: () => openFact(fact.id) }, fact.statement))));
 }
